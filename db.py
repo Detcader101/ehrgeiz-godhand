@@ -34,6 +34,16 @@ CREATE TABLE IF NOT EXISTS panels (
     message_id  INTEGER NOT NULL,
     PRIMARY KEY (guild_id, kind)
 );
+
+-- Records the last time a Discord user unlinked. Used to enforce the relink
+-- cooldown (spec §5.2). One row per Discord user; later unlinks replace the
+-- previous row. We keep `tekken_id` so a same-ID re-link can be allowed
+-- immediately (only different-ID re-links wait out the cooldown).
+CREATE TABLE IF NOT EXISTS unlinks (
+    discord_id   INTEGER PRIMARY KEY,
+    tekken_id    TEXT,
+    unlinked_at  TEXT NOT NULL
+);
 """
 
 
@@ -95,6 +105,42 @@ async def upsert_player(
 async def delete_player(discord_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM players WHERE discord_id = ?", (discord_id,))
+        await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Unlinks (relink cooldown)                                                    #
+# --------------------------------------------------------------------------- #
+
+async def record_unlink(discord_id: int, tekken_id: str | None, now_iso: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO unlinks (discord_id, tekken_id, unlinked_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                tekken_id   = excluded.tekken_id,
+                unlinked_at = excluded.unlinked_at
+            """,
+            (discord_id, tekken_id, now_iso),
+        )
+        await db.commit()
+
+
+async def get_last_unlink(discord_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM unlinks WHERE discord_id = ?", (discord_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def clear_unlink(discord_id: int) -> None:
+    """Drop the cooldown record (used when admin force-links — admins know
+    their server)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM unlinks WHERE discord_id = ?", (discord_id,))
         await db.commit()
 
 

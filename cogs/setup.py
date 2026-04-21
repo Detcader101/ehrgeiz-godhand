@@ -76,6 +76,9 @@ SERVER_PLAN: list[CategorySpec] = [
     ]),
     CategorySpec("🛠️ Staff", [
         ChannelSpec("mod-log", "text", "Every mod action the bot performs is logged here."),
+        ChannelSpec("verification-log", "text",
+                    "Audit trail for player verification: links, unlinks, "
+                    "rank changes, admin overrides. Spot suspicious patterns here."),
         ChannelSpec("staff-chat", "text", "Private admin + moderator discussion."),
     ], staff_only=True),
 ]

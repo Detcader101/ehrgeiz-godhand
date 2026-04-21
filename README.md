@@ -29,6 +29,11 @@ Built to be run either on a laptop for one friendly server or 24/7 as a public h
 - One Tekken ID per Discord account (enforced at the DB level); admins can override via `/admin-link`.
 - Persistent panels with stable custom IDs — buttons keep working after bot restarts.
 - Ephemeral responses with auto-delete so channels stay clean.
+- **5-minute TTL cache + single-flight dedupe** on every wavu/ewgf lookup so rapid clicks and multi-guild bursts don't hammer the upstream sites.
+
+**Anti-abuse**
+- **Audit log** — every link, unlink, rank change, and admin override is posted to a staff-only `#verification-log` channel for review.
+- **7-day relink cooldown** on changing to a *different* Tekken ID after an unlink. Same-ID re-link is allowed immediately. `/admin-link` bypasses both.
 
 **Planned**
 - Swiss tournaments seeded by rank tier

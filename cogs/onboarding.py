@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+import audit
 import db
 import ewgf
 import wavu
@@ -18,9 +20,44 @@ log = logging.getLogger(__name__)
 
 VERIFIED_ROLE_NAME = os.environ.get("VERIFIED_ROLE_NAME", "Verified")
 
+# Spec §5.2 — different-ID re-links wait this long after an unlink.
+# Same-ID re-link is allowed immediately (a user who unlinks themselves by
+# mistake should be able to recover without waiting a week).
+RELINK_COOLDOWN = timedelta(days=7)
+
+_ID_NORMALIZE_RE = re.compile(r"[\s\-_]+")
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_id(s: str | None) -> str:
+    return _ID_NORMALIZE_RE.sub("", s or "").lower()
+
+
+def _cooldown_remaining(unlinked_at_iso: str) -> timedelta | None:
+    """Returns time left in the relink cooldown, or None if it's already over."""
+    try:
+        unlinked = datetime.fromisoformat(unlinked_at_iso)
+    except ValueError:
+        return None
+    elapsed = datetime.now(timezone.utc) - unlinked
+    if elapsed >= RELINK_COOLDOWN:
+        return None
+    return RELINK_COOLDOWN - elapsed
+
+
+def _format_duration(td: timedelta) -> str:
+    total_s = int(td.total_seconds())
+    days, rem = divmod(total_s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{max(minutes, 1)}m"
 
 
 async def _resolve_rank(tekken_id: str, *, force_refresh: bool = False) -> str | None:
@@ -131,6 +168,21 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
                 ephemeral=True, delete_after=15,
             )
             return
+
+        # Relink cooldown (spec §5.2). Same-ID re-link is allowed immediately;
+        # different-ID re-link waits 7 days. Admin /admin-link bypasses.
+        last_unlink = await db.get_last_unlink(interaction.user.id)
+        if last_unlink is not None:
+            remaining = _cooldown_remaining(last_unlink["unlinked_at"])
+            if remaining is not None and _normalize_id(last_unlink["tekken_id"]) != _normalize_id(entered):
+                await interaction.followup.send(
+                    f"You unlinked recently. You can re-link a *different* Tekken ID "
+                    f"in **{_format_duration(remaining)}**. "
+                    f"Re-linking your previous ID (`{last_unlink['tekken_id']}`) "
+                    "is allowed immediately. An admin can override with `/admin-link`.",
+                    ephemeral=True, delete_after=20,
+                )
+                return
 
         try:
             profile = await wavu.lookup_player(entered)
@@ -305,6 +357,19 @@ class ConfirmProfileView(discord.ui.View):
         )
         _schedule_delete(interaction, delay=8)
 
+        await audit.post_event(
+            guild,
+            title="Player linked",
+            color=discord.Color.green(),
+            fields=[
+                ("Discord", f"{member.mention} (`{member.id}`)", True),
+                ("Tekken ID", f"`{self.profile.tekken_id}`", True),
+                ("Display name", self.profile.display_name, True),
+                ("Main", self.profile.main_char or "—", True),
+                ("Rank", self.profile.rank_tier or "—", True),
+            ],
+        )
+
     @discord.ui.button(label="No, re-enter", style=discord.ButtonStyle.secondary)
     async def retry(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await interaction.response.send_modal(TekkenIdModal(self.bot))
@@ -361,6 +426,19 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
             now_iso=_now_iso(),
         )
         await _apply_rank_and_verified(member, profile)
+        if rank_tier is not None and rank_tier != stored:
+            await audit.post_event(
+                interaction.guild,
+                title="Rank changed",
+                color=discord.Color.gold(),
+                fields=[
+                    ("Discord", f"{member.mention} (`{member.id}`)", True),
+                    ("Tekken ID", f"`{profile.tekken_id}`", True),
+                    ("From", stored or "—", True),
+                    ("To", rank_tier, True),
+                    ("Trigger", "self-refresh", True),
+                ],
+            )
 
     if rank_name is not None:
         await _save_and_apply(rank_name)
@@ -425,9 +503,11 @@ async def _flow_profile(interaction: discord.Interaction) -> None:
 
 
 class _ConfirmUnlinkView(discord.ui.View):
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, tekken_id: str | None, display_name: str | None):
         super().__init__(timeout=60)
         self.user_id = user_id
+        self.tekken_id = tekken_id
+        self.display_name = display_name
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.user_id
@@ -435,6 +515,7 @@ class _ConfirmUnlinkView(discord.ui.View):
     @discord.ui.button(label="Yes, unlink me", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await db.delete_player(interaction.user.id)
+        await db.record_unlink(interaction.user.id, self.tekken_id, _now_iso())
         member = interaction.guild.get_member(interaction.user.id)
         if member is not None:
             managed = _bot_managed_rank_names()
@@ -450,6 +531,17 @@ class _ConfirmUnlinkView(discord.ui.View):
             embed=None, view=None,
         )
         _schedule_delete(interaction, delay=10)
+
+        await audit.post_event(
+            interaction.guild,
+            title="Player unlinked (self)",
+            color=discord.Color.dark_grey(),
+            fields=[
+                ("Discord", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Tekken ID", f"`{self.tekken_id}`" if self.tekken_id else "—", True),
+                ("Display name", self.display_name or "—", True),
+            ],
+        )
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button):
@@ -468,8 +560,13 @@ async def _flow_unlink(interaction: discord.Interaction) -> None:
         return
     await interaction.response.send_message(
         f"Unlink **{row['display_name']}** (`{row['tekken_id']}`)? "
-        "This removes your rank role. You can re-verify anytime.",
-        view=_ConfirmUnlinkView(interaction.user.id),
+        "This removes your rank role. You can re-verify anytime — note the "
+        "7-day cooldown if you re-link to a *different* Tekken ID.",
+        view=_ConfirmUnlinkView(
+            interaction.user.id,
+            tekken_id=row["tekken_id"],
+            display_name=row["display_name"],
+        ),
         ephemeral=True,
     )
 
@@ -648,6 +745,8 @@ class Onboarding(commands.Cog):
             linked_by=interaction.user.id,
             now_iso=_now_iso(),
         )
+        # Spec §5.4: admin override clears any pending relink cooldown.
+        await db.clear_unlink(member.id)
         try:
             await _apply_rank_and_verified(member, profile)
         except discord.Forbidden:
@@ -661,6 +760,20 @@ class Onboarding(commands.Cog):
             ephemeral=True, delete_after=12,
         )
 
+        await audit.post_event(
+            interaction.guild,
+            title="Player linked (admin override)",
+            color=discord.Color.purple(),
+            fields=[
+                ("Target", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Tekken ID", f"`{profile.tekken_id}`", True),
+                ("Display name", profile.display_name, True),
+                ("Rank", profile.rank_tier or "—", True),
+                ("Rank source", "manual override" if rank else "auto-detect", True),
+            ],
+        )
+
     @app_commands.command(name="admin-unlink",
                           description="Admin: remove a Discord user's Tekken link.")
     @app_commands.default_permissions(manage_guild=True)
@@ -672,6 +785,7 @@ class Onboarding(commands.Cog):
             )
             return
         await db.delete_player(member.id)
+        await db.record_unlink(member.id, row["tekken_id"], _now_iso())
         managed = _bot_managed_rank_names()
         to_remove = [r for r in member.roles if r.name in managed
                      or r.name == VERIFIED_ROLE_NAME]
@@ -683,6 +797,18 @@ class Onboarding(commands.Cog):
         await interaction.response.send_message(
             f"Unlinked {member.mention} (was `{row['tekken_id']}`).",
             ephemeral=True, delete_after=12,
+        )
+
+        await audit.post_event(
+            interaction.guild,
+            title="Player unlinked (admin)",
+            color=discord.Color.purple(),
+            fields=[
+                ("Target", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{interaction.user.mention} (`{interaction.user.id}`)", True),
+                ("Tekken ID", f"`{row['tekken_id']}`", True),
+                ("Display name", row["display_name"], True),
+            ],
         )
 
 
