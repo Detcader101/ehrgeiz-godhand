@@ -30,24 +30,54 @@ async def _ensure_role(guild: discord.Guild, name: str, *, reason: str) -> disco
     return role
 
 
+# Role names this bot has historically created that are NOT in the current
+# valid-rank list. Kept forever so we can strip them on re-sync even after the
+# canonical rank table changes.
+_LEGACY_BOT_RANK_ROLES: set[str] = {
+    "Unranked",
+    # Old μ-derived tier names from the first buggy iteration:
+    "Vindicator", "Initiate", "Usurper",
+    "Revered Ruler", "Divine Ruler",
+    "Yaksa", "Ryujin",
+    "True God of Destruction",
+}
+
+
+def _bot_managed_rank_names() -> set[str]:
+    return set(wavu.ALL_RANK_NAMES) | _LEGACY_BOT_RANK_ROLES
+
+
 async def _apply_rank_and_verified(member: discord.Member, profile: wavu.PlayerProfile) -> None:
     guild = member.guild
     verified = await _ensure_role(guild, VERIFIED_ROLE_NAME, reason="Onboarding")
 
-    known_rank_names = set(wavu.ALL_RANK_NAMES)
+    managed = _bot_managed_rank_names()
     if profile.rank_tier:
         rank_role = await _ensure_role(guild, profile.rank_tier, reason="Tekken rank sync")
         to_remove = [r for r in member.roles
-                     if r.name in known_rank_names and r.id != rank_role.id]
+                     if r.name in managed and r.id != rank_role.id]
         if to_remove:
             await member.remove_roles(*to_remove, reason="Rank re-sync")
         await member.add_roles(verified, rank_role, reason="Onboarding verified")
     else:
         # No rank resolved — grant Verified only, strip any stale rank role.
-        to_remove = [r for r in member.roles if r.name in known_rank_names]
+        to_remove = [r for r in member.roles if r.name in managed]
         if to_remove:
             await member.remove_roles(*to_remove, reason="Rank cleared")
         await member.add_roles(verified, reason="Onboarding verified (no rank)")
+
+
+async def _auto_delete(interaction: discord.Interaction, delay: float = 12.0) -> None:
+    """Delete the interaction's ephemeral response after `delay` seconds."""
+    try:
+        await asyncio.sleep(delay)
+        await interaction.delete_original_response()
+    except (discord.NotFound, discord.HTTPException, asyncio.CancelledError):
+        pass
+
+
+def _schedule_delete(interaction: discord.Interaction, delay: float = 12.0) -> None:
+    asyncio.create_task(_auto_delete(interaction, delay))
 
 
 # --------------------------------------------------------------------------- #
@@ -77,18 +107,19 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
             await interaction.followup.send(
                 f"That Tekken ID is already claimed by <@{existing['discord_id']}>. "
                 "If that's wrong, ask an admin to run `/admin-link` to correct it.",
-                ephemeral=True,
+                ephemeral=True, delete_after=15,
             )
             return
 
         try:
             profile = await wavu.lookup_player(entered)
         except wavu.PlayerNotFound as e:
-            await interaction.followup.send(f"{e}", ephemeral=True)
+            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
             return
         except wavu.WavuError as e:
             await interaction.followup.send(
-                f"Data source error: {e}\nTry again in a minute.", ephemeral=True
+                f"Data source error: {e}\nTry again in a minute.",
+                ephemeral=True, delete_after=15,
             )
             return
 
@@ -239,7 +270,7 @@ class ConfirmProfileView(discord.ui.View):
         except sqlite3.IntegrityError:
             await interaction.response.send_message(
                 "That Tekken ID was just claimed by someone else. Ask an admin for help.",
-                ephemeral=True,
+                ephemeral=True, delete_after=15,
             )
             return
 
@@ -249,7 +280,7 @@ class ConfirmProfileView(discord.ui.View):
             await interaction.response.send_message(
                 "I verified you in the database but I couldn't assign your roles — "
                 "my role needs to be positioned above the rank roles. Ask an admin.",
-                ephemeral=True,
+                ephemeral=True, delete_after=15,
             )
             return
 
@@ -257,6 +288,7 @@ class ConfirmProfileView(discord.ui.View):
             content=f"Verified. Welcome, {self.profile.display_name}.",
             embed=None, view=None,
         )
+        _schedule_delete(interaction, delay=8)
 
     @discord.ui.button(label="No, re-enter", style=discord.ButtonStyle.secondary)
     async def retry(self, interaction: discord.Interaction, _button: discord.ui.Button):
@@ -282,7 +314,7 @@ class VerifyView(discord.ui.View):
                 f"You're already verified as **{existing['display_name']}** "
                 f"(`{existing['tekken_id']}`). Use `/refresh` to update your rank, "
                 "or ask an admin to change your link.",
-                ephemeral=True,
+                ephemeral=True, delete_after=15,
             )
             return
         await interaction.response.send_modal(TekkenIdModal(self.bot))
@@ -315,7 +347,9 @@ class Onboarding(commands.Cog):
             color=discord.Color.blurple(),
         )
         await interaction.channel.send(embed=embed, view=VerifyView(self.bot))
-        await interaction.response.send_message("Panel posted.", ephemeral=True)
+        await interaction.response.send_message(
+            "Panel posted.", ephemeral=True, delete_after=8,
+        )
 
     @app_commands.command(name="refresh",
                           description="Re-sync your rank from wavu.wiki.")
@@ -323,14 +357,15 @@ class Onboarding(commands.Cog):
         row = await db.get_player_by_discord(interaction.user.id)
         if row is None:
             await interaction.response.send_message(
-                "You're not linked yet. Use the Verify button first.", ephemeral=True
+                "You're not linked yet. Use the Verify button first.",
+                ephemeral=True, delete_after=10,
             )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             profile = await wavu.lookup_player(row["tekken_id"])
         except (wavu.PlayerNotFound, wavu.WavuError) as e:
-            await interaction.followup.send(f"{e}", ephemeral=True)
+            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
             return
 
         # Auto-detect rank from recent replays.
@@ -358,7 +393,8 @@ class Onboarding(commands.Cog):
             )
             await _apply_rank_and_verified(member, profile)
             await interaction.followup.send(
-                content="Updated.", embed=_profile_embed(profile), ephemeral=True
+                content="Updated.", embed=_profile_embed(profile),
+                ephemeral=True, delete_after=12,
             )
         elif stored_is_valid:
             profile.rank_tier = stored
@@ -375,7 +411,7 @@ class Onboarding(commands.Cog):
             await _apply_rank_and_verified(member, profile)
             await interaction.followup.send(
                 content="Updated. *(No recent ranked match found — kept your existing rank.)*",
-                embed=_profile_embed(profile), ephemeral=True,
+                embed=_profile_embed(profile), ephemeral=True, delete_after=12,
             )
         else:
             # No replay match, no prior valid rank → offer the self-report dropdown.
@@ -392,7 +428,8 @@ class Onboarding(commands.Cog):
         row = await db.get_player_by_discord(interaction.user.id)
         if row is None:
             await interaction.response.send_message(
-                "You're not linked yet. Use the Verify button first.", ephemeral=True
+                "You're not linked yet. Use the Verify button first.",
+                ephemeral=True, delete_after=10,
             )
             return
         profile = wavu.PlayerProfile(
@@ -426,7 +463,7 @@ class Onboarding(commands.Cog):
         try:
             profile = await wavu.lookup_player(tekken_id)
         except (wavu.PlayerNotFound, wavu.WavuError) as e:
-            await interaction.followup.send(f"{e}", ephemeral=True)
+            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
             return
 
         if rank is not None:
@@ -434,7 +471,7 @@ class Onboarding(commands.Cog):
                 await interaction.followup.send(
                     f"`{rank}` is not a known T8 rank. Valid ranks:\n"
                     + ", ".join(wavu.ALL_RANK_NAMES),
-                    ephemeral=True,
+                    ephemeral=True, delete_after=20,
                 )
                 return
             profile.rank_tier = rank
@@ -464,11 +501,12 @@ class Onboarding(commands.Cog):
         except discord.Forbidden:
             await interaction.followup.send(
                 "Linked in DB but couldn't assign roles (role hierarchy).",
-                ephemeral=True,
+                ephemeral=True, delete_after=15,
             )
             return
         await interaction.followup.send(
-            content=f"Linked {member.mention}.", embed=_profile_embed(profile), ephemeral=True
+            content=f"Linked {member.mention}.", embed=_profile_embed(profile),
+            ephemeral=True, delete_after=12,
         )
 
     @app_commands.command(name="admin-unlink",
@@ -478,13 +516,12 @@ class Onboarding(commands.Cog):
         row = await db.get_player_by_discord(member.id)
         if row is None:
             await interaction.response.send_message(
-                f"{member.mention} isn't linked.", ephemeral=True
+                f"{member.mention} isn't linked.", ephemeral=True, delete_after=10,
             )
             return
         await db.delete_player(member.id)
-        # Strip rank roles.
-        known_rank_names = set(wavu.ALL_RANK_NAMES)
-        to_remove = [r for r in member.roles if r.name in known_rank_names
+        managed = _bot_managed_rank_names()
+        to_remove = [r for r in member.roles if r.name in managed
                      or r.name == VERIFIED_ROLE_NAME]
         if to_remove:
             try:
@@ -492,7 +529,8 @@ class Onboarding(commands.Cog):
             except discord.Forbidden:
                 pass
         await interaction.response.send_message(
-            f"Unlinked {member.mention} (was `{row['tekken_id']}`).", ephemeral=True
+            f"Unlinked {member.mention} (was `{row['tekken_id']}`).",
+            ephemeral=True, delete_after=12,
         )
 
 
