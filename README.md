@@ -18,6 +18,8 @@ Built for small friendly servers — designed to be run on-demand on a laptop ra
 
 ## Features
 
+**One-command server setup** — `/setup-server` provisions the entire server structure in ~30 seconds: categories, text + voice channels, staff-only perms, and role hierarchy. Declarative plan in [`cogs/setup.py`](cogs/setup.py) — fork the repo and edit `SERVER_PLAN` / `ROLE_PLAN` to adapt it to your community. Idempotent; safe to re-run.
+
 **Onboarding & rank sync**
 - Unified Player Hub panel with buttons: Verify, My Profile, Refresh Rank, Set Rank Manually, Unlink Me.
 - Verification via Polaris Battle ID — bot looks up the player on [wank.wavu.wiki](https://wank.wavu.wiki) and confirms the name/main character with the user before granting roles.
@@ -76,7 +78,19 @@ Copy `.env.example` to `.env` and fill in:
 python bot.py
 ```
 
-In Discord, pick a channel (e.g. `#player-hub`) and run `/post-player-panel`. The unified panel appears with all the buttons.
+### 5. Build your server with one command
+
+In your (empty or nearly-empty) Discord server, run:
+
+```
+/setup-server
+```
+
+The bot previews the full layout (categories, channels, roles). Click **Build it** and it creates everything in ~30–60 seconds: 7 categories, 16 channels, 4 roles, staff-only perms on the Staff category, and it auto-posts the Player Hub panel in `#player-hub`.
+
+The command is idempotent — anything that already exists by name is skipped. Safe to run again after you edit the plan.
+
+After setup, drag the bot's role **above** the new rank/admin/mod roles in Server Settings → Roles (Discord requires this for the bot to manage those roles).
 
 ## How the rank lookup works
 

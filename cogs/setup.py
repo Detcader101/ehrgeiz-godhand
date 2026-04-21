@@ -10,11 +10,18 @@ edit those to change the structure.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+import db
+from cogs.onboarding import (
+    PANEL_KIND_PLAYER_HUB,
+    PlayerHubView,
+    _player_hub_embed,
+)
 
 log = logging.getLogger(__name__)
 
@@ -109,18 +116,20 @@ ROLE_PLAN: list[RoleSpec] = [
 
 @dataclass
 class SetupReport:
-    categories_created: list[str]
-    categories_existing: list[str]
-    channels_created: list[str]
-    channels_existing: list[str]
-    roles_created: list[str]
-    roles_existing: list[str]
-    errors: list[str]
+    categories_created: list[str] = field(default_factory=list)
+    categories_existing: list[str] = field(default_factory=list)
+    channels_created: list[str] = field(default_factory=list)
+    channels_existing: list[str] = field(default_factory=list)
+    roles_created: list[str] = field(default_factory=list)
+    roles_existing: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    panel_posted_in: str | None = None  # channel name if Player Hub was auto-posted
+    panel_skip_reason: str | None = None  # human-readable reason if skipped
 
     def to_embed(self) -> discord.Embed:
         embed = discord.Embed(title="Server setup complete", color=discord.Color.green())
 
-        def section(title: str, created: list[str], existing: list[str]) -> str:
+        def section(created: list[str], existing: list[str]) -> str:
             parts = []
             if created:
                 parts.append(f"**Created ({len(created)}):** " + ", ".join(created))
@@ -129,14 +138,34 @@ class SetupReport:
             return "\n".join(parts) if parts else "—"
 
         embed.add_field(name="Categories",
-                        value=section("", self.categories_created, self.categories_existing),
+                        value=section(self.categories_created, self.categories_existing),
                         inline=False)
         embed.add_field(name="Channels",
-                        value=section("", self.channels_created, self.channels_existing),
+                        value=section(self.channels_created, self.channels_existing),
                         inline=False)
         embed.add_field(name="Roles",
-                        value=section("", self.roles_created, self.roles_existing),
+                        value=section(self.roles_created, self.roles_existing),
                         inline=False)
+
+        # Next-steps panel: what the admin still has to do manually.
+        next_steps = [
+            "**1.** Server Settings → Roles: drag the bot's role **above** the rank "
+            "roles (and Admin/Moderator if you want the bot to be able to manage them).",
+        ]
+        if self.panel_posted_in:
+            next_steps.append(
+                f"**2.** Player Hub panel is live in **#{self.panel_posted_in}**. "
+                "Nothing else needed there."
+            )
+        else:
+            reason = f" ({self.panel_skip_reason})" if self.panel_skip_reason else ""
+            next_steps.append(
+                f"**2.** Player Hub panel was **not** auto-posted{reason}. "
+                "Go to your preferred channel and run `/post-player-panel`."
+            )
+        next_steps.append("**3.** Write your rules in **#rules** and pin them.")
+        embed.add_field(name="📝 Next steps", value="\n".join(next_steps), inline=False)
+
         if self.errors:
             embed.add_field(name="⚠ Errors",
                             value="\n".join(self.errors[:5]), inline=False)
@@ -144,8 +173,38 @@ class SetupReport:
         return embed
 
 
+async def _post_player_hub_if_channel_exists(
+    bot: commands.Bot, guild: discord.Guild, report: SetupReport,
+) -> None:
+    """If a #player-hub text channel exists, post the Player Hub panel there
+    (deleting any prior bot-tracked panel first) and record outcome on report."""
+    channel = discord.utils.get(guild.text_channels, name="player-hub")
+    if channel is None:
+        report.panel_skip_reason = "no #player-hub channel found"
+        return
+    # Clean up the previous panel if we've ever posted one in this guild.
+    existing = await db.get_panel(guild.id, PANEL_KIND_PLAYER_HUB)
+    if existing is not None:
+        old_channel = guild.get_channel(existing["channel_id"])
+        if old_channel is not None:
+            try:
+                old_msg = await old_channel.fetch_message(existing["message_id"])
+                await old_msg.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+    try:
+        msg = await channel.send(
+            embed=_player_hub_embed(), view=PlayerHubView(bot),
+        )
+    except discord.Forbidden:
+        report.panel_skip_reason = "bot can't post in #player-hub (permissions)"
+        return
+    await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, channel.id, msg.id)
+    report.panel_posted_in = channel.name
+
+
 async def _build_server(guild: discord.Guild) -> SetupReport:
-    report = SetupReport([], [], [], [], [], [], [])
+    report = SetupReport()
 
     # --- Roles first, so we can reference them for category perms --- #
     role_by_name: dict[str, discord.Role] = {r.name: r for r in guild.roles}
@@ -243,7 +302,10 @@ class _ConfirmSetupView(discord.ui.View):
             embed=None, view=None,
         )
         report = await _build_server(interaction.guild)
-        await interaction.edit_original_response(embed=report.to_embed())
+        await _post_player_hub_if_channel_exists(
+            interaction.client, interaction.guild, report,
+        )
+        await interaction.edit_original_response(content=None, embed=report.to_embed())
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button):
