@@ -323,7 +323,7 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
             await interaction.followup.send(
                 f"That Tekken ID is already claimed by <@{existing['discord_id']}>. "
                 "If that's wrong, ask an admin to run `/admin-link` to correct it.",
-                ephemeral=True, delete_after=15,
+                ephemeral=True,
             )
             return
 
@@ -365,12 +365,12 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
         try:
             profile = await wavu.lookup_player(entered)
         except wavu.PlayerNotFound as e:
-            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
+            await interaction.followup.send(f"{e}", ephemeral=True)
             return
         except wavu.WavuError as e:
             await interaction.followup.send(
                 f"Data source error: {e}\nTry again in a minute.",
-                ephemeral=True, delete_after=15,
+                ephemeral=True,
             )
             return
 
@@ -624,7 +624,7 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     try:
         profile = await wavu.lookup_player(row["tekken_id"], force_refresh=True)
     except (wavu.PlayerNotFound, wavu.WavuError) as e:
-        await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
+        await interaction.followup.send(f"{e}", ephemeral=True)
         return
 
     rank_name = await _resolve_rank(row["tekken_id"], force_refresh=True)
@@ -689,19 +689,19 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
                     f"Your **{rank_name}** claim was sent to organizers for "
                     "confirmation — they'll grant the rank role within ~72h."
                 ),
-                ephemeral=True, delete_after=20,
+                ephemeral=True,
             )
         else:
             await interaction.followup.send(
                 content="Updated.", embed=_profile_embed(profile),
-                ephemeral=True, delete_after=12,
+                ephemeral=True,
             )
     elif stored_is_valid:
         # rank_tier == stored, so needs_pending is False; safe.
         await _save_and_apply(stored)
         await interaction.followup.send(
             content="Updated. *(Couldn't auto-detect rank — kept your existing one.)*",
-            embed=_profile_embed(profile), ephemeral=True, delete_after=12,
+            embed=_profile_embed(profile), ephemeral=True,
         )
     else:
         view = RankGroupSelectView(bot, interaction.user.id, profile)
@@ -1256,7 +1256,7 @@ class Onboarding(commands.Cog):
         try:
             profile = await wavu.lookup_player(tekken_id)
         except (wavu.PlayerNotFound, wavu.WavuError) as e:
-            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
+            await interaction.followup.send(f"{e}", ephemeral=True)
             return
 
         if rank is not None:
@@ -1264,7 +1264,7 @@ class Onboarding(commands.Cog):
                 await interaction.followup.send(
                     f"`{rank}` is not a known T8 rank. Valid ranks:\n"
                     + ", ".join(wavu.ALL_RANK_NAMES),
-                    ephemeral=True, delete_after=20,
+                    ephemeral=True,
                 )
                 return
             profile.rank_tier = rank
@@ -1294,12 +1294,12 @@ class Onboarding(commands.Cog):
         except discord.Forbidden:
             await interaction.followup.send(
                 "Linked in DB but couldn't assign roles (role hierarchy).",
-                ephemeral=True, delete_after=15,
+                ephemeral=True,
             )
             return
         await interaction.followup.send(
             content=f"Linked {member.mention}.", embed=_profile_embed(profile),
-            ephemeral=True, delete_after=12,
+            ephemeral=True,
         )
 
         await audit.post_event(
