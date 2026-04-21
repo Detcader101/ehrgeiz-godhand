@@ -1,6 +1,14 @@
-# Tekken 8 Discord Bot
+# Ehrgeiz Godhand
 
-A panel-driven Discord bot for Tekken 8 community servers. Players verify with their Tekken ID, their in-game rank becomes a Discord role, and (coming soon) organizers run rank-seeded Swiss tournaments with auto-provisioned per-match voice channels.
+**Panel-driven Discord bot for Tekken 8 communities — role assignment by rank/ELO, bracket forming, and general moderation.**
+
+> Hello, this bot was created by Claude as an open source project with my prompt and direction. I want this bot to be useful for as many people as possible, because Tekken needs Tournaments. Any improvements I'd love, and you can clone this bot and use it however. This is for the community, for every group that wants it. Ehrgeiz Godhand is a light reference, and the original server this bot was created for does not matter; have fun ;)
+>
+> — Detcader_
+
+---
+
+Players verify with their Polaris Battle ID, their in-game rank becomes a Discord role, and (coming soon) organizers run rank-seeded Swiss tournaments with auto-provisioned per-match voice channels.
 
 Built for small friendly servers — designed to be run on-demand on a laptop rather than deployed 24/7 on a VPS.
 
@@ -36,8 +44,8 @@ Built for small friendly servers — designed to be run on-demand on a laptop ra
 Requires Python 3.10+.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/tekken-bot.git
-cd tekken-bot
+git clone https://github.com/gnutgnut/ehrgeiz-godhand.git
+cd ehrgeiz-godhand
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
