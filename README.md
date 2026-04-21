@@ -32,7 +32,10 @@ Built to be run either on a laptop for one friendly server or 24/7 as a public h
 - **5-minute TTL cache + single-flight dedupe** on every wavu/ewgf lookup so rapid clicks and multi-guild bursts don't hammer the upstream sites.
 
 **Moderation**
-- `/shutup @member` — one-click "stop talking": deletes the member's last 5 messages in the current channel and times them out for 2 minutes. Requires Moderate Members + Manage Messages. Logs to `#mod-log`. (More mod commands: `/kick`, `/ban`, `/timeout`, `/warn`, `/purge` — coming as part of v1.0 per [SPEC.md](SPEC.md) §9.)
+- `/shutup @member` — one-click "stop talking": deletes the member's last 5 messages in the current channel and times them out for 2 minutes. Logs to `#mod-log`. Two classes of caller:
+  - **Moderators** (Discord perms: Moderate Members + Manage Messages, or Administrator) — no rate limit, standard top-role hierarchy check on the target.
+  - **The Silencerz** (community-trust marker role provisioned by `/setup-server`) — limited to **once per hour per silencer per server**. Cannot `/shutup` mods, admins, or other Silencerz. Cooldown is only consumed on a successful action so failed attempts on protected targets don't burn the hour.
+- More mod commands: `/kick`, `/ban`, `/timeout`, `/warn`, `/purge` — coming as part of v1.0 per [SPEC.md](SPEC.md) §9.
 
 **Anti-abuse**
 - **Audit log** — every link, unlink, rank change, and admin override is posted to a staff-only `#verification-log` channel for review.

@@ -63,6 +63,17 @@ CREATE TABLE IF NOT EXISTS pending_verifications (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_message ON pending_verifications(message_id);
+
+-- Per-user /shutup cooldown tracking for The Silencerz role (members who
+-- can use /shutup but only once per hour). One row per (user, guild) so a
+-- user in multiple servers has independent cooldowns. Moderators bypass
+-- this entirely; only consulted for non-mod silencers.
+CREATE TABLE IF NOT EXISTS shutup_uses (
+    discord_id    INTEGER NOT NULL,
+    guild_id      INTEGER NOT NULL,
+    last_used_at  TEXT    NOT NULL,
+    PRIMARY KEY (discord_id, guild_id)
+);
 """
 
 
@@ -269,6 +280,34 @@ async def mark_pending_expired(discord_id: int, now_iso: str) -> None:
         await db.execute(
             "UPDATE pending_verifications SET expired_at = ? WHERE discord_id = ?",
             (now_iso, discord_id),
+        )
+        await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Silencer /shutup cooldown                                                    #
+# --------------------------------------------------------------------------- #
+
+async def get_last_shutup_use(discord_id: int, guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT last_used_at FROM shutup_uses WHERE discord_id = ? AND guild_id = ?",
+            (discord_id, guild_id),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def record_shutup_use(discord_id: int, guild_id: int, now_iso: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO shutup_uses (discord_id, guild_id, last_used_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(discord_id, guild_id) DO UPDATE SET
+                last_used_at = excluded.last_used_at
+            """,
+            (discord_id, guild_id, now_iso),
         )
         await db.commit()
 

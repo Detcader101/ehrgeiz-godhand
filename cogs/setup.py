@@ -117,6 +117,11 @@ ROLE_PLAN: list[RoleSpec] = [
     RoleSpec("Verified", discord.Color.green(),
              discord.Permissions.none(),
              hoist=False, mentionable=False),
+    # Marker role: holders gain access to /shutup at a 1-per-hour rate
+    # limit. No Discord-level perms — authority is checked in cogs/mod.py.
+    RoleSpec("The Silencerz", discord.Color.from_rgb(180, 0, 200),
+             discord.Permissions.none(),
+             hoist=True, mentionable=False),
 ]
 
 
