@@ -15,7 +15,6 @@ import wavu
 
 log = logging.getLogger(__name__)
 
-ONBOARDING_CHANNEL_ID = int(os.environ["ONBOARDING_CHANNEL_ID"])
 VERIFIED_ROLE_NAME = os.environ.get("VERIFIED_ROLE_NAME", "Verified")
 
 
@@ -295,29 +294,242 @@ class ConfirmProfileView(discord.ui.View):
         await interaction.response.send_modal(TekkenIdModal(self.bot))
 
 
-class VerifyView(discord.ui.View):
-    """Persistent view posted in the onboarding channel."""
+# --------------------------------------------------------------------------- #
+# Shared flows (called by both slash commands and panel buttons)               #
+# --------------------------------------------------------------------------- #
 
-    def __init__(self, bot: commands.Bot):
-        super().__init__(timeout=None)
-        self.bot = bot
+async def _flow_verify_start(interaction: discord.Interaction, bot: commands.Bot) -> None:
+    existing = await db.get_player_by_discord(interaction.user.id)
+    if existing:
+        await interaction.response.send_message(
+            f"You're already verified as **{existing['display_name']}** "
+            f"(`{existing['tekken_id']}`). Use **Refresh Rank** to update your rank, "
+            "or ask an admin to change your link.",
+            ephemeral=True, delete_after=15,
+        )
+        return
+    await interaction.response.send_modal(TekkenIdModal(bot))
 
-    @discord.ui.button(
-        label="Verify with Tekken ID",
-        style=discord.ButtonStyle.primary,
-        custom_id="tekken_bot:verify",
+
+async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> None:
+    row = await db.get_player_by_discord(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You're not linked yet. Click **Verify** first.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        profile = await wavu.lookup_player(row["tekken_id"])
+    except (wavu.PlayerNotFound, wavu.WavuError) as e:
+        await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
+        return
+
+    try:
+        rank_result = await wavu.find_player_rank(row["tekken_id"])
+    except wavu.WavuError:
+        rank_result = None
+
+    member = interaction.guild.get_member(interaction.user.id)
+    stored = row["rank_tier"]
+    stored_is_valid = stored in wavu.ALL_RANK_NAMES
+
+    async def _save_and_apply(rank_tier: str | None) -> None:
+        profile.rank_tier = rank_tier
+        await db.upsert_player(
+            discord_id=member.id,
+            tekken_id=profile.tekken_id,
+            display_name=profile.display_name,
+            main_char=profile.main_char,
+            rating_mu=profile.rating_mu,
+            rank_tier=profile.rank_tier,
+            linked_by=row["linked_by"],
+            now_iso=_now_iso(),
+        )
+        await _apply_rank_and_verified(member, profile)
+
+    if rank_result is not None:
+        await _save_and_apply(rank_result[1])
+        await interaction.followup.send(
+            content="Updated.", embed=_profile_embed(profile),
+            ephemeral=True, delete_after=12,
+        )
+    elif stored_is_valid:
+        await _save_and_apply(stored)
+        await interaction.followup.send(
+            content="Updated. *(No recent ranked match found — kept your existing rank.)*",
+            embed=_profile_embed(profile), ephemeral=True, delete_after=12,
+        )
+    else:
+        view = RankGroupSelectView(bot, interaction.user.id, profile)
+        await interaction.followup.send(
+            f"Couldn't find a recent ranked match for **{profile.display_name}**. "
+            "Pick your current rank:",
+            view=view, ephemeral=True,
+        )
+
+
+async def _flow_set_rank(interaction: discord.Interaction, bot: commands.Bot) -> None:
+    row = await db.get_player_by_discord(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You're not linked yet. Click **Verify** first.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    profile = wavu.PlayerProfile(
+        tekken_id=row["tekken_id"],
+        display_name=row["display_name"],
+        main_char=row["main_char"],
+        rating_mu=row["rating_mu"],
+        rank_tier=None,
     )
-    async def verify(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        existing = await db.get_player_by_discord(interaction.user.id)
-        if existing:
-            await interaction.response.send_message(
-                f"You're already verified as **{existing['display_name']}** "
-                f"(`{existing['tekken_id']}`). Use `/refresh` to update your rank, "
-                "or ask an admin to change your link.",
-                ephemeral=True, delete_after=15,
-            )
-            return
-        await interaction.response.send_modal(TekkenIdModal(self.bot))
+    view = RankGroupSelectView(bot, interaction.user.id, profile)
+    await interaction.response.send_message(
+        "Pick your current rank:", view=view, ephemeral=True,
+    )
+
+
+async def _flow_profile(interaction: discord.Interaction) -> None:
+    row = await db.get_player_by_discord(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You're not linked yet. Click **Verify** first.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    profile = wavu.PlayerProfile(
+        tekken_id=row["tekken_id"],
+        display_name=row["display_name"],
+        main_char=row["main_char"],
+        rating_mu=row["rating_mu"],
+        rank_tier=row["rank_tier"],
+    )
+    await interaction.response.send_message(
+        embed=_profile_embed(profile), ephemeral=True, delete_after=20,
+    )
+
+
+class _ConfirmUnlinkView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+    @discord.ui.button(label="Yes, unlink me", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await db.delete_player(interaction.user.id)
+        member = interaction.guild.get_member(interaction.user.id)
+        if member is not None:
+            managed = _bot_managed_rank_names()
+            to_remove = [r for r in member.roles if r.name in managed
+                         or r.name == VERIFIED_ROLE_NAME]
+            if to_remove:
+                try:
+                    await member.remove_roles(*to_remove, reason="Self-unlink")
+                except discord.Forbidden:
+                    pass
+        await interaction.response.edit_message(
+            content="Unlinked. Click **Verify** anytime to link again.",
+            embed=None, view=None,
+        )
+        _schedule_delete(interaction, delay=10)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Cancelled.", embed=None, view=None,
+        )
+        _schedule_delete(interaction, delay=5)
+
+
+async def _flow_unlink(interaction: discord.Interaction) -> None:
+    row = await db.get_player_by_discord(interaction.user.id)
+    if row is None:
+        await interaction.response.send_message(
+            "You're not linked.", ephemeral=True, delete_after=8,
+        )
+        return
+    await interaction.response.send_message(
+        f"Unlink **{row['display_name']}** (`{row['tekken_id']}`)? "
+        "This removes your rank role. You can re-verify anytime.",
+        view=_ConfirmUnlinkView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Persistent Player Hub panel                                                  #
+# --------------------------------------------------------------------------- #
+
+PANEL_KIND_PLAYER_HUB = "player_hub"
+
+
+class PlayerHubView(discord.ui.View):
+    """Persistent unified panel. Custom IDs must stay stable across restarts."""
+
+    def __init__(self, bot: commands.Bot | None = None):
+        super().__init__(timeout=None)
+        # Bot is None when the View is reconstructed on startup from custom_id;
+        # we resolve it from interaction.client inside callbacks.
+        self._bot = bot
+
+    def _resolve_bot(self, interaction: discord.Interaction) -> commands.Bot:
+        return self._bot or interaction.client  # type: ignore[return-value]
+
+    @discord.ui.button(label="Verify",
+                       style=discord.ButtonStyle.primary,
+                       custom_id="hub:verify", row=0)
+    async def verify(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_verify_start(interaction, self._resolve_bot(interaction))
+
+    @discord.ui.button(label="My Profile",
+                       style=discord.ButtonStyle.secondary,
+                       custom_id="hub:profile", row=0)
+    async def profile(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_profile(interaction)
+
+    @discord.ui.button(label="Refresh Rank",
+                       style=discord.ButtonStyle.success,
+                       custom_id="hub:refresh", row=1)
+    async def refresh(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_refresh(interaction, self._resolve_bot(interaction))
+
+    @discord.ui.button(label="Set Rank Manually",
+                       style=discord.ButtonStyle.secondary,
+                       custom_id="hub:set_rank", row=1)
+    async def set_rank(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_set_rank(interaction, self._resolve_bot(interaction))
+
+    @discord.ui.button(label="Unlink Me",
+                       style=discord.ButtonStyle.danger,
+                       custom_id="hub:unlink", row=1)
+    async def unlink(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_unlink(interaction)
+
+
+def _player_hub_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="Tekken 8 Player Hub",
+        description=(
+            "**New here?** Click **Verify** and enter your **Tekken ID** "
+            "(the ~12-character Polaris Battle ID from *Main Menu → Community → "
+            "My Profile*). The bot checks wavu.wiki, confirms it's you, and "
+            "gives you your rank role.\n\n"
+            "**Already verified?**\n"
+            "• **Refresh Rank** — pull your latest rank from your recent matches.\n"
+            "• **Set Rank Manually** — pick your rank from a dropdown (for when "
+            "auto-detect can't find a recent match).\n"
+            "• **My Profile** — see what the bot has on file for you.\n"
+            "• **Unlink Me** — remove your link (with confirmation)."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="One Tekken ID per Discord account • Admins can override")
+    return embed
 
 
 # --------------------------------------------------------------------------- #
@@ -329,120 +541,51 @@ class Onboarding(commands.Cog):
         self.bot = bot
 
     async def cog_load(self) -> None:
-        self.bot.add_view(VerifyView(self.bot))
+        # Persistent view: custom_ids let Discord route button clicks back to this
+        # View even after a bot restart.
+        self.bot.add_view(PlayerHubView(self.bot))
 
-    @app_commands.command(name="post-verify-panel",
-                          description="Admin: post the verification button in this channel.")
+    async def _delete_old_panel(self, guild: discord.Guild, kind: str) -> None:
+        row = await db.get_panel(guild.id, kind)
+        if row is None:
+            return
+        channel = guild.get_channel(row["channel_id"])
+        if channel is None:
+            return
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass  # message was already deleted or inaccessible — proceed
+
+    @app_commands.command(name="post-player-panel",
+                          description="Admin: post (or repost) the Player Hub in this channel.")
     @app_commands.default_permissions(manage_guild=True)
-    async def post_verify_panel(self, interaction: discord.Interaction):
-        embed = discord.Embed(
-            title="Welcome. Verify to get in.",
-            description=(
-                "Click the button below and enter your **Tekken ID** "
-                "(the ~12-character Polaris Battle ID on your player card).\n\n"
-                "The bot will check wavu.wiki, confirm it's you, and grant you "
-                "your rank role. One Tekken ID per Discord account — admins can "
-                "override if you need a change."
-            ),
-            color=discord.Color.blurple(),
+    async def post_player_panel(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only command.", ephemeral=True, delete_after=8,
+            )
+            return
+        await self._delete_old_panel(guild, PANEL_KIND_PLAYER_HUB)
+        msg = await interaction.channel.send(
+            embed=_player_hub_embed(), view=PlayerHubView(self.bot),
         )
-        await interaction.channel.send(embed=embed, view=VerifyView(self.bot))
+        await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, interaction.channel.id, msg.id)
         await interaction.response.send_message(
-            "Panel posted.", ephemeral=True, delete_after=8,
+            "Player Hub posted.", ephemeral=True, delete_after=8,
         )
 
     @app_commands.command(name="refresh",
                           description="Re-sync your rank from wavu.wiki.")
     async def refresh(self, interaction: discord.Interaction):
-        row = await db.get_player_by_discord(interaction.user.id)
-        if row is None:
-            await interaction.response.send_message(
-                "You're not linked yet. Use the Verify button first.",
-                ephemeral=True, delete_after=10,
-            )
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            profile = await wavu.lookup_player(row["tekken_id"])
-        except (wavu.PlayerNotFound, wavu.WavuError) as e:
-            await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
-            return
-
-        # Auto-detect rank from recent replays.
-        try:
-            rank_result = await wavu.find_player_rank(row["tekken_id"])
-        except wavu.WavuError:
-            rank_result = None
-
-        member = interaction.guild.get_member(interaction.user.id)
-
-        stored = row["rank_tier"]
-        stored_is_valid = stored in wavu.ALL_RANK_NAMES
-
-        if rank_result is not None:
-            profile.rank_tier = rank_result[1]
-            await db.upsert_player(
-                discord_id=member.id,
-                tekken_id=profile.tekken_id,
-                display_name=profile.display_name,
-                main_char=profile.main_char,
-                rating_mu=profile.rating_mu,
-                rank_tier=profile.rank_tier,
-                linked_by=row["linked_by"],
-                now_iso=_now_iso(),
-            )
-            await _apply_rank_and_verified(member, profile)
-            await interaction.followup.send(
-                content="Updated.", embed=_profile_embed(profile),
-                ephemeral=True, delete_after=12,
-            )
-        elif stored_is_valid:
-            profile.rank_tier = stored
-            await db.upsert_player(
-                discord_id=member.id,
-                tekken_id=profile.tekken_id,
-                display_name=profile.display_name,
-                main_char=profile.main_char,
-                rating_mu=profile.rating_mu,
-                rank_tier=profile.rank_tier,
-                linked_by=row["linked_by"],
-                now_iso=_now_iso(),
-            )
-            await _apply_rank_and_verified(member, profile)
-            await interaction.followup.send(
-                content="Updated. *(No recent ranked match found — kept your existing rank.)*",
-                embed=_profile_embed(profile), ephemeral=True, delete_after=12,
-            )
-        else:
-            # No replay match, no prior valid rank → offer the self-report dropdown.
-            view = RankGroupSelectView(self.bot, interaction.user.id, profile)
-            await interaction.followup.send(
-                f"Couldn't find a recent ranked match for **{profile.display_name}**. "
-                "Pick your current rank:",
-                view=view, ephemeral=True,
-            )
+        await _flow_refresh(interaction, self.bot)
 
     @app_commands.command(name="set-rank",
                           description="Manually set your rank (use if auto-detect is wrong).")
     async def set_rank(self, interaction: discord.Interaction):
-        row = await db.get_player_by_discord(interaction.user.id)
-        if row is None:
-            await interaction.response.send_message(
-                "You're not linked yet. Use the Verify button first.",
-                ephemeral=True, delete_after=10,
-            )
-            return
-        profile = wavu.PlayerProfile(
-            tekken_id=row["tekken_id"],
-            display_name=row["display_name"],
-            main_char=row["main_char"],
-            rating_mu=row["rating_mu"],
-            rank_tier=None,
-        )
-        view = RankGroupSelectView(self.bot, interaction.user.id, profile)
-        await interaction.response.send_message(
-            "Pick your current rank:", view=view, ephemeral=True,
-        )
+        await _flow_set_rank(interaction, self.bot)
 
     @app_commands.command(name="admin-link",
                           description="Admin: force-link a Discord user to a Tekken ID.")

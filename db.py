@@ -24,6 +24,16 @@ CREATE TABLE IF NOT EXISTS warnings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_warnings_discord_id ON warnings(discord_id);
+
+-- Bot-managed persistent panels. One row per (guild, kind) so a repost deletes
+-- the previous panel before creating a new one.
+CREATE TABLE IF NOT EXISTS panels (
+    guild_id    INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, kind)
+);
 """
 
 
@@ -85,4 +95,42 @@ async def upsert_player(
 async def delete_player(discord_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM players WHERE discord_id = ?", (discord_id,))
+        await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Panels                                                                       #
+# --------------------------------------------------------------------------- #
+
+async def get_panel(guild_id: int, kind: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM panels WHERE guild_id = ? AND kind = ?",
+            (guild_id, kind),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def set_panel(guild_id: int, kind: str, channel_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO panels (guild_id, kind, channel_id, message_id)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, kind) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                message_id = excluded.message_id
+            """,
+            (guild_id, kind, channel_id, message_id),
+        )
+        await db.commit()
+
+
+async def delete_panel(guild_id: int, kind: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM panels WHERE guild_id = ? AND kind = ?",
+            (guild_id, kind),
+        )
         await db.commit()
