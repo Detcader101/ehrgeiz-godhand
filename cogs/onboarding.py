@@ -1172,6 +1172,29 @@ class Onboarding(commands.Cog):
     async def cog_unload(self) -> None:
         self._sweeper.stop()
 
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: Exception,
+    ) -> None:
+        """Catch-all for slash-command exceptions in this cog.
+
+        Without this, an uncaught error after `interaction.response.defer()`
+        leaves the user staring at a permanent "thinking…" — the followup
+        never lands and Discord shows no error. We log the traceback to the
+        bot console (so it's visible in the PowerShell window the bot is
+        running in) and send a short error embed back to the operator.
+        """
+        cmd_name = interaction.command.name if interaction.command else "<unknown>"
+        log.exception("Slash command /%s raised: %s", cmd_name, error)
+        msg = f"⚠ `/{cmd_name}` failed: `{type(error).__name__}: {error}`\n*Check the bot console for the full traceback.*"
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            # Interaction is gone (>15min after defer) — nothing we can do.
+            pass
+
     async def _delete_old_panel(self, guild: discord.Guild, kind: str) -> None:
         row = await db.get_panel(guild.id, kind)
         if row is None:
