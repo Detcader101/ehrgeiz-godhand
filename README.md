@@ -14,7 +14,9 @@
 
 Players verify with their Polaris Battle ID, their in-game rank becomes a Discord role, and (coming soon) organizers run rank-seeded Swiss tournaments with auto-provisioned per-match voice channels.
 
-Built for small friendly servers — designed to be run on-demand on a laptop rather than deployed 24/7 on a VPS.
+Built to be run either on a laptop for one friendly server or 24/7 as a public hosted instance. Self-host and hosted deployment are both first-class.
+
+📖 **[Read the full project spec (SPEC.md)](SPEC.md)** — vision, design principles, anti-abuse posture, tournament design, and the phased roadmap.
 
 ## Features
 
