@@ -95,6 +95,22 @@ def _requires_pending(rank_name: str | None) -> bool:
     return ordinal is not None and ordinal >= _PENDING_THRESHOLD_ORDINAL
 
 
+async def _upgrade_display_name(profile: wavu.PlayerProfile) -> None:
+    """If wavu fell back to the tekken_id as display_name (meaning it had no
+    real name — usually because the player has no ranked-match data on
+    wavu), try to fill in a better name from ewgf in place. Silently keeps
+    the fallback if ewgf also has nothing."""
+    if profile.display_name != profile.tekken_id:
+        return
+    try:
+        better = await ewgf.lookup_display_name(profile.tekken_id)
+    except ewgf.EwgfError as e:
+        log.warning("ewgf name lookup failed for %s: %s", profile.tekken_id, e)
+        return
+    if better:
+        profile.display_name = better
+
+
 async def _resolve_rank(tekken_id: str, *, force_refresh: bool = False) -> str | None:
     """Try wavu's replay stream first (authoritative for very recent matches);
     fall back to ewgf.gg (covers inactive players). Returns None if neither
@@ -374,6 +390,10 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
             )
             return
 
+        # If wavu had no display name for this player (usually because they
+        # haven't played ranked), upgrade from ewgf before showing the embed.
+        await _upgrade_display_name(profile)
+
         # Auto-detect rank: wavu replays first, then ewgf as fallback.
         profile.rank_tier = await _resolve_rank(entered)
 
@@ -627,6 +647,7 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
         await interaction.followup.send(f"{e}", ephemeral=True)
         return
 
+    await _upgrade_display_name(profile)
     rank_name = await _resolve_rank(row["tekken_id"], force_refresh=True)
 
     member = interaction.guild.get_member(interaction.user.id)
@@ -1258,6 +1279,8 @@ class Onboarding(commands.Cog):
         except (wavu.PlayerNotFound, wavu.WavuError) as e:
             await interaction.followup.send(f"{e}", ephemeral=True)
             return
+
+        await _upgrade_display_name(profile)
 
         if rank is not None:
             if rank not in wavu.ALL_RANK_NAMES:

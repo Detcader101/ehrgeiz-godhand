@@ -119,9 +119,16 @@ def _extract_display_name(soup: BeautifulSoup, tekken_id: str) -> str:
         # Real format: "Detcader_ • Wavu Wank" — take text before the first
         # separator (•, |, –, —) and strip site-name suffix.
         parts = re.split(r"\s*[•|\u2013\u2014]\s*", raw, maxsplit=1)
-        if parts and parts[0] and parts[0].lower() not in {"wavu wank", "wank"}:
-            return parts[0].strip()
-    # Last-resort fallback. H1 is the site header ("Wavu Wank"), not useful.
+        if parts and parts[0]:
+            name = parts[0].strip()
+            # Filter out wavu's error/placeholder titles. When wavu has no
+            # record of a player (e.g. they exist on Polaris but haven't
+            # played ranked), the page 200s with title "Error * Wavu Wank".
+            if name.lower() not in {"wavu wank", "wank", "error", "not found", "404"}:
+                return name
+    # Last-resort fallback. Caller may upgrade this with a better name from
+    # another source (e.g. ewgf); until then the tekken_id is used so the
+    # player row has something readable.
     return tekken_id
 
 
