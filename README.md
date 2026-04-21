@@ -23,7 +23,7 @@ Built for small friendly servers — designed to be run on-demand on a laptop ra
 **Onboarding & rank sync**
 - Unified Player Hub panel with buttons: Verify, My Profile, Refresh Rank, Set Rank Manually, Unlink Me.
 - Verification via Polaris Battle ID — bot looks up the player on [wank.wavu.wiki](https://wank.wavu.wiki) and confirms the name/main character with the user before granting roles.
-- Auto-detects current Tekken rank from the player's most recent ranked match via wavu's replay API. Falls back to a two-stage self-report dropdown when no recent match is found.
+- Auto-detects current Tekken rank with a two-source chain: wavu's replay API first (authoritative for very recent matches), then [ewgf.gg](https://ewgf.gg) (covers inactive players). Falls back to a two-stage self-report dropdown if neither source has the player.
 - One Tekken ID per Discord account (enforced at the DB level); admins can override via `/admin-link`.
 - Persistent panels with stable custom IDs — buttons keep working after bot restarts.
 - Ephemeral responses with auto-delete so channels stay clean.
@@ -94,23 +94,26 @@ After setup, drag the bot's role **above** the new rank/admin/mod roles in Serve
 
 ## How the rank lookup works
 
-Wavu.wiki doesn't expose an official player-lookup API. The bot does two things:
+There's no official Tekken player-lookup API, so the bot uses two community sites in a chain:
 
-1. **Scrapes `https://wank.wavu.wiki/player/{TekkenID}`** for the player's display name and main character (via the HTML page).
-2. **Queries `https://wank.wavu.wiki/api/replays`** — the only documented wavu endpoint — paginating through the most recent matches to find one containing the player's Polaris ID. The `p1_rank` / `p2_rank` fields in each replay record are the authoritative in-game rank integer, which the bot maps to a tier name via the `TEKKEN_RANKS` table in `wavu.py`.
+1. **Display name + main character** come from `https://wank.wavu.wiki/player/{TekkenID}` (HTML scrape in [`wavu.py`](wavu.py)).
+2. **Current rank** is resolved by trying sources in order:
+   - **wavu's `/api/replays` endpoint** — paginates through the most recent matches, returns the `p1_rank` / `p2_rank` int when a record contains the player's Polaris ID. Mapped to a tier name via the `TEKKEN_RANKS` table in `wavu.py`. Authoritative but only sees roughly the last 35 minutes of play.
+   - **[ewgf.gg](https://ewgf.gg) scrape** ([`ewgf.py`](ewgf.py)) — fetches `https://ewgf.gg/player/{TekkenID}` and regex-extracts `currentSeasonRank` / `allTimeHighestRank` strings from the React Server Components payload embedded in the page. Returns the highest current-season rank across all characters; falls back to the highest all-time rank if no current-season data exists.
+3. **Self-report dropdown** — if both sources strike out, the user picks their rank from a two-stage dropdown.
 
-If neither step finds the player (e.g. they haven't played a ranked match in the last ~35 minutes of replay stream), the bot falls back to a two-stage dropdown so the user can self-report.
-
-**If wavu changes their markup or API**, only `wavu.py` needs updating — the rest of the bot treats it as an abstract data source.
+**If wavu or ewgf change their markup**, only the matching client file (`wavu.py` / `ewgf.py`) needs updating — the rest of the bot treats them as abstract data sources.
 
 ## Architecture
 
 ```
 bot.py              # Entry point. Loads cogs, syncs slash commands to guild.
 db.py               # aiosqlite helpers. Tables: players, warnings, panels.
-wavu.py             # wavu.wiki client. PlayerProfile, rank lookup, rank map.
+wavu.py             # wavu.wiki client. PlayerProfile, replay-API rank lookup, rank map.
+ewgf.py             # ewgf.gg client. Fallback rank lookup via RSC payload scrape.
 cogs/
-  onboarding.py     # PlayerHubView + all rank/verify logic.
+  onboarding.py     # PlayerHubView + verify/refresh flows + rank-source chain.
+  setup.py          # /setup-server: declarative SERVER_PLAN / ROLE_PLAN provisioner.
 ```
 
 **Schema (SQLite):**
@@ -120,7 +123,8 @@ cogs/
 
 ## Credits
 
-- **[Wavu Wank](https://wank.wavu.wiki/)** — the data source for all player ranks and stats. Please don't abuse it (the bot uses a custom User-Agent and single-flight requests).
+- **[Wavu Wank](https://wank.wavu.wiki/)** — primary source for player profiles and very-recent rank data. Please don't abuse it (the bot uses a custom User-Agent and single-flight requests).
+- **[ewgf.gg](https://ewgf.gg)** — secondary rank source covering inactive players. Lookups are on-demand and per-user, no scraping at scale.
 - Built with **[discord.py](https://github.com/Rapptz/discord.py)** (v2.x).
 
 ## License

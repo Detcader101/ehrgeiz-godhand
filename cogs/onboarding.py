@@ -11,6 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+import ewgf
 import wavu
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,23 @@ VERIFIED_ROLE_NAME = os.environ.get("VERIFIED_ROLE_NAME", "Verified")
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _resolve_rank(tekken_id: str) -> str | None:
+    """Try wavu's replay stream first (authoritative for very recent matches);
+    fall back to ewgf.gg (covers inactive players). Returns None if neither
+    source has a parseable rank."""
+    try:
+        result = await wavu.find_player_rank(tekken_id)
+        if result is not None:
+            return result[1]
+    except wavu.WavuError as e:
+        log.warning("wavu rank lookup failed for %s: %s", tekken_id, e)
+    try:
+        return await ewgf.find_player_rank(tekken_id)
+    except ewgf.EwgfError as e:
+        log.warning("ewgf rank lookup failed for %s: %s", tekken_id, e)
+        return None
 
 
 async def _ensure_role(guild: discord.Guild, name: str, *, reason: str) -> discord.Role:
@@ -122,14 +140,8 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
             )
             return
 
-        # Try to auto-detect rank from recent replays.
-        try:
-            rank_result = await wavu.find_player_rank(entered)
-        except wavu.WavuError:
-            rank_result = None
-        if rank_result is not None:
-            _rid, rank_name = rank_result
-            profile.rank_tier = rank_name
+        # Auto-detect rank: wavu replays first, then ewgf as fallback.
+        profile.rank_tier = await _resolve_rank(entered)
 
         if profile.rank_tier:
             view = ConfirmProfileView(self.bot, interaction.user.id, profile)
@@ -326,10 +338,7 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
         await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
         return
 
-    try:
-        rank_result = await wavu.find_player_rank(row["tekken_id"])
-    except wavu.WavuError:
-        rank_result = None
+    rank_name = await _resolve_rank(row["tekken_id"])
 
     member = interaction.guild.get_member(interaction.user.id)
     stored = row["rank_tier"]
@@ -349,8 +358,8 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
         )
         await _apply_rank_and_verified(member, profile)
 
-    if rank_result is not None:
-        await _save_and_apply(rank_result[1])
+    if rank_name is not None:
+        await _save_and_apply(rank_name)
         await interaction.followup.send(
             content="Updated.", embed=_profile_embed(profile),
             ephemeral=True, delete_after=12,
@@ -358,13 +367,13 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     elif stored_is_valid:
         await _save_and_apply(stored)
         await interaction.followup.send(
-            content="Updated. *(No recent ranked match found — kept your existing rank.)*",
+            content="Updated. *(Couldn't auto-detect rank — kept your existing one.)*",
             embed=_profile_embed(profile), ephemeral=True, delete_after=12,
         )
     else:
         view = RankGroupSelectView(bot, interaction.user.id, profile)
         await interaction.followup.send(
-            f"Couldn't find a recent ranked match for **{profile.display_name}**. "
+            f"Couldn't auto-detect a rank for **{profile.display_name}**. "
             "Pick your current rank:",
             view=view, ephemeral=True,
         )
@@ -619,11 +628,7 @@ class Onboarding(commands.Cog):
                 return
             profile.rank_tier = rank
         else:
-            try:
-                rank_result = await wavu.find_player_rank(profile.tekken_id)
-            except wavu.WavuError:
-                rank_result = None
-            profile.rank_tier = rank_result[1] if rank_result else None
+            profile.rank_tier = await _resolve_rank(profile.tekken_id)
 
         existing = await db.get_player_by_tekken_id(profile.tekken_id)
         if existing and existing["discord_id"] != member.id:
