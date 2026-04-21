@@ -31,6 +31,11 @@ class ChannelSpec:
     name: str
     kind: str  # "text" or "voice"
     topic: str | None = None
+    # Roles to grant view+send to *in addition* to the category default. Used
+    # for staff-only categories where one specific channel needs broader read
+    # access (e.g. #verification-log inside Staff, but Organizers must also
+    # see + click the Confirm/Reject buttons there).
+    extra_access_roles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -78,7 +83,9 @@ SERVER_PLAN: list[CategorySpec] = [
         ChannelSpec("mod-log", "text", "Every mod action the bot performs is logged here."),
         ChannelSpec("verification-log", "text",
                     "Audit trail for player verification: links, unlinks, "
-                    "rank changes, admin overrides. Spot suspicious patterns here."),
+                    "rank changes, admin overrides, and high-rank pending "
+                    "claims (Confirm/Reject buttons live here).",
+                    extra_access_roles=["Organizer"]),
         ChannelSpec("staff-chat", "text", "Private admin + moderator discussion."),
     ], staff_only=True),
 ]
@@ -260,23 +267,45 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
                 category.channels if category else guild.channels,
                 name=ch_spec.name,
             ) or discord.utils.get(guild.channels, name=ch_spec.name)
+
+            new_channel = None
             if existing is not None:
                 report.channels_existing.append(ch_spec.name)
-                continue
-            try:
-                if ch_spec.kind == "voice":
-                    await guild.create_voice_channel(
-                        ch_spec.name, category=category,
-                        reason="Ehrgeiz Godhand /setup-server",
-                    )
-                else:
-                    await guild.create_text_channel(
-                        ch_spec.name, category=category, topic=ch_spec.topic,
-                        reason="Ehrgeiz Godhand /setup-server",
-                    )
-                report.channels_created.append(ch_spec.name)
-            except discord.HTTPException as e:
-                report.errors.append(f"Channel '{ch_spec.name}': {e}")
+                # Still apply extra_access_roles in case the channel exists from
+                # an older /setup-server run that didn't set them.
+                if ch_spec.extra_access_roles and isinstance(existing, discord.TextChannel):
+                    new_channel = existing
+            else:
+                try:
+                    if ch_spec.kind == "voice":
+                        await guild.create_voice_channel(
+                            ch_spec.name, category=category,
+                            reason="Ehrgeiz Godhand /setup-server",
+                        )
+                    else:
+                        new_channel = await guild.create_text_channel(
+                            ch_spec.name, category=category, topic=ch_spec.topic,
+                            reason="Ehrgeiz Godhand /setup-server",
+                        )
+                    report.channels_created.append(ch_spec.name)
+                except discord.HTTPException as e:
+                    report.errors.append(f"Channel '{ch_spec.name}': {e}")
+                    continue
+
+            if new_channel is not None and ch_spec.extra_access_roles:
+                for role_name in ch_spec.extra_access_roles:
+                    role = role_by_name.get(role_name)
+                    if role is None:
+                        continue
+                    try:
+                        await new_channel.set_permissions(
+                            role, view_channel=True, send_messages=True,
+                            reason="Ehrgeiz Godhand /setup-server (extra access)",
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        report.errors.append(
+                            f"Channel '{ch_spec.name}' grant {role_name}: {e}"
+                        )
 
     return report
 

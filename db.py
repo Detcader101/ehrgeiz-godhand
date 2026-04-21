@@ -44,6 +44,25 @@ CREATE TABLE IF NOT EXISTS unlinks (
     tekken_id    TEXT,
     unlinked_at  TEXT NOT NULL
 );
+
+-- High-rank claims (Tekken King and above) sit here until an organizer
+-- confirms or rejects them. Spec §5.3.
+--   message_id/channel_id point to the audit-log post that hosts the
+--   Confirm/Reject buttons; both are nullable in case the post fails.
+--   expired_at is set by the 72h sweeper (NULL = still pending).
+CREATE TABLE IF NOT EXISTS pending_verifications (
+    discord_id   INTEGER PRIMARY KEY,
+    guild_id     INTEGER NOT NULL,
+    tekken_id    TEXT    NOT NULL,
+    rank_tier    TEXT    NOT NULL,
+    rank_source  TEXT    NOT NULL,
+    created_at   TEXT    NOT NULL,
+    message_id   INTEGER,
+    channel_id   INTEGER,
+    expired_at   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_message ON pending_verifications(message_id);
 """
 
 
@@ -141,6 +160,116 @@ async def clear_unlink(discord_id: int) -> None:
     their server)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM unlinks WHERE discord_id = ?", (discord_id,))
+        await db.commit()
+
+
+async def purge_unlinks_before(cutoff_iso: str) -> int:
+    """Delete unlinks rows whose unlinked_at is older than the cutoff.
+    Used by the sweeper to drop expired cooldown records — once the cooldown
+    has elapsed the row has no behavioural effect, so holding the
+    discord_id↔tekken_id pairing is needless data retention.
+    Returns the number of rows deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM unlinks WHERE unlinked_at < ?", (cutoff_iso,)
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+# --------------------------------------------------------------------------- #
+# Pending verifications (spec §5.3)                                            #
+# --------------------------------------------------------------------------- #
+
+async def upsert_pending_verification(
+    *,
+    discord_id: int,
+    guild_id: int,
+    tekken_id: str,
+    rank_tier: str,
+    rank_source: str,
+    now_iso: str,
+) -> None:
+    """Create or replace a pending verification request. Resets expired_at
+    and message_id; the caller is expected to set_pending_message after
+    posting the audit message."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO pending_verifications (discord_id, guild_id, tekken_id,
+                rank_tier, rank_source, created_at, message_id, channel_id, expired_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+            ON CONFLICT(discord_id) DO UPDATE SET
+                guild_id    = excluded.guild_id,
+                tekken_id   = excluded.tekken_id,
+                rank_tier   = excluded.rank_tier,
+                rank_source = excluded.rank_source,
+                created_at  = excluded.created_at,
+                message_id  = NULL,
+                channel_id  = NULL,
+                expired_at  = NULL
+            """,
+            (discord_id, guild_id, tekken_id, rank_tier, rank_source, now_iso),
+        )
+        await db.commit()
+
+
+async def set_pending_message(discord_id: int, channel_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_verifications SET channel_id = ?, message_id = ? WHERE discord_id = ?",
+            (channel_id, message_id, discord_id),
+        )
+        await db.commit()
+
+
+async def get_pending_by_discord(discord_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM pending_verifications WHERE discord_id = ?", (discord_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def get_pending_by_message(message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM pending_verifications WHERE message_id = ?", (message_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def delete_pending_verification(discord_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM pending_verifications WHERE discord_id = ?", (discord_id,)
+        )
+        await db.commit()
+
+
+async def list_stale_pending(created_before_iso: str):
+    """Return non-expired rows whose created_at is older than the cutoff
+    (i.e. eligible for the 72h stale-marker sweep)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM pending_verifications
+            WHERE expired_at IS NULL AND created_at < ?
+            """,
+            (created_before_iso,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def mark_pending_expired(discord_id: int, now_iso: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_verifications SET expired_at = ? WHERE discord_id = ?",
+            (now_iso, discord_id),
+        )
         await db.commit()
 
 

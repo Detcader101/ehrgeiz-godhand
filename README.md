@@ -33,7 +33,8 @@ Built to be run either on a laptop for one friendly server or 24/7 as a public h
 
 **Anti-abuse**
 - **Audit log** — every link, unlink, rank change, and admin override is posted to a staff-only `#verification-log` channel for review.
-- **7-day relink cooldown** on changing to a *different* Tekken ID after an unlink. Same-ID re-link is allowed immediately. `/admin-link` bypasses both.
+- **7-day relink cooldown** on changing to a *different* Tekken ID after an unlink. Same-ID re-link is allowed immediately. Auto-cleared after 7 days; admins can clear sooner with `/admin-clear-cooldown` or override with `/admin-link`.
+- **Tiered verification for high-rank claims** — Tekken King and above (across self-report, wavu, ewgf) goes to **Pending Verification**: the user is granted Verified but no rank role until any Admin/Mod/Organizer clicks **Confirm** on the audit-log post. Stale after 72h (claim shown as self-reported, no rank role) but Confirm/Reject buttons remain functional. Persistent across bot restarts.
 
 **Planned**
 - Swiss tournaments seeded by rank tier
