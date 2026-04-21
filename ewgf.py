@@ -19,9 +19,12 @@ import re
 
 import aiohttp
 
+from cache import TTLCache
 from wavu import TEKKEN_RANKS
 
 BASE_URL = "https://ewgf.gg"
+
+_CACHE = TTLCache()
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -51,13 +54,23 @@ def _highest_known(names: list[str]) -> str | None:
 
 
 async def find_player_rank(
-    tekken_id: str, *, timeout_s: float = 15.0
+    tekken_id: str, *, timeout_s: float = 15.0, force_refresh: bool = False
 ) -> str | None:
     """Return the player's current rank tier from ewgf.gg, or None if unknown.
 
     Takes the highest current-season rank across all characters; falls back to
     the highest all-time rank if no current-season data exists.
     """
+    return await _CACHE.get_or_fetch(
+        f"ewgf:rank:{tekken_id}",
+        lambda: _find_player_rank_uncached(tekken_id, timeout_s=timeout_s),
+        force_refresh=force_refresh,
+    )
+
+
+async def _find_player_rank_uncached(
+    tekken_id: str, *, timeout_s: float
+) -> str | None:
     url = f"{BASE_URL}/player/{tekken_id}"
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html"}
     timeout = aiohttp.ClientTimeout(total=timeout_s)

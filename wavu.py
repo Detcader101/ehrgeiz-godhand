@@ -18,8 +18,12 @@ from dataclasses import dataclass
 import aiohttp
 from bs4 import BeautifulSoup
 
+from cache import TTLCache
+
 BASE_URL = "https://wank.wavu.wiki"
 USER_AGENT = "TekkenTOBot/0.1 (discord onboarding; contact: server owner)"
+
+_CACHE = TTLCache()
 
 # Polaris Battle IDs are 12-char base62-ish strings. Loose validation only;
 # reject obvious junk but let the wavu lookup be the source of truth.
@@ -190,14 +194,23 @@ def _parse_profile(tekken_id: str, html: str) -> PlayerProfile:
     )
 
 
-async def lookup_player(tekken_id: str, *, timeout_s: float = 10.0) -> PlayerProfile:
+async def lookup_player(
+    tekken_id: str, *, timeout_s: float = 10.0, force_refresh: bool = False
+) -> PlayerProfile:
     tekken_id = re.sub(r"[\s\-_]+", "", tekken_id)
     if not TEKKEN_ID_RE.match(tekken_id):
         raise PlayerNotFound(
             "That doesn't look like a Tekken ID. It should be ~12 alphanumeric "
             "characters (find it on your Tekken 8 player card)."
         )
+    return await _CACHE.get_or_fetch(
+        f"wavu:profile:{tekken_id}",
+        lambda: _lookup_player_uncached(tekken_id, timeout_s=timeout_s),
+        force_refresh=force_refresh,
+    )
 
+
+async def _lookup_player_uncached(tekken_id: str, *, timeout_s: float) -> PlayerProfile:
     url = f"{BASE_URL}/player/{tekken_id}"
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html"}
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -229,6 +242,7 @@ async def find_player_rank(
     *,
     max_pages: int = 3,
     timeout_s: float = 15.0,
+    force_refresh: bool = False,
 ) -> tuple[int, str] | None:
     """
     Search wavu's replay stream for the target player's most recent match
@@ -236,6 +250,16 @@ async def find_player_rank(
     `max_pages` * ~700 seconds of replay history.
     """
     tekken_id = re.sub(r"[\s\-_]+", "", tekken_id)
+    return await _CACHE.get_or_fetch(
+        f"wavu:rank:{tekken_id}",
+        lambda: _find_player_rank_uncached(tekken_id, max_pages=max_pages, timeout_s=timeout_s),
+        force_refresh=force_refresh,
+    )
+
+
+async def _find_player_rank_uncached(
+    tekken_id: str, *, max_pages: int, timeout_s: float
+) -> tuple[int, str] | None:
     url = f"{BASE_URL}/api/replays"
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     timeout = aiohttp.ClientTimeout(total=timeout_s)

@@ -23,18 +23,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _resolve_rank(tekken_id: str) -> str | None:
+async def _resolve_rank(tekken_id: str, *, force_refresh: bool = False) -> str | None:
     """Try wavu's replay stream first (authoritative for very recent matches);
     fall back to ewgf.gg (covers inactive players). Returns None if neither
-    source has a parseable rank."""
+    source has a parseable rank.
+
+    `force_refresh=True` bypasses the cache in both sources — used by the
+    Refresh Rank flow where the user is signalling "I just played, re-check."
+    """
     try:
-        result = await wavu.find_player_rank(tekken_id)
+        result = await wavu.find_player_rank(tekken_id, force_refresh=force_refresh)
         if result is not None:
             return result[1]
     except wavu.WavuError as e:
         log.warning("wavu rank lookup failed for %s: %s", tekken_id, e)
     try:
-        return await ewgf.find_player_rank(tekken_id)
+        return await ewgf.find_player_rank(tekken_id, force_refresh=force_refresh)
     except ewgf.EwgfError as e:
         log.warning("ewgf rank lookup failed for %s: %s", tekken_id, e)
         return None
@@ -333,12 +337,12 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        profile = await wavu.lookup_player(row["tekken_id"])
+        profile = await wavu.lookup_player(row["tekken_id"], force_refresh=True)
     except (wavu.PlayerNotFound, wavu.WavuError) as e:
         await interaction.followup.send(f"{e}", ephemeral=True, delete_after=15)
         return
 
-    rank_name = await _resolve_rank(row["tekken_id"])
+    rank_name = await _resolve_rank(row["tekken_id"], force_refresh=True)
 
     member = interaction.guild.get_member(interaction.user.id)
     stored = row["rank_tier"]
