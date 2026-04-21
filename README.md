@@ -1,7 +1,7 @@
 # Ehrgeiz Godhand
 
 <p align="center">
-  <img src="assets/ehrgeiz.png" alt="Ehrgeiz Godhand — black and white fist logo with lightning slashes" width="280">
+  <img src="assets/ehrgeiz.png" alt="Ehrgeiz Godhand — red and black fist logo with lightning slashes" width="280">
 </p>
 
 **Panel-driven Discord bot for Tekken 8 communities — role assignment by rank/ELO, bracket forming, and general moderation.**
