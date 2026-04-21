@@ -333,31 +333,78 @@ class Onboarding(commands.Cog):
             await interaction.followup.send(f"{e}", ephemeral=True)
             return
 
-        # Auto-detect rank from recent replays; fall back to previously stored rank.
+        # Auto-detect rank from recent replays.
         try:
             rank_result = await wavu.find_player_rank(row["tekken_id"])
         except wavu.WavuError:
             rank_result = None
-        if rank_result is not None:
-            profile.rank_tier = rank_result[1]
-        else:
-            profile.rank_tier = row["rank_tier"]
 
         member = interaction.guild.get_member(interaction.user.id)
-        await db.upsert_player(
-            discord_id=member.id,
-            tekken_id=profile.tekken_id,
-            display_name=profile.display_name,
-            main_char=profile.main_char,
-            rating_mu=profile.rating_mu,
-            rank_tier=profile.rank_tier,
-            linked_by=row["linked_by"],
-            now_iso=_now_iso(),
+
+        stored = row["rank_tier"]
+        stored_is_valid = stored in wavu.ALL_RANK_NAMES
+
+        if rank_result is not None:
+            profile.rank_tier = rank_result[1]
+            await db.upsert_player(
+                discord_id=member.id,
+                tekken_id=profile.tekken_id,
+                display_name=profile.display_name,
+                main_char=profile.main_char,
+                rating_mu=profile.rating_mu,
+                rank_tier=profile.rank_tier,
+                linked_by=row["linked_by"],
+                now_iso=_now_iso(),
+            )
+            await _apply_rank_and_verified(member, profile)
+            await interaction.followup.send(
+                content="Updated.", embed=_profile_embed(profile), ephemeral=True
+            )
+        elif stored_is_valid:
+            profile.rank_tier = stored
+            await db.upsert_player(
+                discord_id=member.id,
+                tekken_id=profile.tekken_id,
+                display_name=profile.display_name,
+                main_char=profile.main_char,
+                rating_mu=profile.rating_mu,
+                rank_tier=profile.rank_tier,
+                linked_by=row["linked_by"],
+                now_iso=_now_iso(),
+            )
+            await _apply_rank_and_verified(member, profile)
+            await interaction.followup.send(
+                content="Updated. *(No recent ranked match found — kept your existing rank.)*",
+                embed=_profile_embed(profile), ephemeral=True,
+            )
+        else:
+            # No replay match, no prior valid rank → offer the self-report dropdown.
+            view = RankGroupSelectView(self.bot, interaction.user.id, profile)
+            await interaction.followup.send(
+                f"Couldn't find a recent ranked match for **{profile.display_name}**. "
+                "Pick your current rank:",
+                view=view, ephemeral=True,
+            )
+
+    @app_commands.command(name="set-rank",
+                          description="Manually set your rank (use if auto-detect is wrong).")
+    async def set_rank(self, interaction: discord.Interaction):
+        row = await db.get_player_by_discord(interaction.user.id)
+        if row is None:
+            await interaction.response.send_message(
+                "You're not linked yet. Use the Verify button first.", ephemeral=True
+            )
+            return
+        profile = wavu.PlayerProfile(
+            tekken_id=row["tekken_id"],
+            display_name=row["display_name"],
+            main_char=row["main_char"],
+            rating_mu=row["rating_mu"],
+            rank_tier=None,
         )
-        await _apply_rank_and_verified(member, profile)
-        note = "" if rank_result else "\n*(no recent ranked match found — kept previous rank)*"
-        await interaction.followup.send(
-            content=f"Updated.{note}", embed=_profile_embed(profile), ephemeral=True
+        view = RankGroupSelectView(self.bot, interaction.user.id, profile)
+        await interaction.response.send_message(
+            "Pick your current rank:", view=view, ephemeral=True,
         )
 
     @app_commands.command(name="admin-link",
