@@ -1,14 +1,18 @@
-"""Audit log helper (spec §5.1).
+"""Audit log helper (spec §5.1, §9).
 
-Posts structured events to a guild's verification-log channel. The
-channel is found by name (`#verification-log`), which the standard
-/setup-server provisions in the staff-only category.
+Posts structured events to one of two staff-only channels:
+  - #verification-log — identity actions (link/unlink/rank changes/admin
+    overrides). Spec §5.1.
+  - #mod-log — moderation actions (kick/ban/timeout/warn/purge). Spec §9.
 
-If the channel doesn't exist or the bot can't post, the call no-ops —
-audit logging is best-effort and must never break a user-facing flow.
+Channels are found by name; both are provisioned by the standard
+/setup-server in the staff-only category.
 
-When the à-la-carte setup rework lands, the channel name (and whether
-it's staff-only or public) becomes a per-guild preference.
+If the target channel doesn't exist or the bot can't post, the call
+no-ops — audit logging is best-effort and must never break a user flow.
+
+When the à-la-carte setup rework lands, channel names (and staff-only
+vs public) become per-guild preferences.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import logging
 import discord
 
 VERIFICATION_LOG_CHANNEL = "verification-log"
+MOD_LOG_CHANNEL = "mod-log"
 
 log = logging.getLogger(__name__)
 
@@ -28,10 +33,11 @@ async def post_event(
     color: discord.Color,
     fields: list[tuple[str, str, bool]] | None = None,
     description: str | None = None,
+    channel_name: str = VERIFICATION_LOG_CHANNEL,
 ) -> None:
     if guild is None:
         return
-    channel = discord.utils.get(guild.text_channels, name=VERIFICATION_LOG_CHANNEL)
+    channel = discord.utils.get(guild.text_channels, name=channel_name)
     if channel is None:
         return
     embed = discord.Embed(
@@ -43,4 +49,12 @@ async def post_event(
     try:
         await channel.send(embed=embed)
     except (discord.Forbidden, discord.HTTPException) as e:
-        log.warning("audit log post failed in guild %s: %s", guild.id, e)
+        log.warning(
+            "audit log post failed in guild %s (#%s): %s",
+            guild.id, channel_name, e,
+        )
+
+
+async def post_mod_event(guild: discord.Guild | None, **kwargs) -> None:
+    """Convenience wrapper: post to #mod-log instead of #verification-log."""
+    await post_event(guild, channel_name=MOD_LOG_CHANNEL, **kwargs)

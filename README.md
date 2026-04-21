@@ -31,6 +31,9 @@ Built to be run either on a laptop for one friendly server or 24/7 as a public h
 - Ephemeral responses with auto-delete so channels stay clean.
 - **5-minute TTL cache + single-flight dedupe** on every wavu/ewgf lookup so rapid clicks and multi-guild bursts don't hammer the upstream sites.
 
+**Moderation**
+- `/shutup @member` — one-click "stop talking": deletes the member's last 5 messages in the current channel and times them out for 2 minutes. Requires Moderate Members + Manage Messages. Logs to `#mod-log`. (More mod commands: `/kick`, `/ban`, `/timeout`, `/warn`, `/purge` — coming as part of v1.0 per [SPEC.md](SPEC.md) §9.)
+
 **Anti-abuse**
 - **Audit log** — every link, unlink, rank change, and admin override is posted to a staff-only `#verification-log` channel for review.
 - **7-day relink cooldown** on changing to a *different* Tekken ID after an unlink. Same-ID re-link is allowed immediately. Auto-cleared after 7 days; admins can clear sooner with `/admin-clear-cooldown` or override with `/admin-link`.

@@ -25,7 +25,7 @@ INTENTS = discord.Intents.default()
 INTENTS.members = True
 INTENTS.message_content = True
 
-INITIAL_COGS = ["cogs.onboarding", "cogs.setup"]
+INITIAL_COGS = ["cogs.onboarding", "cogs.setup", "cogs.mod"]
 
 
 class TekkenBot(commands.Bot):

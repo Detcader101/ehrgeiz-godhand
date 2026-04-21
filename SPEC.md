@@ -163,6 +163,7 @@ Every tournament, once closed, gets archived: final bracket image, results table
 A first-class mod cog, scoped small on purpose. If a server needs heavier moderation they should reach for a dedicated tool; Ehrgeiz's job is "enough for a friendly Tekken server."
 
 **v1.0 mod scope:**
+- `/shutup <user>` ✅ — convenience combo: deletes the user's last 5 messages in the current channel and times them out for 2 minutes. The "this person is being annoying right now" one-click hammer.
 - `/kick <user> [reason]`
 - `/ban <user> [reason] [delete_messages_days]`
 - `/timeout <user> <duration> [reason]`
