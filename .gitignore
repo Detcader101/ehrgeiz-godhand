@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+assets/rank_cache/
+assets/char_cache/

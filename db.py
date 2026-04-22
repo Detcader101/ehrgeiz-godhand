@@ -74,6 +74,58 @@ CREATE TABLE IF NOT EXISTS shutup_uses (
     last_used_at  TEXT    NOT NULL,
     PRIMARY KEY (discord_id, guild_id)
 );
+
+-- Tournaments (spec §8). One row per tournament; multiple concurrent per
+-- guild are allowed, but the unique partial index below forbids duplicate
+-- names while a tournament is still live.
+--   match_format: 'FT2' | 'FT3' — display metadata only; bot tracks match
+--     winners, not per-game scores.
+--   state: SIGNUPS_OPEN → IN_PROGRESS → COMPLETED, or CANCELLED from any
+--     state.
+--   signup_channel_id / signup_message_id point to the Join/Leave embed;
+--     nullable in case the initial post fails and we need to recover.
+CREATE TABLE IF NOT EXISTS tournaments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id          INTEGER NOT NULL,
+    organizer_id      INTEGER NOT NULL,
+    name              TEXT    NOT NULL,
+    match_format      TEXT    NOT NULL,
+    max_players       INTEGER,
+    state             TEXT    NOT NULL,
+    signup_channel_id INTEGER,
+    signup_message_id INTEGER,
+    created_at        TEXT    NOT NULL,
+    started_at        TEXT,
+    ended_at          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_tournaments_guild_state
+    ON tournaments(guild_id, state);
+CREATE INDEX IF NOT EXISTS idx_tournaments_signup_message
+    ON tournaments(signup_message_id);
+-- Enforces "unique name per guild while live" without blocking a future
+-- tournament from reusing the name after this one ends or is cancelled.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tournaments_active_name
+    ON tournaments(guild_id, name COLLATE NOCASE)
+    WHERE state IN ('SIGNUPS_OPEN', 'IN_PROGRESS');
+
+-- Participants of a tournament. Snapshots display_name and rank_tier at
+-- join time so the bracket/history stays stable even if the player later
+-- unlinks or re-ranks. forfeited flips on if the player leaves the server
+-- or unlinks mid-tournament (slice 2+ handles the consequences).
+CREATE TABLE IF NOT EXISTS tournament_participants (
+    tournament_id INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    display_name  TEXT    NOT NULL,
+    rank_tier     TEXT,
+    joined_at     TEXT    NOT NULL,
+    forfeited     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tournament_id, user_id),
+    FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_participants_tournament
+    ON tournament_participants(tournament_id);
 """
 
 
@@ -348,3 +400,187 @@ async def delete_panel(guild_id: int, kind: str) -> None:
             (guild_id, kind),
         )
         await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Tournaments (spec §8)                                                        #
+# --------------------------------------------------------------------------- #
+
+async def create_tournament(
+    *,
+    guild_id: int,
+    organizer_id: int,
+    name: str,
+    match_format: str,
+    max_players: int | None,
+    now_iso: str,
+) -> int:
+    """Insert a new tournament row in SIGNUPS_OPEN state and return its id.
+    Caller is expected to post the signup message and then call
+    set_tournament_signup_message with the resulting channel/message ids."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO tournaments (guild_id, organizer_id, name, match_format,
+                max_players, state, created_at)
+            VALUES (?, ?, ?, ?, ?, 'SIGNUPS_OPEN', ?)
+            """,
+            (guild_id, organizer_id, name, match_format, max_players, now_iso),
+        )
+        await db.commit()
+        return cur.lastrowid or 0
+
+
+async def set_tournament_signup_message(
+    tournament_id: int, channel_id: int, message_id: int,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournaments SET signup_channel_id = ?, signup_message_id = ? "
+            "WHERE id = ?",
+            (channel_id, message_id, tournament_id),
+        )
+        await db.commit()
+
+
+async def get_tournament(tournament_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournaments WHERE id = ?", (tournament_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def get_tournament_by_signup_message(message_id: int):
+    """Used by the signup View to resolve the tournament from a button click."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournaments WHERE signup_message_id = ?", (message_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def get_active_tournament_by_name(guild_id: int, name: str):
+    """Return a SIGNUPS_OPEN or IN_PROGRESS tournament with this name, if any.
+    Used by /tournament-create for a friendly duplicate-name error before we
+    hit the partial unique index."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM tournaments
+            WHERE guild_id = ? AND name = ? COLLATE NOCASE
+              AND state IN ('SIGNUPS_OPEN', 'IN_PROGRESS')
+            """,
+            (guild_id, name),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def list_tournaments(guild_id: int, states: tuple[str, ...] | None = None):
+    """List tournaments in a guild, optionally filtered by state(s).
+    Ordered newest-first."""
+    query = "SELECT * FROM tournaments WHERE guild_id = ?"
+    params: list = [guild_id]
+    if states:
+        placeholders = ",".join("?" * len(states))
+        query += f" AND state IN ({placeholders})"
+        params.extend(states)
+    query += " ORDER BY id DESC"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cur:
+            return await cur.fetchall()
+
+
+async def update_tournament_state(
+    tournament_id: int, state: str, now_iso: str | None = None,
+) -> None:
+    """Transition a tournament's state. If transitioning to IN_PROGRESS sets
+    started_at; to COMPLETED/CANCELLED sets ended_at. now_iso is required
+    for transitions that timestamp, ignored otherwise."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if state == "IN_PROGRESS":
+            await db.execute(
+                "UPDATE tournaments SET state = ?, started_at = ? WHERE id = ?",
+                (state, now_iso, tournament_id),
+            )
+        elif state in ("COMPLETED", "CANCELLED"):
+            await db.execute(
+                "UPDATE tournaments SET state = ?, ended_at = ? WHERE id = ?",
+                (state, now_iso, tournament_id),
+            )
+        else:
+            await db.execute(
+                "UPDATE tournaments SET state = ? WHERE id = ?",
+                (state, tournament_id),
+            )
+        await db.commit()
+
+
+async def add_participant(
+    *,
+    tournament_id: int,
+    user_id: int,
+    display_name: str,
+    rank_tier: str | None,
+    now_iso: str,
+) -> bool:
+    """Insert a participant. Returns True on insert, False if the user is
+    already in this tournament."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT OR IGNORE INTO tournament_participants
+                (tournament_id, user_id, display_name, rank_tier, joined_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (tournament_id, user_id, display_name, rank_tier, now_iso),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def remove_participant(tournament_id: int, user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM tournament_participants "
+            "WHERE tournament_id = ? AND user_id = ?",
+            (tournament_id, user_id),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def get_participant(tournament_id: int, user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournament_participants "
+            "WHERE tournament_id = ? AND user_id = ?",
+            (tournament_id, user_id),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def list_participants(tournament_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournament_participants "
+            "WHERE tournament_id = ? ORDER BY joined_at",
+            (tournament_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def count_participants(tournament_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM tournament_participants WHERE tournament_id = ?",
+            (tournament_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
