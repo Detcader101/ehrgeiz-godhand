@@ -14,6 +14,7 @@ from discord.ext import commands
 import audit
 import db
 import ewgf
+import media
 import wavu
 
 log = logging.getLogger(__name__)
@@ -253,9 +254,12 @@ async def _start_pending_verification(
         color=discord.Color.gold(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="Discord", value=f"{member.mention} (`{member.id}`)", inline=True)
-    embed.add_field(name="Tekken ID", value=f"`{tekken_id}`", inline=True)
-    embed.add_field(name="Claimed rank", value=rank_tier, inline=True)
+    embed.add_field(name="🪪 Discord", value=f"{member.mention} (`{member.id}`)", inline=True)
+    embed.add_field(name="🎮 Tekken ID", value=f"`{tekken_id}`", inline=True)
+    embed.add_field(name="🏆 Claimed rank", value=rank_tier, inline=True)
+    rank_icon = media.rank_icon_url(rank_tier)
+    if rank_icon is not None:
+        embed.set_thumbnail(url=rank_icon)
     embed.set_footer(text=f"Source: {rank_source}")
 
     try:
@@ -416,12 +420,20 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
 
 def _profile_embed(p: wavu.PlayerProfile) -> discord.Embed:
     embed = discord.Embed(title=p.display_name, color=discord.Color.blurple())
-    embed.add_field(name="Tekken ID", value=f"`{p.tekken_id}`", inline=False)
-    embed.add_field(name="Main", value=p.main_char or "—", inline=True)
-    embed.add_field(name="Rank", value=p.rank_tier or "—", inline=True)
+    embed.add_field(name="🪪 Tekken ID", value=f"`{p.tekken_id}`", inline=False)
+    embed.add_field(name="🥊 Main", value=p.main_char or "—", inline=True)
+    embed.add_field(name="🏅 Rank", value=p.rank_tier or "—", inline=True)
     if p.rating_mu is not None:
-        embed.add_field(name="Rating (μ)", value=f"{p.rating_mu:.0f}", inline=True)
-    embed.set_footer(text="Source: wank.wavu.wiki")
+        embed.add_field(name="📊 Rating (μ)", value=f"{p.rating_mu:.0f}", inline=True)
+    # Character portrait (right side) when we know the main; rank tier icon
+    # as the small author icon (left of name) when we know the rank.
+    char_icon = media.character_icon_url(p.main_char)
+    if char_icon is not None:
+        embed.set_thumbnail(url=char_icon)
+    rank_icon = media.rank_icon_url(p.rank_tier)
+    if rank_icon is not None:
+        embed.set_author(name=p.rank_tier or "", icon_url=rank_icon)
+    embed.set_footer(text="Sources: wank.wavu.wiki + ewgf.gg")
     return embed
 
 
@@ -1155,21 +1167,22 @@ class PlayerHubView(discord.ui.View):
 
 def _player_hub_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="Tekken 8 Player Hub",
+        title="🎴 Tekken 8 Player Hub",
         description=(
-            "**New here?** Click **Verify** and enter your **Tekken ID** "
+            "**🆕 New here?** Click **🔓 Verify** and enter your **Tekken ID** "
             "(the ~12-character Polaris Battle ID from *Main Menu → Community → "
             "My Profile*). The bot checks wavu.wiki, confirms it's you, and "
             "gives you your rank role.\n\n"
-            "**Already verified?**\n"
-            "• **Refresh Rank** — pull your latest rank from your recent matches.\n"
-            "• **Set Rank Manually** — pick your rank from a dropdown (for when "
+            "**✅ Already verified?**\n"
+            "• 🔄 **Refresh Rank** — pull your latest rank from recent matches.\n"
+            "• ✏️ **Set Rank Manually** — pick your rank from a dropdown (for when "
             "auto-detect can't find a recent match).\n"
-            "• **My Profile** — see what the bot has on file for you.\n"
-            "• **Unlink Me** — remove your link (with confirmation)."
+            "• 🪪 **My Profile** — see what the bot has on file for you.\n"
+            "• 🚪 **Unlink Me** — remove your link (with confirmation)."
         ),
         color=discord.Color.blurple(),
     )
+    embed.set_thumbnail(url=media.LOGO_URL)
     embed.set_footer(text="One Tekken ID per Discord account • Admins can override")
     return embed
 

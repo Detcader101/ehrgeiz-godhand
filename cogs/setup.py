@@ -17,6 +17,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import db
+import media
 from cogs.onboarding import (
     PANEL_KIND_PLAYER_HUB,
     PlayerHubView,
@@ -47,46 +48,60 @@ class CategorySpec:
 
 SERVER_PLAN: list[CategorySpec] = [
     CategorySpec("📋 Info", [
-        ChannelSpec("rules", "text", "Server rules. Breaking them gets you warned, timed out, or banned."),
-        ChannelSpec("announcements", "text", "Server-wide announcements. Staff-only posting."),
-        ChannelSpec("player-hub", "text", "Your account, ranks, and profile. Click the buttons."),
+        ChannelSpec("rules", "text",
+                    "📜 Server rules. Breaking them gets you warned, timed out, or banned."),
+        ChannelSpec("announcements", "text",
+                    "📣 Server-wide announcements. Staff-only posting."),
+        ChannelSpec("player-hub", "text",
+                    "🎴 Your account, ranks, and profile. Click the buttons."),
     ]),
     CategorySpec("💬 General", [
-        ChannelSpec("general", "text", "Main hangout chat."),
+        ChannelSpec("general", "text",
+                    "💬 Main hangout chat."),
         ChannelSpec("clips-and-highlights", "text",
-                    "Drop your clips. Use threads for per-character discussion."),
-        ChannelSpec("off-topic", "text", "Non-Tekken stuff."),
+                    "🎬 Drop your clips. Use threads for per-character discussion."),
+        ChannelSpec("off-topic", "text",
+                    "🌀 Non-Tekken stuff."),
     ]),
     CategorySpec("🥊 Tekken", [
-        ChannelSpec("tech-talk", "text", "Frame data, strategy, combo routes, meta."),
+        ChannelSpec("tech-talk", "text",
+                    "🧠 Frame data, strategy, combo routes, meta."),
         ChannelSpec("fundamentals", "text",
-                    "Newbies welcome. Ask the basics here without judgement."),
-        ChannelSpec("combos", "text", "Labbing, combo routes, optimisation."),
-        ChannelSpec("matchup-help", "text", "Ask about specific matchups."),
+                    "📚 Newbies welcome. Ask the basics here without judgement."),
+        ChannelSpec("combos", "text",
+                    "🎯 Labbing, combo routes, optimisation."),
+        ChannelSpec("matchup-help", "text",
+                    "🆚 Ask about specific matchups."),
     ]),
     CategorySpec("🔎 Matchmaking", [
-        ChannelSpec("matchmaking-na", "text", "Looking for games — North America."),
-        ChannelSpec("matchmaking-eu", "text", "Looking for games — Europe."),
-        ChannelSpec("matchmaking-asia", "text", "Looking for games — Asia."),
-        ChannelSpec("matchmaking-oce", "text", "Looking for games — Oceania."),
+        ChannelSpec("matchmaking-na", "text",
+                    "🇺🇸 Looking for games — North America."),
+        ChannelSpec("matchmaking-eu", "text",
+                    "🇪🇺 Looking for games — Europe."),
+        ChannelSpec("matchmaking-asia", "text",
+                    "🌏 Looking for games — Asia."),
+        ChannelSpec("matchmaking-oce", "text",
+                    "🦘 Looking for games — Oceania."),
     ]),
     CategorySpec("🏆 Competitive", [
         ChannelSpec("tournaments", "text",
-                    "Tournament signups and chat. Organizers post here."),
+                    "🏆 Tournament signups and chat. Organizers post here."),
         ChannelSpec("tournament-history", "text",
-                    "Archived brackets and results. Posted by the bot."),
+                    "📜 Archived brackets and results. Posted by the bot."),
     ]),
     CategorySpec("🔊 Voice", [
         ChannelSpec("General VC", "voice"),
     ]),
     CategorySpec("🛠️ Staff", [
-        ChannelSpec("mod-log", "text", "Every mod action the bot performs is logged here."),
+        ChannelSpec("mod-log", "text",
+                    "📋 Every mod action the bot performs is logged here."),
         ChannelSpec("verification-log", "text",
-                    "Audit trail for player verification: links, unlinks, "
+                    "🔍 Audit trail for player verification: links, unlinks, "
                     "rank changes, admin overrides, and high-rank pending "
                     "claims (Confirm/Reject buttons live here).",
                     extra_access_roles=["Organizer"]),
-        ChannelSpec("staff-chat", "text", "Private admin + moderator discussion."),
+        ChannelSpec("staff-chat", "text",
+                    "🤐 Private admin + moderator discussion."),
     ], staff_only=True),
 ]
 
@@ -142,49 +157,56 @@ class SetupReport:
     panel_skip_reason: str | None = None  # human-readable reason if skipped
 
     def to_embed(self) -> discord.Embed:
-        embed = discord.Embed(title="Server setup complete", color=discord.Color.green())
+        embed = discord.Embed(
+            title="✅ Server setup complete",
+            description="Your Ehrgeiz Godhand server is provisioned. "
+                        "Summary below — anything that already existed was left alone.",
+            color=discord.Color.green(),
+        )
+        embed.set_thumbnail(url=media.LOGO_URL)
 
         def section(created: list[str], existing: list[str]) -> str:
             parts = []
             if created:
-                parts.append(f"**Created ({len(created)}):** " + ", ".join(created))
+                parts.append(f"🆕 **Created ({len(created)}):** " + ", ".join(created))
             if existing:
-                parts.append(f"**Already existed ({len(existing)}):** " + ", ".join(existing))
+                parts.append(f"☑️ **Already existed ({len(existing)}):** " + ", ".join(existing))
             return "\n".join(parts) if parts else "—"
 
-        embed.add_field(name="Categories",
+        embed.add_field(name="📂 Categories",
                         value=section(self.categories_created, self.categories_existing),
                         inline=False)
-        embed.add_field(name="Channels",
+        embed.add_field(name="📺 Channels",
                         value=section(self.channels_created, self.channels_existing),
                         inline=False)
-        embed.add_field(name="Roles",
+        embed.add_field(name="👥 Roles",
                         value=section(self.roles_created, self.roles_existing),
                         inline=False)
 
         # Next-steps panel: what the admin still has to do manually.
         next_steps = [
-            "**1.** Server Settings → Roles: drag the bot's role **above** the rank "
-            "roles (and Admin/Moderator if you want the bot to be able to manage them).",
+            "**1️⃣** Server Settings → Roles: drag the bot's role **above** the rank "
+            "roles (and Admin/Moderator if you want the bot to manage them).",
         ]
         if self.panel_posted_in:
             next_steps.append(
-                f"**2.** Player Hub panel is live in **#{self.panel_posted_in}**. "
+                f"**2️⃣** 🎴 Player Hub panel is live in **#{self.panel_posted_in}**. "
                 "Nothing else needed there."
             )
         else:
             reason = f" ({self.panel_skip_reason})" if self.panel_skip_reason else ""
             next_steps.append(
-                f"**2.** Player Hub panel was **not** auto-posted{reason}. "
+                f"**2️⃣** 🎴 Player Hub panel was **not** auto-posted{reason}. "
                 "Go to your preferred channel and run `/post-player-panel`."
             )
-        next_steps.append("**3.** Write your rules in **#rules** and pin them.")
+        next_steps.append("**3️⃣** 📜 Write your rules in **#rules** and pin them.")
         embed.add_field(name="📝 Next steps", value="\n".join(next_steps), inline=False)
 
         if self.errors:
             embed.add_field(name="⚠ Errors",
                             value="\n".join(self.errors[:5]), inline=False)
             embed.color = discord.Color.orange()
+        embed.set_footer(text="Ehrgeiz Godhand • Idempotent — safe to re-run later")
         return embed
 
 
@@ -362,14 +384,20 @@ def _preview_embed() -> discord.Embed:
         lines.append("")
 
     embed = discord.Embed(
-        title="Confirm server setup",
-        description="Going to create (or skip-if-exists):",
+        title="🛠️ Confirm server setup",
+        description=(
+            "Going to create the standard **Ehrgeiz Godhand** server layout. "
+            "Anything that already exists by name is **skipped** — re-running "
+            "later is safe."
+        ),
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Channels", value="\n".join(lines)[:1024], inline=False)
-    role_list = ", ".join(r.name for r in ROLE_PLAN)
-    embed.add_field(name="Roles", value=role_list, inline=False)
-    embed.set_footer(text="Safe to run again later — existing items are skipped.")
+    embed.set_thumbnail(url=media.LOGO_URL)
+    embed.add_field(name="📂 Categories & channels",
+                    value="\n".join(lines)[:1024], inline=False)
+    role_list = ", ".join(f"`{r.name}`" for r in ROLE_PLAN)
+    embed.add_field(name="👥 Roles", value=role_list, inline=False)
+    embed.set_footer(text="Click Build it to provision, or Cancel.")
     return embed
 
 
