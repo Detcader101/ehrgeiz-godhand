@@ -34,17 +34,9 @@ ACCENT = (200, 30, 40)
 TEXT = (235, 230, 225)
 TEXT_DIM = (160, 155, 150)
 
-WIDTH = 820
-HEADER_HEIGHT = 54
-ROW_HEIGHT = 84
-PADDING_X = 24
-PADDING_Y = 18
-# Icons from ewgf are NOT square — rank icons are 500x250 wide plaques and
-# character icons are 450x640 portraits. We give each a bounding box whose
-# aspect matches the source so nothing gets squashed.
-RANK_ICON_BOX = (120, 60)    # 2:1
-CHAR_ICON_BOX = (52, 72)     # 3:4
-INTER_PAD = 14
+# Roster layout constants are local to render_roster — the signup render
+# is a fixed card grid. Bracket-specific constants live alongside the
+# bracket renderer further down.
 
 # Typography. We run two families:
 #   - Display (Bebas Neue, condensed all-caps sans) for the broadcast-style
@@ -171,49 +163,117 @@ def _paste_icon(
     canvas.paste(resized, (ox, oy), resized)
 
 
+def _fill_cell_with_icon(
+    canvas: Image.Image, icon: Image.Image | None,
+    rect: tuple[int, int, int, int], pad: int,
+) -> None:
+    """Aspect-preserving fit into a rectangular grid cell (letterboxed).
+    Used for rank plaques where the whole plaque image matters."""
+    if icon is None:
+        return
+    x0, y0, x1, y1 = rect
+    box_w = max(1, (x1 - x0) - 2 * pad)
+    box_h = max(1, (y1 - y0) - 2 * pad)
+    _paste_icon(canvas, icon, x0 + pad, y0 + pad, box_w, box_h)
+
+
+def _fill_cell_with_icon_cover(
+    canvas: Image.Image, icon: Image.Image | None,
+    rect: tuple[int, int, int, int], pad: int,
+    vertical_anchor: float = 0.0,
+) -> None:
+    """Scale-and-crop an icon to completely fill a grid cell (CSS
+    'object-fit: cover'). Horizontal overflow crops centered; vertical
+    overflow crops by `vertical_anchor` (0 = top, 1 = bottom). For
+    character portraits ~0.18 gives a 'bust shot' framing — shoulders
+    and face dominate, top of head sliver trimmed."""
+    if icon is None:
+        return
+    x0, y0, x1, y1 = rect
+    cell_w = max(1, (x1 - x0) - 2 * pad)
+    cell_h = max(1, (y1 - y0) - 2 * pad)
+    src_w, src_h = icon.size
+    scale = max(cell_w / src_w, cell_h / src_h)
+    new_w = max(1, int(src_w * scale))
+    new_h = max(1, int(src_h * scale))
+    resized = icon.resize((new_w, new_h), Image.LANCZOS)
+    if new_w > cell_w:
+        offset_x = (new_w - cell_w) // 2
+        resized = resized.crop((offset_x, 0, offset_x + cell_w, new_h))
+    if resized.size[1] > cell_h:
+        overflow = resized.size[1] - cell_h
+        offset_y = int(overflow * max(0.0, min(1.0, vertical_anchor)))
+        resized = resized.crop(
+            (0, offset_y, resized.size[0], offset_y + cell_h),
+        )
+    canvas.paste(resized, (x0 + pad, y0 + pad), resized)
+
+
+def _fit_text_to_box(
+    draw: ImageDraw.ImageDraw, text: str,
+    *, max_w: int, max_h: int,
+    max_size: int, min_size: int, step: int = 2,
+    font_loader=None,
+):
+    """Pick the largest font size at which `text` fits inside a
+    (max_w, max_h) box. Defaults to the display face; pass
+    `_load_font` for a mixed-case body bold instead."""
+    loader = font_loader or _load_display_font
+    for size in range(max_size, min_size - 1, -step):
+        font = loader(size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        if tw <= max_w and th <= max_h:
+            return font
+    return loader(min_size)
+
+
 async def render_roster(participants: list[dict]) -> io.BytesIO:
-    """Render a PNG of the signup roster.
+    """Render the signup roster as a grid of player cards.
+
+    Each card is a strict 2x2 rectangular layout:
+      ┌──────────┬────────────┐
+      │          │ RANK       │
+      │ PORTRAIT ├────────────┤
+      │          │ NAME       │
+      └──────────┴────────────┘
+    The portrait is a top-anchored cover crop (bust-shot framing); the
+    character name is a red chip on the portrait's bottom edge. Name
+    text scales to fill the name cell — short handles dominate, long
+    ones shrink, but the card silhouette never changes.
 
     Each participant dict needs keys: display_name, rank_tier, main_char.
     Missing icons leave blank slots; missing rank/char strings show
-    'Unranked' / no char icon.
+    'Unranked' / no char chip.
     """
     RANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CHAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    count = max(1, len(participants))
-    height = HEADER_HEIGHT + count * ROW_HEIGHT + PADDING_Y * 2
-    img = Image.new("RGBA", (WIDTH, height), BG_COLOR)
-    draw = ImageDraw.Draw(img)
+    W = 880
+    COLS = 2
+    CARD_W = 404
+    CARD_H = 180
+    HEADER_H = 120
+    GAP = 16
+    PORTRAIT_W = 140
+    RANK_H = 110
+    NAME_H = CARD_H - RANK_H
+    CELL_PAD = 10
+    PORTRAIT_PAD = 2
+    CHIP_H = 40
 
-    # Header bar — subtle vertical gradient behind the title for depth,
-    # then the accent underline.
-    _paint_header_gradient(img, 0, HEADER_HEIGHT)
-    draw.line(
-        [(0, HEADER_HEIGHT), (WIDTH, HEADER_HEIGHT)],
-        fill=ACCENT, width=2,
-    )
-    title_font = _load_display_font(36)
-    draw.text(
-        (PADDING_X, 8),
-        f"ENTRANTS  ·  {len(participants)}",
-        fill=TEXT, font=title_font,
-    )
+    # Cell background tints — the portrait cell stays slightly darker
+    # than the rank/name cells so the grid tiles read without hard
+    # borders.
+    PORTRAIT_CELL_BG = (24, 20, 22)
+    RIGHT_CELL_BG = ROW_BG_ALT
 
-    if not participants:
-        note_font = _load_font(18)
-        draw.text(
-            (PADDING_X, HEADER_HEIGHT + PADDING_Y + 14),
-            "No one yet — be the first to step up.",
-            fill=TEXT_DIM, font=note_font,
-        )
-        return _to_png_buf(img)
-
-    # Only open a network session if at least one icon is missing from
-    # cache. Hot path (all icons cached) stays fully local.
+    # Pre-fetch all icons in one go (network session opened only if
+    # cache misses — steady-state is fully offline).
     session: aiohttp.ClientSession | None = None
     try:
-        if _any_missing_cache(participants):
+        if participants and _any_missing_cache(participants):
             session = aiohttp.ClientSession()
         rank_icons = await asyncio.gather(*(
             _fetch_icon(
@@ -233,40 +293,107 @@ async def render_roster(participants: list[dict]) -> io.BytesIO:
         if session is not None:
             await session.close()
 
-    name_font = _load_font(22)
-    rank_font = _load_font(16)
+    rows = max(1, (len(participants) + COLS - 1) // COLS)
+    H = HEADER_H + GAP + rows * (CARD_H + GAP) + GAP
+    img = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Header — title + entrant count in Bebas over a subtle gradient.
+    _paint_header_gradient(img, 0, HEADER_H)
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=ACCENT, width=3)
+    draw.text((24, 14), "EHRGEIZ GODHAND",
+              fill=TEXT, font=_load_display_font(52))
+    draw.text((24, 74), f"ENTRANTS  ·  {len(participants)}",
+              fill=ACCENT, font=_load_display_font(26))
+
+    if not participants:
+        note_font = _load_font(18)
+        draw.text(
+            (24, HEADER_H + GAP + 24),
+            "No one yet — be the first to step up.",
+            fill=TEXT_DIM, font=note_font,
+        )
+        return _to_png_buf(img)
 
     for i, p in enumerate(participants):
-        y = HEADER_HEIGHT + PADDING_Y + i * ROW_HEIGHT
-        if i % 2 == 1:
+        col = i % COLS
+        row = i // COLS
+        cx = 24 + col * (CARD_W + 24)
+        cy = HEADER_H + GAP + row * (CARD_H + GAP)
+
+        portrait_rect = (cx, cy, cx + PORTRAIT_W, cy + CARD_H)
+        rank_rect     = (cx + PORTRAIT_W, cy,
+                         cx + CARD_W, cy + RANK_H)
+        name_rect     = (cx + PORTRAIT_W, cy + RANK_H,
+                         cx + CARD_W, cy + CARD_H)
+
+        draw.rectangle(portrait_rect, fill=PORTRAIT_CELL_BG)
+        draw.rectangle(rank_rect,     fill=RIGHT_CELL_BG)
+        draw.rectangle(name_rect,     fill=RIGHT_CELL_BG)
+        draw.rectangle([(cx, cy), (cx + 4, cy + CARD_H)], fill=ACCENT)
+        # 1-px grid rules between cells.
+        draw.line([(cx + PORTRAIT_W, cy),
+                   (cx + PORTRAIT_W, cy + CARD_H)],
+                  fill=BG_COLOR, width=1)
+        draw.line([(cx + PORTRAIT_W, cy + RANK_H),
+                   (cx + CARD_W, cy + RANK_H)],
+                  fill=BG_COLOR, width=1)
+
+        # --- Portrait cell — cover-crop above the chip strip ----------- #
+        portrait_image_rect = (
+            portrait_rect[0], portrait_rect[1],
+            portrait_rect[2], portrait_rect[3] - CHIP_H,
+        )
+        _fill_cell_with_icon_cover(
+            img, char_icons[i],
+            portrait_image_rect, pad=PORTRAIT_PAD,
+            vertical_anchor=0.18,
+        )
+
+        # Character chip — solid red strip, crisp flat edges.
+        if p.get("main_char"):
+            chip_top = cy + CARD_H - CHIP_H
             draw.rectangle(
-                [(0, y), (WIDTH, y + ROW_HEIGHT)],
-                fill=ROW_BG_ALT,
+                [(cx, chip_top), (cx + PORTRAIT_W, cy + CARD_H)],
+                fill=ACCENT,
+            )
+            label = p["main_char"].upper()
+            chip_font = _fit_text_to_box(
+                draw, label,
+                max_w=PORTRAIT_W - 12, max_h=CHIP_H - 10,
+                max_size=34, min_size=14,
+            )
+            bbox = draw.textbbox((0, 0), label, font=chip_font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            draw.text(
+                (cx + (PORTRAIT_W - tw) // 2,
+                 chip_top + (CHIP_H - th) // 2 - bbox[1]),
+                label, fill=TEXT, font=chip_font,
             )
 
-        x = PADDING_X
-        _paste_icon(
-            img, rank_icons[i],
-            x, y + (ROW_HEIGHT - RANK_ICON_BOX[1]) // 2,
-            RANK_ICON_BOX[0], RANK_ICON_BOX[1],
+        # --- Rank plaque cell — aspect-preserved fill ----------------- #
+        _fill_cell_with_icon(
+            img, rank_icons[i], rank_rect, pad=CELL_PAD,
         )
-        x += RANK_ICON_BOX[0] + INTER_PAD
-        _paste_icon(
-            img, char_icons[i],
-            x, y + (ROW_HEIGHT - CHAR_ICON_BOX[1]) // 2,
-            CHAR_ICON_BOX[0], CHAR_ICON_BOX[1],
-        )
-        x += CHAR_ICON_BOX[0] + INTER_PAD
 
-        name_y = y + (ROW_HEIGHT - 44) // 2
-        draw.text(
-            (x, name_y), p["display_name"],
-            fill=TEXT, font=name_font,
+        # --- Name cell — mixed-case body font scaled to fill ---------- #
+        name_label = p["display_name"]
+        name_font = _fit_text_to_box(
+            draw, name_label,
+            max_w=name_rect[2] - name_rect[0] - 2 * CELL_PAD,
+            max_h=name_rect[3] - name_rect[1] - 2 * CELL_PAD,
+            max_size=34, min_size=12,
+            font_loader=_load_font,
         )
-        draw.text(
-            (x, name_y + 26), p.get("rank_tier") or "Unranked",
-            fill=TEXT_DIM, font=rank_font,
-        )
+        bbox = draw.textbbox((0, 0), name_label, font=name_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = name_rect[0] + ((name_rect[2] - name_rect[0]) - tw) // 2
+        ty = (name_rect[1]
+              + ((name_rect[3] - name_rect[1]) - th) // 2
+              - bbox[1])
+        draw.text((tx, ty), name_label, fill=TEXT, font=name_font)
 
     return _to_png_buf(img)
 

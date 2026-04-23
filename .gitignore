@@ -8,3 +8,4 @@ venv/
 .DS_Store
 assets/rank_cache/
 assets/char_cache/
+design_lab_out/
