@@ -15,6 +15,7 @@ import discord
 from discord.ext import commands
 
 import db
+import rank_emoji
 from cogs.onboarding import VERIFIED_ROLE_NAME
 
 log = logging.getLogger(__name__)
@@ -75,9 +76,14 @@ async def _flow_lfg(interaction: discord.Interaction) -> None:
     rank = player["rank_tier"] if player else None
     main_char = player["main_char"] if player else None
 
+    # Inline custom rank emoji if the guild has run /upload-rank-emojis,
+    # otherwise empty string — graceful degradation.
+    rank_emoji_md = await rank_emoji.markdown_for(interaction.guild_id, rank)
+
     tag_bits: list[str] = []
     if rank:
-        tag_bits.append(f"**{rank}**")
+        prefix = f"{rank_emoji_md} " if rank_emoji_md else ""
+        tag_bits.append(f"{prefix}**{rank}**")
     if main_char:
         tag_bits.append(main_char)
     tag = " · ".join(tag_bits) if tag_bits else "Unranked"

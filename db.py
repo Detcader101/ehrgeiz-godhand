@@ -145,6 +145,19 @@ CREATE TABLE IF NOT EXISTS tournament_matches (
 
 CREATE INDEX IF NOT EXISTS idx_matches_tournament_round
     ON tournament_matches(tournament_id, round_number);
+
+-- Per-guild cache of custom emoji IDs that /upload-rank-emojis has
+-- created (or re-discovered) for each Tekken rank. Keyed by guild +
+-- rank_name so the same bot running in multiple guilds can look up
+-- the right emoji markdown in each.
+CREATE TABLE IF NOT EXISTS guild_rank_emojis (
+    guild_id    INTEGER NOT NULL,
+    rank_name   TEXT    NOT NULL,
+    emoji_id    INTEGER NOT NULL,
+    emoji_name  TEXT    NOT NULL,
+    uploaded_at TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, rank_name)
+);
 """
 
 
@@ -643,6 +656,46 @@ async def delete_fake_players() -> int:
         )
         await db.commit()
         return cur.rowcount or 0
+
+
+async def set_rank_emoji(
+    guild_id: int, rank_name: str,
+    emoji_id: int, emoji_name: str, now_iso: str,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO guild_rank_emojis
+                (guild_id, rank_name, emoji_id, emoji_name, uploaded_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, rank_name) DO UPDATE SET
+                emoji_id    = excluded.emoji_id,
+                emoji_name  = excluded.emoji_name,
+                uploaded_at = excluded.uploaded_at
+            """,
+            (guild_id, rank_name, emoji_id, emoji_name, now_iso),
+        )
+        await db.commit()
+
+
+async def get_rank_emoji(guild_id: int, rank_name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM guild_rank_emojis WHERE guild_id = ? AND rank_name = ?",
+            (guild_id, rank_name),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def list_rank_emojis(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM guild_rank_emojis WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            return await cur.fetchall()
 
 
 async def list_matches_for_round(tournament_id: int, round_number: int):

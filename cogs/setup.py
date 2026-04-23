@@ -9,10 +9,15 @@ edit those to change the structure.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -20,6 +25,7 @@ from discord.ext import commands
 import db
 import media
 import tournament_render
+import wavu
 from cogs.onboarding import (
     PANEL_KIND_PLAYER_HUB,
     PlayerHubView,
@@ -708,6 +714,189 @@ class Setup(commands.Cog):
             ephemeral=True,
         )
 
+    @app_commands.command(
+        name="upload-rank-emojis",
+        description="[Admin] Upload Tekken rank icons to this server as custom emojis.",
+    )
+    @app_commands.default_permissions(manage_emojis=True)
+    async def upload_rank_emojis(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        # Requires the bot to have Manage Emojis — warn early instead of
+        # crashing halfway through the upload loop.
+        if not guild.me.guild_permissions.manage_emojis_and_stickers:
+            await interaction.response.send_message(
+                "⚠ I need the **Manage Emojis and Stickers** permission "
+                "to upload rank icons. Grant it to my role, then re-run.",
+                ephemeral=True, delete_after=20)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await _upload_rank_emojis_for_guild(guild)
+        await interaction.followup.send(embed=result.to_embed(), ephemeral=True)
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Setup(bot))
+
+
+# --------------------------------------------------------------------------- #
+# Rank emoji upload — slice C                                                  #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class RankEmojiResult:
+    created: list[str] = field(default_factory=list)
+    reused: list[str] = field(default_factory=list)
+    failed: list[tuple[str, str]] = field(default_factory=list)
+    icon_fetch_errors: list[str] = field(default_factory=list)
+
+    def to_embed(self) -> discord.Embed:
+        total = len(self.created) + len(self.reused)
+        color = (discord.Color.green() if not (self.failed or self.icon_fetch_errors)
+                 else discord.Color.orange())
+        embed = discord.Embed(
+            title="🎌 Rank emoji upload",
+            description=(
+                f"Mapped **{total}** Tekken ranks to custom emojis in this server "
+                f"({len(self.created)} newly created, {len(self.reused)} already existed)."
+            ),
+            color=color,
+        )
+        embed.set_thumbnail(url=media.LOGO_URL)
+        if self.created:
+            embed.add_field(
+                name=f"🆕 Created ({len(self.created)})",
+                value=", ".join(f"`{n}`" for n in self.created[:20])
+                      + ("…" if len(self.created) > 20 else ""),
+                inline=False,
+            )
+        if self.reused:
+            embed.add_field(
+                name=f"♻️ Reused ({len(self.reused)})",
+                value=", ".join(f"`{n}`" for n in self.reused[:20])
+                      + ("…" if len(self.reused) > 20 else ""),
+                inline=False,
+            )
+        if self.failed:
+            embed.add_field(
+                name=f"⚠ Failed ({len(self.failed)})",
+                value="\n".join(f"`{n}` — {err}" for n, err in self.failed[:5]),
+                inline=False,
+            )
+        if self.icon_fetch_errors:
+            embed.add_field(
+                name="🌐 Icon fetch errors",
+                value=", ".join(self.icon_fetch_errors[:10]),
+                inline=False,
+            )
+        embed.set_footer(
+            text="Ephemeral mapping stored in guild_rank_emojis • safe to re-run"
+        )
+        return embed
+
+
+def _emoji_name_for_rank(rank_name: str) -> str:
+    """Turn a Tekken rank name into a valid Discord emoji name.
+
+    Discord emoji names must be [A-Za-z0-9_] and 2-32 chars. We prefix
+    everything with `t8_` so the emoji-picker groups them together and
+    they don't collide with other server emoji the admin might create.
+    """
+    slug = rank_name.lower()
+    slug = slug.replace("∞", "inf")
+    slug = re.sub(r"[^a-z0-9_]+", "_", slug).strip("_")
+    return f"t8_{slug}"[:32]
+
+
+async def _upload_rank_emojis_for_guild(
+    guild: discord.Guild,
+) -> RankEmojiResult:
+    """Upload (or re-discover) a custom emoji for every Tekken rank tier.
+
+    Idempotent — running it twice against the same guild reuses existing
+    emojis with matching names. Makes one HTTP call to ewgf per
+    never-before-seen rank icon (most installs hit cache after the
+    first roster render).
+    """
+    result = RankEmojiResult()
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Map existing guild emoji by name for fast lookup.
+    existing_by_name = {e.name: e for e in guild.emojis}
+
+    async with aiohttp.ClientSession() as session:
+        for rank_name in wavu.ALL_RANK_NAMES:
+            emoji_name = _emoji_name_for_rank(rank_name)
+
+            # Case 1: emoji already exists in the guild — just record it.
+            if emoji_name in existing_by_name:
+                emoji = existing_by_name[emoji_name]
+                await db.set_rank_emoji(
+                    guild.id, rank_name, emoji.id, emoji_name, now,
+                )
+                result.reused.append(rank_name)
+                continue
+
+            # Case 2: fetch the icon bytes (cache, then network fallback).
+            url = media.rank_icon_url(rank_name)
+            if url is None:
+                result.failed.append((rank_name, "no icon URL"))
+                continue
+            cache_path = tournament_render.RANK_CACHE_DIR / url.rsplit("/", 1)[-1]
+            image_bytes = await _read_or_fetch_icon(cache_path, url, session)
+            if image_bytes is None:
+                result.icon_fetch_errors.append(rank_name)
+                continue
+
+            # Case 3: create the emoji. Discord accepts PNG/JPEG up to
+            # 256 KiB — webp (our source) is also fine.
+            try:
+                emoji = await guild.create_custom_emoji(
+                    name=emoji_name,
+                    image=image_bytes,
+                    reason="Ehrgeiz Godhand /upload-rank-emojis",
+                )
+                await db.set_rank_emoji(
+                    guild.id, rank_name, emoji.id, emoji_name, now,
+                )
+                result.created.append(rank_name)
+                # Small stagger so we don't spike Discord's emoji
+                # create-rate-limit budget on a cold guild.
+                await asyncio.sleep(0.4)
+            except discord.Forbidden:
+                result.failed.append(
+                    (rank_name, "forbidden (check Manage Emojis perm)")
+                )
+            except discord.HTTPException as e:
+                result.failed.append((rank_name, str(e)))
+
+    return result
+
+
+async def _read_or_fetch_icon(
+    cache_path: Path, url: str, session: aiohttp.ClientSession,
+) -> bytes | None:
+    """Return the raw bytes of an icon — from the local cache if present,
+    otherwise download + cache. None on fetch failure."""
+    if cache_path.exists():
+        try:
+            return cache_path.read_bytes()
+        except OSError as e:
+            log.warning("local icon read failed %s: %s", cache_path, e)
+    try:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.read()
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_bytes(data)
+            return data
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.warning("icon fetch %s failed: %s", url, e)
+        return None
