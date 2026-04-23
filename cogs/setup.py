@@ -83,14 +83,19 @@ SERVER_PLAN: list[CategorySpec] = [
     # into games. EU listed first so UK/EU players land on their channel
     # without scrolling past foreign regions.
     CategorySpec("🎮 Matchmaking", [
-        ChannelSpec("🇪🇺-matchmaking-eu", "text",
-                    "🇪🇺 Primary region. UK + EU looking for games."),
-        ChannelSpec("🌎-matchmaking-na", "text",
-                    "🌎 North America."),
-        ChannelSpec("🌏-matchmaking-asia", "text",
-                    "🌏 Asia."),
-        ChannelSpec("🦘-matchmaking-oce", "text",
-                    "🦘 Oceania."),
+        # EU is the only region with an emoji prefix — a deliberate
+        # visual cue that this is the primary room. Flag sequences like
+        # 🇪🇺 don't render reliably in Discord channel names (they show
+        # as "EU" text on some clients), so we use 🌍 which is a single
+        # codepoint and always renders correctly.
+        ChannelSpec("🌍-matchmaking-eu", "text",
+                    "🌍 Primary region. UK + EU looking for games."),
+        ChannelSpec("matchmaking-na", "text",
+                    "North America."),
+        ChannelSpec("matchmaking-asia", "text",
+                    "Asia."),
+        ChannelSpec("matchmaking-oce", "text",
+                    "Oceania."),
     ], verified_only=True),
     CategorySpec("💬 Community", [
         ChannelSpec("💬-general", "text",
@@ -1204,8 +1209,12 @@ LEGACY_CATEGORY_NAMES = {
 # Legacy channel names (same idea). Mostly the pre-multi-VC voice
 # channel name and anything else that gets replaced over time.
 LEGACY_CHANNEL_NAMES = {
-    "🎙️ General VC",       # replaced by Lobby + Casuals/Match VCs
-    "General VC",           # further-legacy no-emoji voice channel name
+    "🎙️ General VC",               # replaced by Lobby + Casuals/Match VCs
+    "General VC",                    # further-legacy no-emoji voice channel name
+    "🇪🇺-matchmaking-eu",           # flag-sequence EU → 🌍 primary room
+    "🌎-matchmaking-na",             # emoji stripped from non-EU regions
+    "🌏-matchmaking-asia",
+    "🦘-matchmaking-oce",
 }
 
 
