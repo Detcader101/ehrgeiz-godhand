@@ -419,22 +419,27 @@ async def render_banner(
     title: str,
     subtitle: str | None = None,
     kicker: str | None = None,
+    body: str | None = None,
 ) -> io.BytesIO:
-    """Wide hero banner for a pinned channel panel.
+    """Wide banner for a pinned channel panel.
 
-    Layout: Ehrgeiz logo left, stacked text block right (kicker · title ·
-    subtitle), red accent strip top and bottom. Same 960-wide aspect as
-    the bracket render so banners and bracket graphics sit in the same
-    visual family.
+    Hero band (960×240): Ehrgeiz logo left, stacked kicker/title/
+    subtitle right, red accent strips. If `body` is supplied, a second
+    band appears below the hero with the word-wrapped body text baked
+    into the same PNG — keeps the bot's posts visually cohesive rather
+    than splitting content between the image and an embed description.
     """
-    img = Image.new("RGBA", (BANNER_W, BANNER_H), BG_COLOR)
+    body_band_h = _compute_body_band_height(body) if body else 0
+    total_h = BANNER_H + body_band_h
+
+    img = Image.new("RGBA", (BANNER_W, total_h), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # Background: subtle top-to-bottom wash with a red-tinted left column
-    # so the logo has something to sit against.
-    _paint_banner_gradient(img)
+    # Hero background wash — only paints the hero band, not the body.
+    _paint_banner_gradient(img, y_start=0, y_end=BANNER_H)
 
-    # Top + bottom accent strips.
+    # Top accent strip, and a divider between hero + body (which
+    # doubles as the bottom stripe if no body is present).
     draw.rectangle([(0, 0), (BANNER_W, 4)], fill=ACCENT)
     draw.rectangle([(0, BANNER_H - 4), (BANNER_W, BANNER_H)], fill=ACCENT)
 
@@ -496,16 +501,26 @@ async def render_banner(
         )
         draw.text((text_x, y), subtitle.upper(), fill=TEXT_DIM, font=sf)
 
+    # Body band below the hero — word-wrapped text baked into the PNG.
+    if body:
+        _render_banner_body(img, draw, body, y_start=BANNER_H)
+        draw.rectangle(
+            [(0, total_h - 4), (BANNER_W, total_h)],
+            fill=ACCENT,
+        )
+
     return _to_png_buf(img)
 
 
-def _paint_banner_gradient(canvas: Image.Image) -> None:
+def _paint_banner_gradient(
+    canvas: Image.Image, y_start: int = 0, y_end: int | None = None,
+) -> None:
     """Left-to-right wash: red-tinted shadow on the left (under the logo)
-    fading into the neutral background on the right. Keeps the logo
-    from floating visually and matches the bracket header family."""
+    fading into the neutral background on the right. Optionally bounded
+    to a vertical slice so the body band below doesn't inherit the
+    gradient."""
     width = canvas.width
-    height = canvas.height
-    # Left 40% gets a subtle red boost; right 60% stays bg.
+    y_end = canvas.height if y_end is None else y_end
     left_tint = (55, 22, 28)
     neutral = BG_COLOR
     for i in range(width):
@@ -513,7 +528,92 @@ def _paint_banner_gradient(canvas: Image.Image) -> None:
         r = int(left_tint[0] + (neutral[0] - left_tint[0]) * t)
         g = int(left_tint[1] + (neutral[1] - left_tint[1]) * t)
         b = int(left_tint[2] + (neutral[2] - left_tint[2]) * t)
-        canvas.paste((r, g, b, 255), (i, 0, i + 1, height))
+        canvas.paste((r, g, b, 255), (i, y_start, i + 1, y_end))
+
+
+# --------------------------------------------------------------------------- #
+# Banner body — word-wrapped text baked into the image                         #
+# --------------------------------------------------------------------------- #
+
+BANNER_BODY_FONT_SIZE = 20
+BANNER_BODY_LINE_GAP = 8
+BANNER_BODY_PAD_X = 44
+BANNER_BODY_PAD_Y = 24
+BANNER_BODY_BG = (18, 16, 18)
+
+
+def _strip_body_markdown(s: str) -> str:
+    """Flatten embed-style markdown so the text renders cleanly as a
+    flat image. `**bold**` loses its markers (the body font is already
+    bold); backticks drop for the same reason."""
+    s = s.replace("**", "")
+    s = s.replace("`", "")
+    return s
+
+
+def _wrap_body(
+    draw: ImageDraw.ImageDraw, text: str, font, max_w: int,
+) -> list[str]:
+    """Greedy word-wrap that respects explicit newlines in the source.
+    Blank lines are preserved so paragraph breaks carry over."""
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        words = paragraph.split()
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            bbox = draw.textbbox((0, 0), candidate, font=font)
+            if bbox[2] - bbox[0] <= max_w:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+    return lines
+
+
+def _compute_body_band_height(body: str) -> int:
+    """Compute the body-band pixel height up front so the canvas can
+    be sized correctly before we paint into it."""
+    scratch = Image.new("RGBA", (1, 1))
+    draw = ImageDraw.Draw(scratch)
+    font = _load_font(BANNER_BODY_FONT_SIZE)
+    lines = _wrap_body(
+        draw, _strip_body_markdown(body), font,
+        max_w=BANNER_W - 2 * BANNER_BODY_PAD_X,
+    )
+    line_h = BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
+    return 2 * BANNER_BODY_PAD_Y + max(line_h, len(lines) * line_h)
+
+
+def _render_banner_body(
+    canvas: Image.Image, draw: ImageDraw.ImageDraw,
+    body: str, y_start: int,
+) -> None:
+    height = _compute_body_band_height(body)
+    draw.rectangle(
+        [(0, y_start), (BANNER_W, y_start + height)],
+        fill=BANNER_BODY_BG,
+    )
+    font = _load_font(BANNER_BODY_FONT_SIZE)
+    lines = _wrap_body(
+        draw, _strip_body_markdown(body), font,
+        max_w=BANNER_W - 2 * BANNER_BODY_PAD_X,
+    )
+    line_h = BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
+    y = y_start + BANNER_BODY_PAD_Y
+    for line in lines:
+        if line:
+            draw.text(
+                (BANNER_BODY_PAD_X, y), line,
+                fill=TEXT, font=font,
+            )
+        y += line_h
 
 
 # --------------------------------------------------------------------------- #

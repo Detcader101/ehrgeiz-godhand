@@ -502,20 +502,21 @@ async def _post_or_refresh_banner(
             kicker=spec.kicker,
             title=spec.title,
             subtitle=spec.subtitle,
+            body=spec.body,
         )
     except Exception as e:
         report.errors.append(f"Banner render for #{spec.channel_name}: {e}")
         return
 
-    embed = discord.Embed(
-        description=spec.body,
-        color=discord.Color.red(),
-    )
+    # Body text now lives inside the PNG — the embed is just a frame for
+    # the image with the brand red color bar on the left. No description.
+    embed = discord.Embed(color=discord.Color.red())
     embed.set_image(url="attachment://banner.png")
 
     view = spec.view_factory() if spec.view_factory else None
 
     existing = await db.get_panel(guild.id, spec.kind)
+    msg: discord.Message | None = None
     if existing is not None:
         try:
             ch = guild.get_channel(existing["channel_id"]) or channel
@@ -527,32 +528,35 @@ async def _post_or_refresh_banner(
             if view is not None:
                 edit_kwargs["view"] = view
             await msg.edit(**edit_kwargs)
-            return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            # Old message is gone or unreachable — fall through and
-            # post a fresh one.
-            pass
+            msg = None  # fall through to repost
+            buf.seek(0)  # rewind in case the failed edit consumed it
 
-    try:
-        send_kwargs: dict = {
-            "embed": embed,
-            "file": discord.File(buf, filename="banner.png"),
-        }
-        if view is not None:
-            send_kwargs["view"] = view
-        msg = await channel.send(**send_kwargs)
-    except discord.Forbidden:
-        report.errors.append(
-            f"Banner for #{spec.channel_name}: no send permission"
-        )
-        return
-    except discord.HTTPException as e:
-        report.errors.append(f"Banner for #{spec.channel_name}: {e}")
-        return
+    if msg is None:
+        try:
+            send_kwargs: dict = {
+                "embed": embed,
+                "file": discord.File(buf, filename="banner.png"),
+            }
+            if view is not None:
+                send_kwargs["view"] = view
+            msg = await channel.send(**send_kwargs)
+        except discord.Forbidden:
+            report.errors.append(
+                f"Banner for #{spec.channel_name}: no send permission"
+            )
+            return
+        except discord.HTTPException as e:
+            report.errors.append(f"Banner for #{spec.channel_name}: {e}")
+            return
 
+    # Ensure pinned on every run — even when we edited an existing
+    # message. Admins may have unpinned it; this puts it back. Skipping
+    # the pin call if already pinned keeps the pin-notification tidy.
     try:
-        await msg.pin()
-        await _delete_pin_notification(channel)
+        if not msg.pinned:
+            await msg.pin()
+            await _delete_pin_notification(channel)
     except (discord.Forbidden, discord.HTTPException) as e:
         log.warning("pin failed for banner %s: %s", spec.kind, e)
 
