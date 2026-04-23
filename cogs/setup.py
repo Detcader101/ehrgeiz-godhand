@@ -35,6 +35,7 @@ from cogs.onboarding import (
 )
 from cogs.tournament import TournamentsPanelView
 from cogs.matchmaking import LFGPanelView
+from view_util import ErrorHandledView
 
 log = logging.getLogger(__name__)
 
@@ -835,7 +836,7 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
 # Slash command + confirm view                                                 #
 # --------------------------------------------------------------------------- #
 
-class _ConfirmSetupView(discord.ui.View):
+class _ConfirmSetupView(ErrorHandledView):
     def __init__(self, invoker_id: int):
         super().__init__(timeout=60)
         self.invoker_id = invoker_id
@@ -1434,7 +1435,7 @@ async def _unpin_and_remove_panels(
     return len(rows)
 
 
-class _ConfirmPurgeView(discord.ui.View):
+class _ConfirmPurgeView(ErrorHandledView):
     """Confirmation UI for the destructive /purge-server and
     /reset-server commands. The same view handles both — if
     `rebuild=True`, we kick off /setup-server's build after the purge

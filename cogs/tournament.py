@@ -27,6 +27,7 @@ import media
 import tournament_render
 import wavu
 from cogs.onboarding import VERIFIED_ROLE_NAME
+from view_util import ErrorHandledView
 
 # Name → ordinal lookup for seeding. Built once at import time.
 _RANK_ORDINAL_BY_NAME = {v: k for k, v in wavu.TEKKEN_RANKS.items()}
@@ -295,7 +296,7 @@ async def _build_round_bracket_file(
 # Persistent signup view (Join / Leave)                                        #
 # --------------------------------------------------------------------------- #
 
-class SignupView(discord.ui.View):
+class SignupView(ErrorHandledView):
     """Persistent Join/Leave view. We resolve the tournament from the
     message_id on each click (via signup_message_id) rather than binding
     it to the view instance — that way a single registered SignupView
@@ -530,7 +531,7 @@ async def _announce_state_change(
 # #tournaments channel panel (pinned by /setup-server)                         #
 # --------------------------------------------------------------------------- #
 
-class TournamentsPanelView(discord.ui.View):
+class TournamentsPanelView(ErrorHandledView):
     """Persistent buttons attached to the #tournaments banner.
 
       - Active Tournaments (anyone): lists live tournaments ephemerally.

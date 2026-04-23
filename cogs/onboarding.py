@@ -17,6 +17,7 @@ import ewgf
 import media
 import tournament_render
 import wavu
+from view_util import ErrorHandledView
 
 log = logging.getLogger(__name__)
 
@@ -532,7 +533,7 @@ class _RankGroupSelect(discord.ui.Select):
         await interaction.response.edit_message(view=self.parent_view)
 
 
-class RankGroupSelectView(discord.ui.View):
+class RankGroupSelectView(ErrorHandledView):
     def __init__(self, bot: commands.Bot, user_id: int, profile: wavu.PlayerProfile):
         super().__init__(timeout=180)
         self.bot = bot
@@ -549,7 +550,7 @@ class RankGroupSelectView(discord.ui.View):
         return True
 
 
-class ConfirmProfileView(discord.ui.View):
+class ConfirmProfileView(ErrorHandledView):
     def __init__(
         self, bot: commands.Bot, user_id: int, profile: wavu.PlayerProfile,
         *, rank_source: str = "auto-detect",
@@ -843,7 +844,7 @@ async def _flow_profile(interaction: discord.Interaction) -> None:
 # Pending verification UI (spec §5.3) — persistent View                        #
 # --------------------------------------------------------------------------- #
 
-class PendingVerificationView(discord.ui.View):
+class PendingVerificationView(ErrorHandledView):
     """Persistent View attached to every #verification-log Pending message.
 
     Custom_ids are static; we look up the pending row by interaction.message.id
@@ -1081,7 +1082,7 @@ class _PendingSweeper:
             log.warning("Couldn't edit stale pending message: %s", e)
 
 
-class _ConfirmUnlinkView(discord.ui.View):
+class _ConfirmUnlinkView(ErrorHandledView):
     def __init__(self, user_id: int, tekken_id: str | None, display_name: str | None):
         super().__init__(timeout=60)
         self.user_id = user_id
@@ -1158,7 +1159,7 @@ async def _flow_unlink(interaction: discord.Interaction) -> None:
 PANEL_KIND_PLAYER_HUB = "player_hub"
 
 
-class PlayerHubView(discord.ui.View):
+class PlayerHubView(ErrorHandledView):
     """Persistent unified panel. Custom IDs must stay stable across restarts."""
 
     def __init__(self, bot: commands.Bot | None = None):

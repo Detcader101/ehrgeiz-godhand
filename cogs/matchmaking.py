@@ -18,6 +18,7 @@ import channel_util
 import db
 import rank_emoji
 from cogs.onboarding import VERIFIED_ROLE_NAME
+from view_util import ErrorHandledView
 
 log = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ REGION_LABELS: dict[str, str] = {
 }
 
 
-class LFGPanelView(discord.ui.View):
+class LFGPanelView(ErrorHandledView):
     """Persistent 'I'm Looking for Games' button — one registration serves
     every matchmaking channel's banner because the callback resolves the
     region from `interaction.channel.name`."""
