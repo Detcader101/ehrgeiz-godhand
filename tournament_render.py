@@ -684,35 +684,37 @@ async def render_bot_profile_banner() -> io.BytesIO:
     )
 
     # Safe-zone layout.
-    # - Avatar circle sits roughly in the bottom-left ~120×120 of the
-    #   banner, so text must stay out of that corner.
-    # - Kebab/"..." button sits in the top-right ~40×40.
-    # Keeping the text block anchored at x≈190 (past avatar) and pulled
-    # upward (above the avatar's crown) keeps both UI chrome elements
-    # out of the composition.
-    text_x = 190
-    text_max_w = PROFILE_BANNER_W - text_x - 50  # 50px right gutter clears the kebab
+    #   - Avatar circle sits bottom-left, reaching ~130px right and
+    #     ~130px up from the banner's lower-left corner.
+    #   - Kebab/"..." button sits top-right, ~40×40.
+    # Text anchors into the LOWER-RIGHT quadrant — the only block of
+    # pixels neither UI element covers. Deliberately off-centre: this
+    # composition is Discord-chrome-aware, not symmetric.
+    text_x = 265
+    text_right_gutter = 40
+    text_max_w = PROFILE_BANNER_W - text_x - text_right_gutter
 
     title = "EHRGEIZ GODHAND"
     tagline = "TEKKEN 8 SERVER COMPANION"
 
-    title_h = 60
-    tag_h = 22
+    title_h = 56
+    tag_h = 20
     gap = 10
     block_h = title_h + gap + tag_h
-    # Nudged upward from centre (~40% of banner height) so the tagline
-    # finishes above the avatar's overlap line.
-    block_y = int(PROFILE_BANNER_H * 0.32) - block_h // 2 + 30
+    # Block sits below centre so the title's baseline drops past the
+    # top-right kebab zone and the whole thing hovers above the bottom
+    # accent strip without touching the avatar's crown.
+    block_y = PROFILE_BANNER_H - block_h - 48
 
     title_font = _fit_text_to_box(
         draw, title,
         max_w=text_max_w, max_h=title_h,
-        max_size=54, min_size=26,
+        max_size=50, min_size=26,
     )
     tag_font = _fit_text_to_box(
         draw, tagline,
         max_w=text_max_w, max_h=tag_h,
-        max_size=20, min_size=12,
+        max_size=18, min_size=12,
     )
 
     draw.text((text_x, block_y), title, fill=TEXT, font=title_font)
