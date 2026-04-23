@@ -605,6 +605,13 @@ async def _post_player_hub_if_channel_exists(
     except discord.Forbidden:
         report.panel_skip_reason = "bot can't post in #player-hub (permissions)"
         return
+    # Pin so the hub stays reachable via the channel's pin sidebar even
+    # once chat pushes it up, matching the other branded banners.
+    try:
+        await msg.pin()
+        await _delete_pin_notification(channel)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning("player hub pin failed: %s", e)
     await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, channel.id, msg.id)
     report.panel_posted_in = channel.name
 

@@ -1203,35 +1203,60 @@ class PlayerHubView(discord.ui.View):
 
 PLAYER_HUB_BANNER_FILENAME = "player_hub_banner.png"
 
+# Body text baked into the Player Hub banner PNG. Kept plain-ASCII + a
+# couple of safe unicode bits (bullet, em-dash, arrow) so the body font
+# renders every glyph — colour-emojis aren't in DejaVu and would tofu.
+# The button labels carry their own emoji in Discord's UI, so players
+# still see them where it matters.
+_PLAYER_HUB_BODY = (
+    "New here? Click VERIFY and enter your Tekken ID — the ~12-"
+    "character Polaris Battle ID from Main Menu > Community > My "
+    "Profile. The bot checks wavu.wiki, confirms it's you, and gives "
+    "you your rank role.\n"
+    "\n"
+    "Already verified? Use the buttons below:\n"
+    "• Refresh Rank — pull your latest rank from recent matches.\n"
+    "• Set Rank Manually — pick your rank from a dropdown.\n"
+    "• My Profile — see what the bot has on file for you.\n"
+    "• Unlink Me — remove your link (with confirmation)."
+)
+
 
 def _player_hub_embed() -> discord.Embed:
-    embed = discord.Embed(
-        description=(
-            "**🆕 New here?** Click **🔓 Verify** and enter your **Tekken ID** "
-            "(the ~12-character Polaris Battle ID from *Main Menu → Community → "
-            "My Profile*). The bot checks wavu.wiki, confirms it's you, and "
-            "gives you your rank role.\n\n"
-            "**✅ Already verified?**\n"
-            "• 🔄 **Refresh Rank** — pull your latest rank from recent matches.\n"
-            "• ✏️ **Set Rank Manually** — pick your rank from a dropdown.\n"
-            "• 🪪 **My Profile** — see what the bot has on file for you.\n"
-            "• 🚪 **Unlink Me** — remove your link (with confirmation)."
-        ),
-        color=discord.Color.red(),
-    )
+    """Container embed for the Player Hub banner attachment. The body
+    text lives inside the image itself (see _player_hub_banner_file),
+    so this embed carries only the accent colour bar and the footer."""
+    embed = discord.Embed(color=discord.Color.red())
     embed.set_image(url=f"attachment://{PLAYER_HUB_BANNER_FILENAME}")
     embed.set_footer(text="One Tekken ID per Discord account • Admins can override")
     return embed
 
 
+async def _delete_player_hub_pin_notification(
+    channel: discord.abc.Messageable,
+) -> None:
+    """Delete the transient 'X pinned a message' system post that
+    appears right after we pin the Player Hub. Silent on failure."""
+    if not isinstance(channel, discord.TextChannel):
+        return
+    try:
+        async for m in channel.history(limit=5):
+            if m.type == discord.MessageType.pins_add:
+                await m.delete()
+                return
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def _player_hub_banner_file() -> discord.File:
-    """Render the Player Hub hero image — same family as the channel
-    banners provisioned by /setup-server so the hub reads as a branded
-    panel, not a vanilla embed."""
+    """Render the Player Hub hero image with the onboarding instructions
+    baked into the body band — same visual family as the channel
+    banners provisioned by /setup-server."""
     buf = await tournament_render.render_banner(
         kicker="Your Identity",
         title="Player Hub",
         subtitle="Verify · profile · rank · unlink",
+        body=_PLAYER_HUB_BODY,
     )
     return discord.File(buf, filename=PLAYER_HUB_BANNER_FILENAME)
 
@@ -1303,12 +1328,21 @@ class Onboarding(commands.Cog):
             return
         await self._delete_old_panel(guild, PANEL_KIND_PLAYER_HUB)
         banner = await _player_hub_banner_file()
-        msg = await interaction.channel.send(
+        channel = interaction.channel
+        msg = await channel.send(
             embed=_player_hub_embed(),
             view=PlayerHubView(self.bot),
             file=banner,
         )
-        await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, interaction.channel.id, msg.id)
+        # Pin + tidy the "X pinned a message" system notification so the
+        # hub stays reachable at the top of #player-hub even when chat
+        # pushes it up.
+        try:
+            await msg.pin()
+            await _delete_player_hub_pin_notification(channel)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("player hub pin failed: %s", e)
+        await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, channel.id, msg.id)
         await interaction.response.send_message(
             "Player Hub posted.", ephemeral=True, delete_after=8,
         )
