@@ -14,7 +14,9 @@ and the end-of-tournament archive flow are deferred to slices 2-5.
 from __future__ import annotations
 
 import logging
+import math
 import random
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import discord
@@ -1048,6 +1050,8 @@ class Tournament(commands.Cog):
             f"— winner set to {winner.mention}.",
             ephemeral=True,
         )
+        # Override might have been the last outstanding match of the round.
+        await _on_match_state_change(interaction.client, match["id"])
 
     @tournament_set_result.autocomplete("name")
     async def _tournament_set_result_autocomplete(
@@ -1675,6 +1679,8 @@ async def _flow_loser_confirm(interaction: discord.Interaction) -> None:
             ("Confirmed by", f"<@{loser}>", True),
         ],
     )
+    # Auto-advance if this was the last match of the round.
+    await _on_match_state_change(interaction.client, match["id"])
 
 
 async def _flow_loser_dispute(interaction: discord.Interaction) -> None:
@@ -1740,6 +1746,268 @@ async def _flow_loser_dispute(interaction: discord.Interaction) -> None:
     )
 
 
+async def _on_match_state_change(
+    client: discord.Client, match_id: int,
+) -> None:
+    """Called after any transition to CONFIRMED. If the round is
+    complete, either advances to the next round or closes out the
+    tournament. Idempotent — re-entry on subsequent match confirms in
+    the same already-advanced round bails out early."""
+    match = await db.get_match(match_id)
+    if match is None or match["state"] != "CONFIRMED":
+        return
+
+    tournament_id = match["tournament_id"]
+    round_num = match["round_number"]
+
+    if not await db.is_round_complete(tournament_id, round_num):
+        return
+
+    # If we've already paired the next round, don't re-enter.
+    next_round_rows = await db.list_matches_for_round(
+        tournament_id, round_num + 1)
+    if next_round_rows:
+        return
+
+    tournament = await db.get_tournament(tournament_id)
+    if tournament is None or tournament["state"] != "IN_PROGRESS":
+        return
+
+    participant_count = await db.count_participants(tournament_id)
+    total_rounds = _compute_total_rounds(participant_count)
+
+    if round_num >= total_rounds:
+        await _complete_tournament(client, tournament)
+    else:
+        await _advance_to_next_round(client, tournament, round_num)
+
+
+def _compute_total_rounds(participant_count: int) -> int:
+    """Swiss standard: ceil(log2(N)). Clamped at 1 to handle sub-4
+    edge cases that slipped past the start-time min-players check."""
+    if participant_count < 2:
+        return 1
+    return max(1, math.ceil(math.log2(participant_count)))
+
+
+async def _compute_next_round_pairings(tournament) -> list[tuple]:
+    """Simplified Dutch Swiss pairing for round N+1.
+
+    Scoring: 1 point per CONFIRMED win (byes count). Players sort by
+    (wins desc, rank-ordinal desc, user_id asc). Then split top half
+    vs bottom half and pair across — same shape as round 1 but grouped
+    by score. Bye (for odd counts) goes to the lowest-ranked player
+    who hasn't already had one.
+
+    Rematches are accepted occasionally for simplicity — full Dutch
+    push-up/push-down is overkill for 8-16 player community brackets.
+    """
+    tournament_id = tournament["id"]
+    participants = await db.list_participants(tournament_id)
+    all_matches = await db.list_matches_for_tournament(tournament_id)
+
+    wins: dict[int, int] = defaultdict(int)
+    for m in all_matches:
+        if m["state"] == "CONFIRMED" and m["winner_id"] is not None:
+            wins[m["winner_id"]] += 1
+
+    rank_ord: dict[int, int] = {}
+    for p in participants:
+        ord_ = _RANK_ORDINAL_BY_NAME.get(p["rank_tier"])
+        rank_ord[p["user_id"]] = ord_ if ord_ is not None else -1
+
+    had_bye: set[int] = set()
+    for m in all_matches:
+        if m["player_a_id"] is not None and m["player_b_id"] is None:
+            had_bye.add(m["player_a_id"])
+
+    active = [p for p in participants if not p["forfeited"]]
+    active.sort(key=lambda p: (
+        -wins.get(p["user_id"], 0),
+        -rank_ord[p["user_id"]],
+        p["user_id"],
+    ))
+
+    pairings: list[tuple] = []
+    bye_player = None
+    if len(active) % 2 == 1:
+        # Lowest-ranked player without a prior bye gets this round's bye.
+        for i in range(len(active) - 1, -1, -1):
+            if active[i]["user_id"] not in had_bye:
+                bye_player = active.pop(i)
+                break
+        else:
+            # Everyone already had one — give it to the lowest seed
+            # anyway (edge case in very long tournaments).
+            bye_player = active.pop()
+
+    half = len(active) // 2
+    top = active[:half]
+    bot = active[half:]
+    for t, b in zip(top, bot):
+        pairings.append((t["user_id"], b["user_id"], None))
+
+    if bye_player is not None:
+        pairings.append(
+            (bye_player["user_id"], None, bye_player["user_id"]))
+
+    return pairings
+
+
+async def _advance_to_next_round(
+    client: discord.Client, tournament, completed_round: int,
+) -> None:
+    next_round = completed_round + 1
+    pairings = await _compute_next_round_pairings(tournament)
+    if not pairings:
+        return
+    await db.create_matches(
+        tournament["id"], next_round, pairings, _now_iso(),
+    )
+
+    bracket_file = await _build_round_bracket_file(
+        tournament["name"], tournament["id"], next_round,
+    )
+    channel = client.get_channel(tournament["signup_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    participants = await db.list_participants(tournament["id"])
+    active_mentions = " ".join(
+        f"<@{p['user_id']}>"
+        for p in participants if not p["forfeited"]
+    ) or "*(no active players)*"
+
+    headline = (
+        f"⚔️ **{tournament['name']} — ROUND {next_round} LIVE!**"
+    )
+    body = (
+        f"{tournament['match_format']} · Swiss pairings below. "
+        "Play your match, then hit **⚔️ Report a Win**."
+    )
+
+    try:
+        await channel.send(
+            f"{headline}\n{body}\n\n{active_mentions}",
+            file=bracket_file,
+            view=ReportWinView(),
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException as e:
+        log.warning("round %d announcement failed for %s: %s",
+                    next_round, tournament["id"], e)
+
+
+async def _complete_tournament(
+    client: discord.Client, tournament,
+) -> None:
+    tournament_id = tournament["id"]
+    await db.update_tournament_state(
+        tournament_id, "COMPLETED", _now_iso(),
+    )
+
+    standings = await _compute_final_standings(tournament_id)
+    channel = client.get_channel(tournament["signup_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    podium_icons = ["🥇", "🥈", "🥉"]
+    lines: list[str] = []
+    for i, s in enumerate(standings):
+        icon = podium_icons[i] if i < 3 else f"#{i + 1}"
+        rank_bit = f" · {s['rank_tier']}" if s["rank_tier"] else ""
+        lines.append(
+            f"{icon} <@{s['user_id']}>{rank_bit}  "
+            f"— {s['wins']} W · Buchholz {s['buchholz']}"
+        )
+    body = "\n".join(lines) if lines else "*(no standings computed)*"
+
+    mentions = " ".join(
+        f"<@{s['user_id']}>" for s in standings
+    ) or ""
+
+    headline = f"🏆 **{tournament['name']} — COMPLETE!**"
+    footer = (
+        "\n\nFinal bracket will archive into #🗂️-tournament-history "
+        "in the next update. Thanks for playing."
+    )
+
+    try:
+        await channel.send(
+            f"{headline}\n\n**FINAL STANDINGS**\n{body}{footer}\n\n{mentions}",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    except discord.HTTPException as e:
+        log.warning("completion message failed for %s: %s",
+                    tournament_id, e)
+
+    await _unpin_signup(client, tournament)
+
+    await audit.post_event(
+        client.get_guild(tournament["guild_id"]),
+        title="Tournament · COMPLETE",
+        color=discord.Color.gold(),
+        fields=[
+            ("Tournament", tournament["name"], True),
+            ("Winner",
+             f"<@{standings[0]['user_id']}>" if standings else "—", True),
+            ("Total rounds",
+             str(_compute_total_rounds(len(standings))), True),
+        ],
+    )
+
+
+async def _compute_final_standings(tournament_id: int) -> list[dict]:
+    """Rankings by wins (desc), Buchholz (desc), head-to-head (desc),
+    user_id (asc) as deterministic tiebreakers."""
+    participants = await db.list_participants(tournament_id)
+    all_matches = await db.list_matches_for_tournament(tournament_id)
+
+    wins: dict[int, int] = defaultdict(int)
+    opponents: dict[int, list[int]] = defaultdict(list)
+    h2h_wins: dict[tuple[int, int], int] = defaultdict(int)
+
+    for m in all_matches:
+        if m["state"] != "CONFIRMED":
+            continue
+        winner = m["winner_id"]
+        a, b = m["player_a_id"], m["player_b_id"]
+        if winner is not None:
+            wins[winner] += 1
+        if a is not None and b is not None:
+            opponents[a].append(b)
+            opponents[b].append(a)
+            if winner is not None:
+                loser = b if winner == a else a
+                h2h_wins[(winner, loser)] += 1
+
+    def buchholz_of(uid: int) -> int:
+        return sum(wins.get(o, 0) for o in opponents[uid])
+
+    out: list[dict] = []
+    for p in participants:
+        uid = p["user_id"]
+        out.append({
+            "user_id": uid,
+            "display_name": p["display_name"],
+            "rank_tier": p["rank_tier"],
+            "wins": wins.get(uid, 0),
+            "buchholz": buchholz_of(uid),
+        })
+
+    # Primary sort: wins desc, Buchholz desc. H2H applied as a second
+    # pass swap where two adjacent tied players have beaten each other.
+    out.sort(key=lambda s: (-s["wins"], -s["buchholz"], s["user_id"]))
+    for i in range(len(out) - 1):
+        a, b = out[i], out[i + 1]
+        if a["wins"] == b["wins"] and a["buchholz"] == b["buchholz"]:
+            # Prefer whichever beat the other in head-to-head.
+            if h2h_wins.get((b["user_id"], a["user_id"]), 0) > \
+               h2h_wins.get((a["user_id"], b["user_id"]), 0):
+                out[i], out[i + 1] = b, a
+    return out
+
+
 async def _flow_organizer_resolve(
     interaction: discord.Interaction, side: str,
 ) -> None:
@@ -1788,6 +2056,7 @@ async def _flow_organizer_resolve(
             ("Organizer", interaction.user.mention, True),
         ],
     )
+    await _on_match_state_change(interaction.client, match["id"])
 
 
 async def setup(bot: commands.Bot) -> None:
