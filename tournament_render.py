@@ -535,10 +535,10 @@ def _paint_banner_gradient(
 # Banner body — word-wrapped text baked into the image                         #
 # --------------------------------------------------------------------------- #
 
-BANNER_BODY_FONT_SIZE = 20
-BANNER_BODY_LINE_GAP = 8
-BANNER_BODY_PAD_X = 44
-BANNER_BODY_PAD_Y = 24
+BANNER_BODY_FONT_SIZE = 28
+BANNER_BODY_LINE_GAP = 14
+BANNER_BODY_PAD_X = 60
+BANNER_BODY_PAD_Y = 40
 BANNER_BODY_BG = (18, 16, 18)
 
 
