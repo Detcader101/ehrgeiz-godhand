@@ -893,6 +893,52 @@ class Setup(commands.Cog):
         )
 
     @app_commands.command(
+        name="set-bot-profile-banner",
+        description="[Admin] Render + apply the Ehrgeiz banner to the bot's Discord profile.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def set_bot_profile_banner(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            buf = await tournament_render.render_bot_profile_banner()
+            data = buf.getvalue()
+            await self.bot.user.edit(banner=data)
+        except discord.HTTPException as e:
+            await interaction.followup.send(
+                f"⚠ Discord rejected the update: `{e}`. "
+                "Bot-user edits are rate-limited — if you just uploaded "
+                "an avatar or banner, wait an hour and retry.",
+                ephemeral=True,
+            )
+            return
+        except Exception as e:
+            log.exception("set-bot-profile-banner failed")
+            await interaction.followup.send(
+                f"⚠ Render/upload failed: `{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎌 Bot profile banner updated",
+            description=(
+                "The Ehrgeiz Godhand banner is live on the bot's Discord "
+                "profile card. Click the bot's name to preview — Discord "
+                "may cache the old image for a minute."
+            ),
+            color=discord.Color.green(),
+        )
+        embed.set_image(url="attachment://profile_banner.png")
+        # Rewind the rendered bytes so the same buffer can attach to the
+        # ephemeral confirmation embed.
+        buf.seek(0)
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(buf, filename="profile_banner.png"),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
         name="upload-rank-emojis",
         description="[Admin] Upload Tekken rank icons to this server as custom emojis.",
     )

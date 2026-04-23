@@ -656,6 +656,82 @@ def _render_banner_body(
 
 
 # --------------------------------------------------------------------------- #
+# Bot profile banner (shown on the bot's Discord user card)                    #
+# --------------------------------------------------------------------------- #
+
+PROFILE_BANNER_W = 680
+PROFILE_BANNER_H = 240
+
+
+async def render_bot_profile_banner() -> io.BytesIO:
+    """Render the 680×240 Discord-profile banner that sits at the top of
+    the bot's user card. Logo-forward, minimal text — no body band.
+    Intended to be applied via `ClientUser.edit(banner=bytes)`."""
+    img = Image.new("RGBA", (PROFILE_BANNER_W, PROFILE_BANNER_H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Gradient wash + accent strips top/bottom.
+    _paint_banner_gradient(img, y_start=0, y_end=PROFILE_BANNER_H)
+    draw.rectangle([(0, 0), (PROFILE_BANNER_W, 4)], fill=ACCENT)
+    draw.rectangle(
+        [(0, PROFILE_BANNER_H - 4), (PROFILE_BANNER_W, PROFILE_BANNER_H)],
+        fill=ACCENT,
+    )
+
+    # Logo — left side, vertically centered, larger than the channel-
+    # banner version since there's less competing text.
+    logo_x = 26
+    logo_box = 180
+    if LOGO_PATH.exists():
+        try:
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            src_w, src_h = logo.size
+            scale = min(logo_box / src_w, logo_box / src_h)
+            new_w = max(1, int(src_w * scale))
+            new_h = max(1, int(src_h * scale))
+            resized = logo.resize((new_w, new_h), Image.LANCZOS)
+            img.alpha_composite(
+                resized,
+                (logo_x + (logo_box - new_w) // 2,
+                 (PROFILE_BANNER_H - new_h) // 2),
+            )
+        except (OSError, IOError) as e:
+            log.warning("profile banner logo load failed: %s", e)
+
+    # Title + tagline, stacked and vertically centered.
+    text_x = logo_x + logo_box + 22
+    text_max_w = PROFILE_BANNER_W - text_x - 30
+
+    title = "EHRGEIZ GODHAND"
+    tagline = "TEKKEN 8 SERVER COMPANION"
+
+    title_h = 68
+    tag_h = 22
+    gap = 10
+    block_h = title_h + gap + tag_h
+    block_y = (PROFILE_BANNER_H - block_h) // 2
+
+    title_font = _fit_text_to_box(
+        draw, title,
+        max_w=text_max_w, max_h=title_h,
+        max_size=64, min_size=28,
+    )
+    tag_font = _fit_text_to_box(
+        draw, tagline,
+        max_w=text_max_w, max_h=tag_h,
+        max_size=20, min_size=12,
+    )
+
+    draw.text((text_x, block_y), title, fill=TEXT, font=title_font)
+    draw.text(
+        (text_x, block_y + title_h + gap), tagline,
+        fill=ACCENT, font=tag_font,
+    )
+
+    return _to_png_buf(img)
+
+
+# --------------------------------------------------------------------------- #
 # Round bracket render                                                         #
 # --------------------------------------------------------------------------- #
 
