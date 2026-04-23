@@ -18,6 +18,7 @@ from discord.ext import commands
 
 import db
 import media
+import tournament_render
 from cogs.onboarding import (
     PANEL_KIND_PLAYER_HUB,
     PlayerHubView,
@@ -115,6 +116,172 @@ class RoleSpec:
     mentionable: bool
 
 
+# --------------------------------------------------------------------------- #
+# Channel banners                                                              #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class BannerSpec:
+    """Declarative config for the pinned Ehrgeiz banner at the top of
+    each user-facing text channel. `kind` is the db.panels key so the
+    bot can find the existing message on re-setup instead of posting a
+    duplicate."""
+    channel_name: str
+    kind: str
+    kicker: str
+    title: str
+    subtitle: str
+    body: str
+
+
+BANNER_PLAN: list[BannerSpec] = [
+    # ---- Info ---- #
+    BannerSpec(
+        channel_name="rules", kind="banner_rules",
+        kicker="Welcome", title="House Rules",
+        subtitle="Read before you swing",
+        body=(
+            "**Basics:** be kind, don't harass, don't cheat.\n"
+            "**Tekken talk:** hype is good, tilt is fine, slurs are not.\n"
+            "**Onboarding:** verify your Tekken ID in **#player-hub** to "
+            "unlock the rest of the server.\n\n"
+            "Breaking the rules gets you warned, timed out, or banned. "
+            "Moderators' call is final; use DMs for appeals."
+        ),
+    ),
+    BannerSpec(
+        channel_name="announcements", kind="banner_announcements",
+        kicker="Server News", title="Announcements",
+        subtitle="Stay in the loop",
+        body=(
+            "Server-wide news, event dates, bot updates, tournament "
+            "kickoffs. Staff-only posting — watch for the pings."
+        ),
+    ),
+    # #player-hub deliberately skipped: it already carries the Player Hub panel.
+    # ---- General ---- #
+    BannerSpec(
+        channel_name="general", kind="banner_general",
+        kicker="Hangout", title="General Chat",
+        subtitle="Home of the Ehrgeiz crowd",
+        body=(
+            "Your main hangout. Tekken chat, meme chat, whatever chat. "
+            "Keep it friendly."
+        ),
+    ),
+    BannerSpec(
+        channel_name="clips-and-highlights", kind="banner_clips",
+        kicker="Replay Culture", title="Clips & Highlights",
+        subtitle="Drop the tape",
+        body=(
+            "Post your best sets, sick combos, clutch comebacks. Thread "
+            "the talk under each clip so the feed stays watchable."
+        ),
+    ),
+    BannerSpec(
+        channel_name="off-topic", kind="banner_offtopic",
+        kicker="Anything Else", title="Off-Topic",
+        subtitle="Non-Tekken is fine here",
+        body="Everything that's not Tekken goes here. Same server rules apply.",
+    ),
+    # ---- Tekken ---- #
+    BannerSpec(
+        channel_name="tech-talk", kind="banner_techtalk",
+        kicker="Theory", title="Tech Talk",
+        subtitle="Frame data · meta · strategy",
+        body=(
+            "Advanced discussion — frame data, matchup theory, meta shifts, "
+            "patch analysis. Bring receipts."
+        ),
+    ),
+    BannerSpec(
+        channel_name="fundamentals", kind="banner_fundamentals",
+        kicker="Study Hall", title="Fundamentals",
+        subtitle="Newbies welcome, always",
+        body=(
+            "Ask the basic questions here without judgement. Veterans: "
+            "this is where you pay it forward."
+        ),
+    ),
+    BannerSpec(
+        channel_name="combos", kind="banner_combos",
+        kicker="Lab Notes", title="Combos",
+        subtitle="Routes · optimisation · tech",
+        body=(
+            "Character combo routes, damage optimisations, new tech. "
+            "Include the character + notation + (where known) wall carry."
+        ),
+    ),
+    BannerSpec(
+        channel_name="matchup-help", kind="banner_matchup",
+        kicker="Call for Help", title="Matchup Help",
+        subtitle="Ask about specific matchups",
+        body=(
+            "Stuck against a character? Post the pair (you vs them), "
+            "screenshot or describe the problem spot, and ask."
+        ),
+    ),
+    # ---- Matchmaking ---- #
+    BannerSpec(
+        channel_name="matchmaking-na", kind="banner_mm_na",
+        kicker="North America", title="Matchmaking · NA",
+        subtitle="Looking for games",
+        body=(
+            "Click **I'm Looking** below and the bot posts an LFG ping "
+            "with your rank + main so others know who they're playing. "
+            "Auto-clears after 30 minutes."
+        ),
+    ),
+    BannerSpec(
+        channel_name="matchmaking-eu", kind="banner_mm_eu",
+        kicker="Europe", title="Matchmaking · EU",
+        subtitle="Looking for games",
+        body=(
+            "Click **I'm Looking** below and the bot posts an LFG ping "
+            "with your rank + main. Auto-clears after 30 minutes."
+        ),
+    ),
+    BannerSpec(
+        channel_name="matchmaking-asia", kind="banner_mm_asia",
+        kicker="Asia", title="Matchmaking · Asia",
+        subtitle="Looking for games",
+        body=(
+            "Click **I'm Looking** below and the bot posts an LFG ping "
+            "with your rank + main. Auto-clears after 30 minutes."
+        ),
+    ),
+    BannerSpec(
+        channel_name="matchmaking-oce", kind="banner_mm_oce",
+        kicker="Oceania", title="Matchmaking · OCE",
+        subtitle="Looking for games",
+        body=(
+            "Click **I'm Looking** below and the bot posts an LFG ping "
+            "with your rank + main. Auto-clears after 30 minutes."
+        ),
+    ),
+    # ---- Competitive ---- #
+    BannerSpec(
+        channel_name="tournaments", kind="banner_tournaments",
+        kicker="Competitive", title="Tournaments",
+        subtitle="Swiss brackets · rank-weighted seeding",
+        body=(
+            "Organizers spin up Swiss tournaments here. Click the signup "
+            "panels to enter. Rank-weighted pairings; match winners only "
+            "(no per-game reporting — keep it moving)."
+        ),
+    ),
+    BannerSpec(
+        channel_name="tournament-history", kind="banner_tournament_history",
+        kicker="Archive", title="Tournament History",
+        subtitle="Past brackets · past champions",
+        body=(
+            "Closed tournaments are archived here by the bot — final "
+            "bracket image + results. Scroll or search for past events."
+        ),
+    ),
+]
+
+
 ROLE_PLAN: list[RoleSpec] = [
     RoleSpec("Admin", discord.Color.red(),
              discord.Permissions(administrator=True),
@@ -155,6 +322,7 @@ class SetupReport:
     errors: list[str] = field(default_factory=list)
     panel_posted_in: str | None = None  # channel name if Player Hub was auto-posted
     panel_skip_reason: str | None = None  # human-readable reason if skipped
+    banners_posted: int = 0
 
     def to_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -199,7 +367,13 @@ class SetupReport:
                 f"**2️⃣** 🎴 Player Hub panel was **not** auto-posted{reason}. "
                 "Go to your preferred channel and run `/post-player-panel`."
             )
-        next_steps.append("**3️⃣** 📜 Write your rules in **#rules** and pin them.")
+        if self.banners_posted:
+            next_steps.append(
+                f"**3️⃣** 🖼️ Pinned **{self.banners_posted}** channel "
+                "banners. Edit copy in `BANNER_PLAN` (cogs/setup.py) and "
+                "re-run to refresh in place."
+            )
+        next_steps.append("**4️⃣** 📜 Read the #rules banner and personalise it if you want.")
         embed.add_field(name="📝 Next steps", value="\n".join(next_steps), inline=False)
 
         if self.errors:
@@ -208,6 +382,99 @@ class SetupReport:
             embed.color = discord.Color.orange()
         embed.set_footer(text="Ehrgeiz Godhand • Idempotent — safe to re-run later")
         return embed
+
+
+async def _delete_pin_notification(channel: discord.TextChannel) -> None:
+    """Nuke the transient 'X pinned a message' system message after a pin,
+    mirroring the pattern used by the tournament signup panel so /setup
+    doesn't litter channels with 14 pin notifications."""
+    try:
+        async for m in channel.history(limit=5):
+            if m.type == discord.MessageType.pins_add:
+                await m.delete()
+                return
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+async def _post_or_refresh_banner(
+    guild: discord.Guild, spec: BannerSpec, report: SetupReport,
+) -> None:
+    """Post (or refresh in place) the pinned banner for a single channel.
+    Idempotent: on re-run we fetch the existing message from db.panels,
+    edit it with a freshly-rendered banner, and skip the pin step since
+    it's already pinned."""
+    channel = discord.utils.get(guild.text_channels, name=spec.channel_name)
+    if channel is None:
+        # Channel isn't in the server — user either renamed it or opted
+        # out of this part of the layout. Silent skip; not an error.
+        return
+
+    try:
+        buf = await tournament_render.render_banner(
+            kicker=spec.kicker,
+            title=spec.title,
+            subtitle=spec.subtitle,
+        )
+    except Exception as e:
+        report.errors.append(f"Banner render for #{spec.channel_name}: {e}")
+        return
+
+    embed = discord.Embed(
+        description=spec.body,
+        color=discord.Color.red(),
+    )
+    embed.set_image(url="attachment://banner.png")
+
+    existing = await db.get_panel(guild.id, spec.kind)
+    if existing is not None:
+        try:
+            ch = guild.get_channel(existing["channel_id"]) or channel
+            msg = await ch.fetch_message(existing["message_id"])
+            await msg.edit(
+                embed=embed,
+                attachments=[discord.File(buf, filename="banner.png")],
+            )
+            return
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            # Old message is gone or unreachable — fall through and
+            # post a fresh one.
+            pass
+
+    try:
+        msg = await channel.send(
+            embed=embed,
+            file=discord.File(buf, filename="banner.png"),
+        )
+    except discord.Forbidden:
+        report.errors.append(
+            f"Banner for #{spec.channel_name}: no send permission"
+        )
+        return
+    except discord.HTTPException as e:
+        report.errors.append(f"Banner for #{spec.channel_name}: {e}")
+        return
+
+    try:
+        await msg.pin()
+        await _delete_pin_notification(channel)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning("pin failed for banner %s: %s", spec.kind, e)
+
+    await db.set_panel(guild.id, spec.kind, channel.id, msg.id)
+
+
+async def _post_channel_banners(
+    guild: discord.Guild, report: SetupReport,
+) -> None:
+    """Loop every banner spec, posting (or refreshing) its pinned panel."""
+    posted = 0
+    for spec in BANNER_PLAN:
+        before = len(report.errors)
+        await _post_or_refresh_banner(guild, spec, report)
+        if len(report.errors) == before:
+            posted += 1
+    report.banners_posted = posted
 
 
 async def _post_player_hub_if_channel_exists(
@@ -364,6 +631,7 @@ class _ConfirmSetupView(discord.ui.View):
         await _post_player_hub_if_channel_exists(
             interaction.client, interaction.guild, report,
         )
+        await _post_channel_banners(interaction.guild, report)
         await interaction.edit_original_response(content=None, embed=report.to_embed())
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)

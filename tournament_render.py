@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 ASSETS_DIR = Path(__file__).parent / "assets"
 RANK_CACHE_DIR = ASSETS_DIR / "rank_cache"
 CHAR_CACHE_DIR = ASSETS_DIR / "char_cache"
+LOGO_PATH = ASSETS_DIR / "ehrgeiz.png"
 
 # Ehrgeiz palette — near-black background with the brand red as the one
 # accent, matching the logo and the embed color.
@@ -403,6 +404,116 @@ def _to_png_buf(img: Image.Image) -> io.BytesIO:
     img.convert("RGB").save(buf, format="PNG", optimize=True)
     buf.seek(0)
     return buf
+
+
+# --------------------------------------------------------------------------- #
+# Channel banner render                                                        #
+# --------------------------------------------------------------------------- #
+
+BANNER_W = 960
+BANNER_H = 240
+
+
+async def render_banner(
+    *,
+    title: str,
+    subtitle: str | None = None,
+    kicker: str | None = None,
+) -> io.BytesIO:
+    """Wide hero banner for a pinned channel panel.
+
+    Layout: Ehrgeiz logo left, stacked text block right (kicker · title ·
+    subtitle), red accent strip top and bottom. Same 960-wide aspect as
+    the bracket render so banners and bracket graphics sit in the same
+    visual family.
+    """
+    img = Image.new("RGBA", (BANNER_W, BANNER_H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Background: subtle top-to-bottom wash with a red-tinted left column
+    # so the logo has something to sit against.
+    _paint_banner_gradient(img)
+
+    # Top + bottom accent strips.
+    draw.rectangle([(0, 0), (BANNER_W, 4)], fill=ACCENT)
+    draw.rectangle([(0, BANNER_H - 4), (BANNER_W, BANNER_H)], fill=ACCENT)
+
+    # Logo — vertically centered, a reasonable size left margin.
+    logo_x = 40
+    logo_w = 180
+    if LOGO_PATH.exists():
+        try:
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            src_w, src_h = logo.size
+            scale = min(logo_w / src_w, (BANNER_H - 40) / src_h)
+            new_w = max(1, int(src_w * scale))
+            new_h = max(1, int(src_h * scale))
+            resized = logo.resize((new_w, new_h), Image.LANCZOS)
+            img.alpha_composite(
+                resized,
+                (logo_x + (logo_w - new_w) // 2,
+                 (BANNER_H - new_h) // 2),
+            )
+        except (OSError, IOError) as e:
+            log.warning("banner logo load failed: %s", e)
+
+    # Text block — left edge just past the logo, vertically centered
+    # as a group.
+    text_x = logo_x + logo_w + 30
+    text_max_w = BANNER_W - text_x - 40
+
+    kicker_h = 26 if kicker else 0
+    title_h = 80
+    sub_h = 32 if subtitle else 0
+    gap_ks = 8 if kicker else 0
+    gap_ts = 10 if subtitle else 0
+    block_h = kicker_h + gap_ks + title_h + gap_ts + sub_h
+    block_y = (BANNER_H - block_h) // 2
+
+    y = block_y
+    if kicker:
+        kf = _fit_text_to_box(
+            draw, kicker.upper(),
+            max_w=text_max_w, max_h=kicker_h,
+            max_size=22, min_size=14,
+        )
+        draw.text((text_x, y), kicker.upper(), fill=ACCENT, font=kf)
+        y += kicker_h + gap_ks
+
+    title_font = _fit_text_to_box(
+        draw, title.upper(),
+        max_w=text_max_w, max_h=title_h,
+        max_size=96, min_size=30,
+    )
+    draw.text((text_x, y), title.upper(), fill=TEXT, font=title_font)
+    y += title_h + gap_ts
+
+    if subtitle:
+        sf = _fit_text_to_box(
+            draw, subtitle.upper(),
+            max_w=text_max_w, max_h=sub_h,
+            max_size=28, min_size=14,
+        )
+        draw.text((text_x, y), subtitle.upper(), fill=TEXT_DIM, font=sf)
+
+    return _to_png_buf(img)
+
+
+def _paint_banner_gradient(canvas: Image.Image) -> None:
+    """Left-to-right wash: red-tinted shadow on the left (under the logo)
+    fading into the neutral background on the right. Keeps the logo
+    from floating visually and matches the bracket header family."""
+    width = canvas.width
+    height = canvas.height
+    # Left 40% gets a subtle red boost; right 60% stays bg.
+    left_tint = (55, 22, 28)
+    neutral = BG_COLOR
+    for i in range(width):
+        t = min(1.0, i / (width * 0.5))
+        r = int(left_tint[0] + (neutral[0] - left_tint[0]) * t)
+        g = int(left_tint[1] + (neutral[1] - left_tint[1]) * t)
+        b = int(left_tint[2] + (neutral[2] - left_tint[2]) * t)
+        canvas.paste((r, g, b, 255), (i, 0, i + 1, height))
 
 
 # --------------------------------------------------------------------------- #
