@@ -665,12 +665,17 @@ PROFILE_BANNER_H = 240
 
 async def render_bot_profile_banner() -> io.BytesIO:
     """Render the 680×240 Discord-profile banner that sits at the top of
-    the bot's user card. Logo-forward, minimal text — no body band.
-    Intended to be applied via `ClientUser.edit(banner=bytes)`."""
+    the bot's user card.
+
+    Discord overlays the bot's avatar (already the Ehrgeiz fist) in the
+    bottom-left corner of the banner and a kebab menu in the top-right,
+    so we deliberately leave those zones empty and anchor the text to
+    the upper-centre instead — no duplicated logo, no collisions with
+    Discord UI chrome.
+    """
     img = Image.new("RGBA", (PROFILE_BANNER_W, PROFILE_BANNER_H), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # Gradient wash + accent strips top/bottom.
     _paint_banner_gradient(img, y_start=0, y_end=PROFILE_BANNER_H)
     draw.rectangle([(0, 0), (PROFILE_BANNER_W, 4)], fill=ACCENT)
     draw.rectangle(
@@ -678,43 +683,31 @@ async def render_bot_profile_banner() -> io.BytesIO:
         fill=ACCENT,
     )
 
-    # Logo — left side, vertically centered, larger than the channel-
-    # banner version since there's less competing text.
-    logo_x = 26
-    logo_box = 180
-    if LOGO_PATH.exists():
-        try:
-            logo = Image.open(LOGO_PATH).convert("RGBA")
-            src_w, src_h = logo.size
-            scale = min(logo_box / src_w, logo_box / src_h)
-            new_w = max(1, int(src_w * scale))
-            new_h = max(1, int(src_h * scale))
-            resized = logo.resize((new_w, new_h), Image.LANCZOS)
-            img.alpha_composite(
-                resized,
-                (logo_x + (logo_box - new_w) // 2,
-                 (PROFILE_BANNER_H - new_h) // 2),
-            )
-        except (OSError, IOError) as e:
-            log.warning("profile banner logo load failed: %s", e)
-
-    # Title + tagline, stacked and vertically centered.
-    text_x = logo_x + logo_box + 22
-    text_max_w = PROFILE_BANNER_W - text_x - 30
+    # Safe-zone layout.
+    # - Avatar circle sits roughly in the bottom-left ~120×120 of the
+    #   banner, so text must stay out of that corner.
+    # - Kebab/"..." button sits in the top-right ~40×40.
+    # Keeping the text block anchored at x≈190 (past avatar) and pulled
+    # upward (above the avatar's crown) keeps both UI chrome elements
+    # out of the composition.
+    text_x = 190
+    text_max_w = PROFILE_BANNER_W - text_x - 50  # 50px right gutter clears the kebab
 
     title = "EHRGEIZ GODHAND"
     tagline = "TEKKEN 8 SERVER COMPANION"
 
-    title_h = 68
+    title_h = 60
     tag_h = 22
     gap = 10
     block_h = title_h + gap + tag_h
-    block_y = (PROFILE_BANNER_H - block_h) // 2
+    # Nudged upward from centre (~40% of banner height) so the tagline
+    # finishes above the avatar's overlap line.
+    block_y = int(PROFILE_BANNER_H * 0.32) - block_h // 2 + 30
 
     title_font = _fit_text_to_box(
         draw, title,
         max_w=text_max_w, max_h=title_h,
-        max_size=64, min_size=28,
+        max_size=54, min_size=26,
     )
     tag_font = _fit_text_to_box(
         draw, tagline,
