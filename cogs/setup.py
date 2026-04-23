@@ -29,6 +29,7 @@ import wavu
 from cogs.onboarding import (
     PANEL_KIND_PLAYER_HUB,
     PlayerHubView,
+    _player_hub_banner_file,
     _player_hub_embed,
 )
 from cogs.tournament import TournamentsPanelView
@@ -400,6 +401,76 @@ class SetupReport:
         return embed
 
 
+async def _reposition_roles(
+    guild: discord.Guild,
+    role_by_name: dict[str, discord.Role],
+    report: SetupReport,
+) -> None:
+    """Order the Ehrgeiz-managed roles just below the bot's top role.
+
+    We build a `{role: position}` dict and let discord.py's
+    `edit_role_positions` atomically reorder them. Target order
+    (highest -> lowest):
+
+        Admin -> Moderator -> (bot's top role) -> Organizer ->
+        The Silencerz -> Verified
+
+    Admin + Mod sit just below the bot (not at the bottom) so the
+    server owner only has to drag the bot role up one or two slots
+    manually to hit the usual final layout.
+    """
+    me = guild.me
+    if me is None:
+        return
+    bot_role = me.top_role
+    base = bot_role.position
+    if base <= 1:
+        # Bot role hasn't been promoted above @everyone — nothing we can
+        # fit below it. Flag so next_steps prompts the admin.
+        report.errors.append(
+            "bot role is at the bottom; drag 'Ehrgeiz Godhand' role above "
+            "Verified + rank roles so it can manage them."
+        )
+        return
+
+    # Order from just-below-bot downwards. We stop early if we run out
+    # of positions above @everyone (position 0).
+    desired_order = [
+        "Admin",
+        "Moderator",
+        "Organizer",
+        "The Silencerz",
+        "Verified",
+    ]
+
+    positions: dict[discord.Role, int] = {}
+    slot = base - 1
+    for name in desired_order:
+        if slot <= 0:
+            break
+        role = role_by_name.get(name)
+        if role is None or role.is_default() or role.id == bot_role.id:
+            continue
+        positions[role] = slot
+        slot -= 1
+
+    if not positions:
+        return
+
+    try:
+        await guild.edit_role_positions(
+            positions=positions,
+            reason="Ehrgeiz Godhand /setup-server (role hierarchy)",
+        )
+    except discord.Forbidden:
+        report.errors.append(
+            "couldn't reposition roles — bot needs Manage Roles + its "
+            "own role above the targets"
+        )
+    except discord.HTTPException as e:
+        report.errors.append(f"role repositioning: {e}")
+
+
 async def _delete_pin_notification(channel: discord.TextChannel) -> None:
     """Nuke the transient 'X pinned a message' system message after a pin,
     mirroring the pattern used by the tournament signup panel so /setup
@@ -521,8 +592,11 @@ async def _post_player_hub_if_channel_exists(
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
     try:
+        banner = await _player_hub_banner_file()
         msg = await channel.send(
-            embed=_player_hub_embed(), view=PlayerHubView(bot),
+            embed=_player_hub_embed(),
+            view=PlayerHubView(bot),
+            file=banner,
         )
     except discord.Forbidden:
         report.panel_skip_reason = "bot can't post in #player-hub (permissions)"
@@ -554,6 +628,14 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
 
     admin_role = role_by_name.get("Admin")
     mod_role = role_by_name.get("Moderator")
+
+    # Reposition bot-created roles so the hierarchy actually works out of
+    # the box. Discord's rule: a bot can't move any role above its own
+    # top role — so we pack everything just below the bot's top role, in
+    # descending order of authority. Admin/Mod sit just below the bot
+    # (rather than position 1 at the bottom); the server owner can drag
+    # them the rest of the way up if they want them above the bot.
+    await _reposition_roles(guild, role_by_name, report)
 
     # --- Categories + channels --- #
     for cat_spec in SERVER_PLAN:
@@ -1065,10 +1147,35 @@ async def _execute_purge(guild: discord.Guild) -> PurgeReport:
     panels_cleaned = await _unpin_and_remove_panels(guild, report)
     _ = panels_cleaned  # informational
 
-    # Delete matching channels first (including voice), then categories.
-    # Iterate guild.channels once and filter to avoid mutating live list.
+    # Phase 1: for every matched category, wipe ALL its children
+    # (not just the ones in SERVER_PLAN). Previous version left
+    # categories non-empty when the admin had added extra channels
+    # inside them — the subsequent category delete then failed because
+    # Discord refuses to delete a category with active contents.
+    deleted_channel_ids: set[int] = set()
+    for cat in list(guild.categories):
+        if cat.name not in PLANNED_CATEGORY_NAMES:
+            continue
+        for ch in list(cat.channels):
+            try:
+                await ch.delete(reason="Ehrgeiz Godhand /purge-server")
+                report.channels_deleted += 1
+                deleted_channel_ids.add(ch.id)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                report.errors.append(f"channel '{ch.name}': {e}")
+        try:
+            await cat.delete(reason="Ehrgeiz Godhand /purge-server")
+            report.categories_deleted += 1
+        except (discord.Forbidden, discord.HTTPException) as e:
+            report.errors.append(f"category '{cat.name}': {e}")
+
+    # Phase 2: sweep up orphan matched-name channels that were moved
+    # out of their parent category (or were never inside one). Skips
+    # anything we already handled in phase 1.
     for ch in list(guild.channels):
         if isinstance(ch, discord.CategoryChannel):
+            continue
+        if ch.id in deleted_channel_ids:
             continue
         if ch.name in PLANNED_CHANNEL_NAMES:
             try:
@@ -1076,14 +1183,6 @@ async def _execute_purge(guild: discord.Guild) -> PurgeReport:
                 report.channels_deleted += 1
             except (discord.Forbidden, discord.HTTPException) as e:
                 report.errors.append(f"channel '{ch.name}': {e}")
-
-    for cat in list(guild.categories):
-        if cat.name in PLANNED_CATEGORY_NAMES:
-            try:
-                await cat.delete(reason="Ehrgeiz Godhand /purge-server")
-                report.categories_deleted += 1
-            except (discord.Forbidden, discord.HTTPException) as e:
-                report.errors.append(f"category '{cat.name}': {e}")
 
     # Roles — skip @everyone and the bot's own managed role.
     bot_role = guild.me.top_role if guild.me else None
@@ -1186,23 +1285,37 @@ class _ConfirmPurgeView(discord.ui.View):
         )
 
         guild = interaction.guild
-        report = await _execute_purge(guild)
+        # Any uncaught exception inside purge/build would leave the
+        # ephemeral message stuck at "Purging…" with no way to tell what
+        # went wrong. Wrap the whole chain so we always surface a result.
+        try:
+            report = await _execute_purge(guild)
 
-        if self.rebuild:
-            build = await _build_server(guild)
-            # Re-run banner + player hub posts against the fresh server.
-            await _post_player_hub_if_channel_exists(
-                interaction.client, guild, build,
-            )
-            await _post_channel_banners(guild, build)
-            await interaction.edit_original_response(
-                content=None,
-                embed=_combined_report_embed(report, build),
-            )
-        else:
-            await interaction.edit_original_response(
-                content=None, embed=_purge_only_report_embed(report),
-            )
+            if self.rebuild:
+                build = await _build_server(guild)
+                await _post_player_hub_if_channel_exists(
+                    interaction.client, guild, build,
+                )
+                await _post_channel_banners(guild, build)
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=_combined_report_embed(report, build),
+                )
+            else:
+                await interaction.edit_original_response(
+                    content=None, embed=_purge_only_report_embed(report),
+                )
+        except Exception as e:
+            log.exception("purge/reset confirm raised")
+            try:
+                await interaction.edit_original_response(
+                    content=(f"❌ **{'Reset' if self.rebuild else 'Purge'} "
+                             f"failed partway:** `{type(e).__name__}: {e}`. "
+                             "Check the bot console for a traceback."),
+                    embed=None,
+                )
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button):

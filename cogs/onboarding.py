@@ -15,6 +15,7 @@ import audit
 import db
 import ewgf
 import media
+import tournament_render
 import wavu
 
 log = logging.getLogger(__name__)
@@ -137,7 +138,42 @@ async def _ensure_role(guild: discord.Guild, name: str, *, reason: str) -> disco
     role = discord.utils.get(guild.roles, name=name)
     if role is None:
         role = await guild.create_role(name=name, reason=reason, mentionable=False)
+        # Newly-created roles default to position 1 (just above @everyone).
+        # Push them up to just above Verified so the rank-role band sits
+        # together in the hierarchy — otherwise the picker would show
+        # fresh tiers dangling at the bottom.
+        await _tuck_rank_role_above_verified(guild, role)
     return role
+
+
+async def _tuck_rank_role_above_verified(
+    guild: discord.Guild, role: discord.Role,
+) -> None:
+    """Move a newly-minted rank role to just above the Verified role so
+    rank tiers cluster together in the server's role list. Best-effort:
+    if the bot can't reposition (missing Manage Roles or its own role is
+    too low), the role just stays at position 1 and the admin can drag
+    it later."""
+    verified = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+    if verified is None:
+        return
+    bot_me = guild.me
+    if bot_me is None:
+        return
+    target_pos = verified.position + 1
+    # Can't place a role at or above the bot's own top role.
+    max_allowed = bot_me.top_role.position - 1
+    if max_allowed < 1:
+        return
+    if target_pos > max_allowed:
+        target_pos = max_allowed
+    try:
+        await guild.edit_role_positions(
+            positions={role: target_pos},
+            reason="Ehrgeiz Godhand: keep rank roles grouped",
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.debug("couldn't tuck rank role %s: %s", role.name, e)
 
 
 # Role names this bot has historically created that are NOT in the current
@@ -1165,9 +1201,11 @@ class PlayerHubView(discord.ui.View):
         await _flow_unlink(interaction)
 
 
+PLAYER_HUB_BANNER_FILENAME = "player_hub_banner.png"
+
+
 def _player_hub_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🎴 Tekken 8 Player Hub",
         description=(
             "**🆕 New here?** Click **🔓 Verify** and enter your **Tekken ID** "
             "(the ~12-character Polaris Battle ID from *Main Menu → Community → "
@@ -1175,16 +1213,27 @@ def _player_hub_embed() -> discord.Embed:
             "gives you your rank role.\n\n"
             "**✅ Already verified?**\n"
             "• 🔄 **Refresh Rank** — pull your latest rank from recent matches.\n"
-            "• ✏️ **Set Rank Manually** — pick your rank from a dropdown (for when "
-            "auto-detect can't find a recent match).\n"
+            "• ✏️ **Set Rank Manually** — pick your rank from a dropdown.\n"
             "• 🪪 **My Profile** — see what the bot has on file for you.\n"
             "• 🚪 **Unlink Me** — remove your link (with confirmation)."
         ),
-        color=discord.Color.blurple(),
+        color=discord.Color.red(),
     )
-    embed.set_thumbnail(url=media.LOGO_URL)
+    embed.set_image(url=f"attachment://{PLAYER_HUB_BANNER_FILENAME}")
     embed.set_footer(text="One Tekken ID per Discord account • Admins can override")
     return embed
+
+
+async def _player_hub_banner_file() -> discord.File:
+    """Render the Player Hub hero image — same family as the channel
+    banners provisioned by /setup-server so the hub reads as a branded
+    panel, not a vanilla embed."""
+    buf = await tournament_render.render_banner(
+        kicker="Your Identity",
+        title="Player Hub",
+        subtitle="Verify · profile · rank · unlink",
+    )
+    return discord.File(buf, filename=PLAYER_HUB_BANNER_FILENAME)
 
 
 # --------------------------------------------------------------------------- #
@@ -1253,8 +1302,11 @@ class Onboarding(commands.Cog):
             )
             return
         await self._delete_old_panel(guild, PANEL_KIND_PLAYER_HUB)
+        banner = await _player_hub_banner_file()
         msg = await interaction.channel.send(
-            embed=_player_hub_embed(), view=PlayerHubView(self.bot),
+            embed=_player_hub_embed(),
+            view=PlayerHubView(self.bot),
+            file=banner,
         )
         await db.set_panel(guild.id, PANEL_KIND_PLAYER_HUB, interaction.channel.id, msg.id)
         await interaction.response.send_message(
