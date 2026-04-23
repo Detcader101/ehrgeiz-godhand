@@ -1209,16 +1209,15 @@ PLAYER_HUB_BANNER_FILENAME = "player_hub_banner.png"
 # The button labels carry their own emoji in Discord's UI, so players
 # still see them where it matters.
 _PLAYER_HUB_BODY = (
-    "New here? Click VERIFY and enter your Tekken ID — the ~12-"
-    "character Polaris Battle ID from Main Menu > Community > My "
-    "Profile. The bot checks wavu.wiki, confirms it's you, and gives "
-    "you your rank role.\n"
+    "## New here?\n"
+    "Click VERIFY and paste your Tekken ID.\n"
+    "(Find it at Main Menu > Community > My Profile.)\n"
     "\n"
-    "Already verified? Use the buttons below:\n"
-    "• Refresh Rank — pull your latest rank from recent matches.\n"
-    "• Set Rank Manually — pick your rank from a dropdown.\n"
-    "• My Profile — see what the bot has on file for you.\n"
-    "• Unlink Me — remove your link (with confirmation)."
+    "## Already verified?\n"
+    "• Refresh Rank — pull latest from recent matches\n"
+    "• Set Rank Manually — pick from a dropdown\n"
+    "• My Profile — see what's on file\n"
+    "• Unlink Me — disconnect your account"
 )
 
 

@@ -153,12 +153,17 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Welcome", title="House Rules",
         subtitle="Read before you swing",
         body=(
-            "**Basics:** be kind, don't harass, don't cheat.\n"
-            "**Tekken talk:** hype is good, tilt is fine, slurs are not.\n"
-            "**Onboarding:** verify your Tekken ID in **#player-hub** to "
-            "unlock the rest of the server.\n\n"
-            "Breaking the rules gets you warned, timed out, or banned. "
-            "Moderators' call is final; use DMs for appeals."
+            "## Basics\n"
+            "Be kind. Don't harass. Don't cheat.\n"
+            "\n"
+            "## Tekken talk\n"
+            "Hype is good. Tilt is fine. Slurs are not.\n"
+            "\n"
+            "## Onboarding\n"
+            "Verify your Tekken ID in #player-hub to unlock the server.\n"
+            "\n"
+            "## Consequences\n"
+            "Warn > timeout > ban. Mods' call is final."
         ),
     ),
     BannerSpec(
@@ -166,8 +171,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Server News", title="Announcements",
         subtitle="Stay in the loop",
         body=(
-            "Server-wide news, event dates, bot updates, tournament "
-            "kickoffs. Staff-only posting — watch for the pings."
+            "## What goes here\n"
+            "Event dates. Bot updates. Tournament kickoffs.\n"
+            "\n"
+            "## Posting\n"
+            "Staff only — watch for the pings."
         ),
     ),
     # #player-hub deliberately skipped: it already carries the Player Hub panel.
@@ -177,7 +185,10 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Hangout", title="General Chat",
         subtitle="Home of the Ehrgeiz crowd",
         body=(
-            "Your main hangout. Tekken chat, meme chat, whatever chat. "
+            "## What goes here\n"
+            "Tekken chat. Meme chat. Whatever chat.\n"
+            "\n"
+            "## Vibe\n"
             "Keep it friendly."
         ),
     ),
@@ -186,15 +197,24 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Replay Culture", title="Clips & Highlights",
         subtitle="Drop the tape",
         body=(
-            "Post your best sets, sick combos, clutch comebacks. Thread "
-            "the talk under each clip so the feed stays watchable."
+            "## Post your best\n"
+            "Sets. Combos. Clutch comebacks.\n"
+            "\n"
+            "## Keep the feed readable\n"
+            "Thread the discussion under each clip."
         ),
     ),
     BannerSpec(
         channel_name="off-topic", kind="banner_offtopic",
         kicker="Anything Else", title="Off-Topic",
         subtitle="Non-Tekken is fine here",
-        body="Everything that's not Tekken goes here. Same server rules apply.",
+        body=(
+            "## What goes here\n"
+            "Everything that isn't Tekken.\n"
+            "\n"
+            "## Rules\n"
+            "Same server rules apply."
+        ),
     ),
     # ---- Tekken ---- #
     BannerSpec(
@@ -202,8 +222,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Theory", title="Tech Talk",
         subtitle="Frame data · meta · strategy",
         body=(
-            "Advanced discussion — frame data, matchup theory, meta shifts, "
-            "patch analysis. Bring receipts."
+            "## What goes here\n"
+            "Frame data. Matchup theory. Meta shifts. Patch analysis.\n"
+            "\n"
+            "## Bring receipts\n"
+            "Back claims with data, clips, or sources."
         ),
     ),
     BannerSpec(
@@ -211,8 +234,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Study Hall", title="Fundamentals",
         subtitle="Newbies welcome, always",
         body=(
-            "Ask the basic questions here without judgement. Veterans: "
-            "this is where you pay it forward."
+            "## Newbies\n"
+            "Ask the basic questions — no judgement.\n"
+            "\n"
+            "## Veterans\n"
+            "This is where you pay it forward."
         ),
     ),
     BannerSpec(
@@ -220,8 +246,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Lab Notes", title="Combos",
         subtitle="Routes · optimisation · tech",
         body=(
-            "Character combo routes, damage optimisations, new tech. "
-            "Include the character + notation + (where known) wall carry."
+            "## What goes here\n"
+            "Combo routes. Damage optimisations. New tech.\n"
+            "\n"
+            "## Include\n"
+            "Character • notation • wall carry (if known)."
         ),
     ),
     BannerSpec(
@@ -229,8 +258,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Call for Help", title="Matchup Help",
         subtitle="Ask about specific matchups",
         body=(
-            "Stuck against a character? Post the pair (you vs them), "
-            "screenshot or describe the problem spot, and ask."
+            "## Stuck on a matchup?\n"
+            "Post your character vs theirs.\n"
+            "\n"
+            "## Describe the problem\n"
+            "Screenshot the spot, or explain where you're losing."
         ),
     ),
     # ---- Matchmaking ---- #
@@ -239,9 +271,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="North America", title="Matchmaking · NA",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking for Games** below and the bot posts an "
-            "LFG ping with your rank + main so others know who they're "
-            "playing. Auto-clears after 30 minutes."
+            "## Click I'm Looking\n"
+            "Posts an LFG with your rank + main.\n"
+            "\n"
+            "## Auto-clears\n"
+            "After 30 minutes. Click again any time."
         ),
         view_factory=LFGPanelView,
     ),
@@ -250,8 +284,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Europe", title="Matchmaking · EU",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking for Games** below and the bot posts an "
-            "LFG ping with your rank + main. Auto-clears after 30 minutes."
+            "## Click I'm Looking\n"
+            "Posts an LFG with your rank + main.\n"
+            "\n"
+            "## Auto-clears\n"
+            "After 30 minutes. Click again any time."
         ),
         view_factory=LFGPanelView,
     ),
@@ -260,8 +297,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Asia", title="Matchmaking · Asia",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking for Games** below and the bot posts an "
-            "LFG ping with your rank + main. Auto-clears after 30 minutes."
+            "## Click I'm Looking\n"
+            "Posts an LFG with your rank + main.\n"
+            "\n"
+            "## Auto-clears\n"
+            "After 30 minutes. Click again any time."
         ),
         view_factory=LFGPanelView,
     ),
@@ -270,8 +310,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Oceania", title="Matchmaking · OCE",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking for Games** below and the bot posts an "
-            "LFG ping with your rank + main. Auto-clears after 30 minutes."
+            "## Click I'm Looking\n"
+            "Posts an LFG with your rank + main.\n"
+            "\n"
+            "## Auto-clears\n"
+            "After 30 minutes. Click again any time."
         ),
         view_factory=LFGPanelView,
     ),
@@ -281,9 +324,12 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Competitive", title="Tournaments",
         subtitle="Swiss brackets · rank-weighted seeding",
         body=(
-            "Click **Active Tournaments** to see what's live. Organizers "
-            "click **Create Tournament (FT3)** for quick-start, or run "
-            "`/tournament-create` for full control over format and player cap."
+            "## See what's live\n"
+            "Click ACTIVE TOURNAMENTS.\n"
+            "\n"
+            "## Organizers\n"
+            "Click CREATE TOURNAMENT (FT3) for quick-start.\n"
+            "For FT2 or a player cap, use /tournament-create."
         ),
         view_factory=TournamentsPanelView,
     ),
@@ -292,8 +338,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Archive", title="Tournament History",
         subtitle="Past brackets · past champions",
         body=(
-            "Closed tournaments are archived here by the bot — final "
-            "bracket image + results. Scroll or search for past events."
+            "## Archive\n"
+            "Closed tournaments, posted here by the bot.\n"
+            "\n"
+            "## Each entry\n"
+            "Final bracket image + results."
         ),
     ),
 ]

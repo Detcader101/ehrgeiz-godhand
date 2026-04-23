@@ -536,9 +536,12 @@ def _paint_banner_gradient(
 # --------------------------------------------------------------------------- #
 
 BANNER_BODY_FONT_SIZE = 28
+BANNER_BODY_HEADER_FONT_SIZE = 30
 BANNER_BODY_LINE_GAP = 14
 BANNER_BODY_PAD_X = 60
-BANNER_BODY_PAD_Y = 40
+BANNER_BODY_PAD_Y = 50
+BANNER_BODY_PARA_GAP = 22     # extra pixels on blank-line paragraph breaks
+BANNER_BODY_HEADER_GAP = 10    # extra pixels above ## headers
 BANNER_BODY_BG = (18, 16, 18)
 
 
@@ -551,17 +554,24 @@ def _strip_body_markdown(s: str) -> str:
     return s
 
 
-def _wrap_body(
-    draw: ImageDraw.ImageDraw, text: str, font, max_w: int,
-) -> list[str]:
-    """Greedy word-wrap that respects explicit newlines in the source.
-    Blank lines are preserved so paragraph breaks carry over."""
-    lines: list[str] = []
-    for paragraph in text.split("\n"):
-        if not paragraph.strip():
-            lines.append("")
-            continue
+def _layout_body(body: str, max_w: int) -> list[tuple[str, str]]:
+    """Tokenize the body into a list of (kind, rendered_text) rows.
+
+    kind ∈ {"header", "body", "break"}:
+      - "## X" source lines become one ("header", "X") row.
+      - Blank source lines become ("break", "") — a paragraph pause.
+      - Everything else gets word-wrapped as ("body", line_text).
+
+    Wrapping uses the appropriate font for the row type so a long
+    header still fits inside the body cell."""
+    scratch = Image.new("RGBA", (1, 1))
+    draw = ImageDraw.Draw(scratch)
+    body_font = _load_font(BANNER_BODY_FONT_SIZE)
+    header_font = _load_font(BANNER_BODY_HEADER_FONT_SIZE)
+
+    def _wrap(paragraph: str, font) -> list[str]:
         words = paragraph.split()
+        wrapped: list[str] = []
         current = ""
         for word in words:
             candidate = f"{current} {word}".strip()
@@ -570,25 +580,44 @@ def _wrap_body(
                 current = candidate
             else:
                 if current:
-                    lines.append(current)
+                    wrapped.append(current)
                 current = word
         if current:
-            lines.append(current)
-    return lines
+            wrapped.append(current)
+        return wrapped or [paragraph]
+
+    rows: list[tuple[str, str]] = []
+    for paragraph in body.split("\n"):
+        stripped = paragraph.strip()
+        if not stripped:
+            rows.append(("break", ""))
+            continue
+        if stripped.startswith("## "):
+            for line in _wrap(stripped[3:], header_font):
+                rows.append(("header", line.upper()))
+            continue
+        for line in _wrap(stripped, body_font):
+            rows.append(("body", line))
+    return rows
+
+
+def _row_height(kind: str) -> int:
+    if kind == "header":
+        return (BANNER_BODY_HEADER_FONT_SIZE + BANNER_BODY_LINE_GAP
+                + BANNER_BODY_HEADER_GAP)
+    if kind == "break":
+        return BANNER_BODY_PARA_GAP
+    return BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
 
 
 def _compute_body_band_height(body: str) -> int:
-    """Compute the body-band pixel height up front so the canvas can
-    be sized correctly before we paint into it."""
-    scratch = Image.new("RGBA", (1, 1))
-    draw = ImageDraw.Draw(scratch)
-    font = _load_font(BANNER_BODY_FONT_SIZE)
-    lines = _wrap_body(
-        draw, _strip_body_markdown(body), font,
+    rows = _layout_body(
+        _strip_body_markdown(body),
         max_w=BANNER_W - 2 * BANNER_BODY_PAD_X,
     )
-    line_h = BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
-    return 2 * BANNER_BODY_PAD_Y + max(line_h, len(lines) * line_h)
+    total = 2 * BANNER_BODY_PAD_Y + sum(_row_height(k) for k, _ in rows)
+    # Guarantee a minimum band height for single-line bodies.
+    return max(total, 2 * BANNER_BODY_PAD_Y + _row_height("body"))
 
 
 def _render_banner_body(
@@ -600,20 +629,30 @@ def _render_banner_body(
         [(0, y_start), (BANNER_W, y_start + height)],
         fill=BANNER_BODY_BG,
     )
-    font = _load_font(BANNER_BODY_FONT_SIZE)
-    lines = _wrap_body(
-        draw, _strip_body_markdown(body), font,
+    body_font = _load_font(BANNER_BODY_FONT_SIZE)
+    header_font = _load_font(BANNER_BODY_HEADER_FONT_SIZE)
+    rows = _layout_body(
+        _strip_body_markdown(body),
         max_w=BANNER_W - 2 * BANNER_BODY_PAD_X,
     )
-    line_h = BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
+
     y = y_start + BANNER_BODY_PAD_Y
-    for line in lines:
-        if line:
+    for kind, text in rows:
+        if kind == "header":
+            y += BANNER_BODY_HEADER_GAP
             draw.text(
-                (BANNER_BODY_PAD_X, y), line,
-                fill=TEXT, font=font,
+                (BANNER_BODY_PAD_X, y), text,
+                fill=ACCENT, font=header_font,
             )
-        y += line_h
+            y += BANNER_BODY_HEADER_FONT_SIZE + BANNER_BODY_LINE_GAP
+        elif kind == "break":
+            y += BANNER_BODY_PARA_GAP
+        else:
+            draw.text(
+                (BANNER_BODY_PAD_X, y), text,
+                fill=TEXT, font=body_font,
+            )
+            y += BANNER_BODY_FONT_SIZE + BANNER_BODY_LINE_GAP
 
 
 # --------------------------------------------------------------------------- #
