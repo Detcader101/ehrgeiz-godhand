@@ -126,6 +126,25 @@ CREATE TABLE IF NOT EXISTS tournament_participants (
 
 CREATE INDEX IF NOT EXISTS idx_participants_tournament
     ON tournament_participants(tournament_id);
+
+-- Round pairings. Slice 1.5 uses this to persist round-1 pairings so the
+-- bracket survives a restart even before /report-win lands. winner_id is
+-- pre-filled for byes (player_b_id IS NULL and winner_id = player_a_id);
+-- otherwise NULL until reported.
+CREATE TABLE IF NOT EXISTS tournament_matches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id   INTEGER NOT NULL,
+    round_number    INTEGER NOT NULL,
+    match_number    INTEGER NOT NULL,
+    player_a_id     INTEGER,
+    player_b_id     INTEGER,
+    winner_id       INTEGER,
+    reported_at     TEXT,
+    FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_matches_tournament_round
+    ON tournament_matches(tournament_id, round_number);
 """
 
 
@@ -584,3 +603,57 @@ async def count_participants(tournament_id: int) -> int:
         ) as cur:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
+
+
+async def create_matches(
+    tournament_id: int,
+    round_number: int,
+    matches: list[tuple[int | None, int | None, int | None]],
+) -> None:
+    """Bulk-insert pairings for a round. Each tuple is
+    (player_a_id, player_b_id, winner_id) in match order — match_number is
+    the list index + 1. winner_id should be set for byes, None otherwise."""
+    if not matches:
+        return
+    rows = [
+        (tournament_id, round_number, i + 1, a, b, w, None)
+        for i, (a, b, w) in enumerate(matches)
+    ]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            """
+            INSERT INTO tournament_matches
+                (tournament_id, round_number, match_number,
+                 player_a_id, player_b_id, winner_id, reported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await db.commit()
+
+
+async def delete_fake_players() -> int:
+    """Wipe synthetic test-bot rows from the players table (tekken_id
+    LIKE 'TEST%'). Used by /tournament-dev-cleanup. Participant snapshots
+    in tournament_participants are left alone — they're self-contained
+    (display_name + rank_tier stored inline) and harmless."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM players WHERE tekken_id LIKE 'TEST%'"
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def list_matches_for_round(tournament_id: int, round_number: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM tournament_matches
+            WHERE tournament_id = ? AND round_number = ?
+            ORDER BY match_number
+            """,
+            (tournament_id, round_number),
+        ) as cur:
+            return await cur.fetchall()
