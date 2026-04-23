@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Callable
 
 import discord
 from discord import app_commands
@@ -24,6 +25,8 @@ from cogs.onboarding import (
     PlayerHubView,
     _player_hub_embed,
 )
+from cogs.tournament import TournamentsPanelView
+from cogs.matchmaking import LFGPanelView
 
 log = logging.getLogger(__name__)
 
@@ -125,13 +128,15 @@ class BannerSpec:
     """Declarative config for the pinned Ehrgeiz banner at the top of
     each user-facing text channel. `kind` is the db.panels key so the
     bot can find the existing message on re-setup instead of posting a
-    duplicate."""
+    duplicate. `view_factory`, when set, attaches a persistent
+    discord.ui.View to the banner (interactive buttons)."""
     channel_name: str
     kind: str
     kicker: str
     title: str
     subtitle: str
     body: str
+    view_factory: Callable[[], discord.ui.View] | None = None
 
 
 BANNER_PLAN: list[BannerSpec] = [
@@ -227,37 +232,41 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="North America", title="Matchmaking · NA",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking** below and the bot posts an LFG ping "
-            "with your rank + main so others know who they're playing. "
-            "Auto-clears after 30 minutes."
+            "Click **I'm Looking for Games** below and the bot posts an "
+            "LFG ping with your rank + main so others know who they're "
+            "playing. Auto-clears after 30 minutes."
         ),
+        view_factory=LFGPanelView,
     ),
     BannerSpec(
         channel_name="matchmaking-eu", kind="banner_mm_eu",
         kicker="Europe", title="Matchmaking · EU",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking** below and the bot posts an LFG ping "
-            "with your rank + main. Auto-clears after 30 minutes."
+            "Click **I'm Looking for Games** below and the bot posts an "
+            "LFG ping with your rank + main. Auto-clears after 30 minutes."
         ),
+        view_factory=LFGPanelView,
     ),
     BannerSpec(
         channel_name="matchmaking-asia", kind="banner_mm_asia",
         kicker="Asia", title="Matchmaking · Asia",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking** below and the bot posts an LFG ping "
-            "with your rank + main. Auto-clears after 30 minutes."
+            "Click **I'm Looking for Games** below and the bot posts an "
+            "LFG ping with your rank + main. Auto-clears after 30 minutes."
         ),
+        view_factory=LFGPanelView,
     ),
     BannerSpec(
         channel_name="matchmaking-oce", kind="banner_mm_oce",
         kicker="Oceania", title="Matchmaking · OCE",
         subtitle="Looking for games",
         body=(
-            "Click **I'm Looking** below and the bot posts an LFG ping "
-            "with your rank + main. Auto-clears after 30 minutes."
+            "Click **I'm Looking for Games** below and the bot posts an "
+            "LFG ping with your rank + main. Auto-clears after 30 minutes."
         ),
+        view_factory=LFGPanelView,
     ),
     # ---- Competitive ---- #
     BannerSpec(
@@ -265,10 +274,11 @@ BANNER_PLAN: list[BannerSpec] = [
         kicker="Competitive", title="Tournaments",
         subtitle="Swiss brackets · rank-weighted seeding",
         body=(
-            "Organizers spin up Swiss tournaments here. Click the signup "
-            "panels to enter. Rank-weighted pairings; match winners only "
-            "(no per-game reporting — keep it moving)."
+            "Click **Active Tournaments** to see what's live. Organizers "
+            "click **Create Tournament (FT3)** for quick-start, or run "
+            "`/tournament-create` for full control over format and player cap."
         ),
+        view_factory=TournamentsPanelView,
     ),
     BannerSpec(
         channel_name="tournament-history", kind="banner_tournament_history",
@@ -426,15 +436,20 @@ async def _post_or_refresh_banner(
     )
     embed.set_image(url="attachment://banner.png")
 
+    view = spec.view_factory() if spec.view_factory else None
+
     existing = await db.get_panel(guild.id, spec.kind)
     if existing is not None:
         try:
             ch = guild.get_channel(existing["channel_id"]) or channel
             msg = await ch.fetch_message(existing["message_id"])
-            await msg.edit(
-                embed=embed,
-                attachments=[discord.File(buf, filename="banner.png")],
-            )
+            edit_kwargs: dict = {
+                "embed": embed,
+                "attachments": [discord.File(buf, filename="banner.png")],
+            }
+            if view is not None:
+                edit_kwargs["view"] = view
+            await msg.edit(**edit_kwargs)
             return
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             # Old message is gone or unreachable — fall through and
@@ -442,10 +457,13 @@ async def _post_or_refresh_banner(
             pass
 
     try:
-        msg = await channel.send(
-            embed=embed,
-            file=discord.File(buf, filename="banner.png"),
-        )
+        send_kwargs: dict = {
+            "embed": embed,
+            "file": discord.File(buf, filename="banner.png"),
+        }
+        if view is not None:
+            send_kwargs["view"] = view
+        msg = await channel.send(**send_kwargs)
     except discord.Forbidden:
         report.errors.append(
             f"Banner for #{spec.channel_name}: no send permission"

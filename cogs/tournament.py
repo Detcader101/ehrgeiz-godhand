@@ -525,6 +525,171 @@ async def _announce_state_change(
 # Cog                                                                          #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# #tournaments channel panel (pinned by /setup-server)                         #
+# --------------------------------------------------------------------------- #
+
+class TournamentsPanelView(discord.ui.View):
+    """Persistent buttons attached to the #tournaments banner.
+
+      - Active Tournaments (anyone): lists live tournaments ephemerally.
+      - Create Tournament FT3 (Organizer only): opens a 1-field modal
+        that creates an uncapped FT3 tournament. For full control
+        (FT2, max-player cap), use /tournament-create.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Active Tournaments", emoji="📋",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tourney-panel:list",
+    )
+    async def active(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_active_list(interaction)
+
+    @discord.ui.button(
+        label="Create Tournament (FT3)", emoji="🏆",
+        style=discord.ButtonStyle.success,
+        custom_id="tourney-panel:create",
+    )
+    async def create(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        if not _is_organizer(member):
+            await interaction.response.send_message(
+                f"Need the **{ORGANIZER_ROLE_NAME}** role (or Administrator) "
+                "to create tournaments.",
+                ephemeral=True, delete_after=12)
+            return
+        await interaction.response.send_modal(CreateTournamentModal())
+
+
+class CreateTournamentModal(discord.ui.Modal, title="Create Swiss Tournament"):
+    """Single-field quick-start modal — defaults to FT3, no cap. Power
+    users go through /tournament-create for the full option set."""
+
+    tournament_name: discord.ui.TextInput = discord.ui.TextInput(
+        label="Tournament name",
+        placeholder="e.g. Friday Night Gauntlet",
+        min_length=1, max_length=60,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+
+        name_value = str(self.tournament_name).strip()
+
+        existing = await db.get_active_tournament_by_name(guild.id, name_value)
+        if existing is not None:
+            await interaction.response.send_message(
+                f"There's already a live tournament called **{existing['name']}** "
+                f"({existing['state']}). Pick a different name.",
+                ephemeral=True, delete_after=15)
+            return
+
+        signup_channel = discord.utils.get(
+            guild.text_channels, name=SIGNUPS_CHANNEL_NAME)
+        if signup_channel is None:
+            await interaction.response.send_message(
+                f"Couldn't find a `#{SIGNUPS_CHANNEL_NAME}` channel. "
+                "Run `/setup-server` first.",
+                ephemeral=True, delete_after=15)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        tournament_id = await db.create_tournament(
+            guild_id=guild.id,
+            organizer_id=member.id,
+            name=name_value,
+            match_format="FT3",
+            max_players=None,
+            now_iso=_now_iso(),
+        )
+
+        t = await db.get_tournament(tournament_id)
+        embed = _build_signup_embed(
+            tournament_row=t,
+            participant_rows=[],
+            organizer_mention=member.mention,
+        )
+        roster_file = await _build_roster_file([])
+
+        try:
+            posted = await signup_channel.send(
+                embed=embed, view=SignupView(), file=roster_file,
+            )
+        except discord.HTTPException as e:
+            await db.update_tournament_state(tournament_id, "CANCELLED", _now_iso())
+            await interaction.followup.send(
+                f"Failed to post signup embed: {e}.", ephemeral=True)
+            return
+
+        await db.set_tournament_signup_message(
+            tournament_id, signup_channel.id, posted.id)
+
+        try:
+            await posted.pin()
+            await _delete_pin_notification(signup_channel)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("failed to pin signup panel (modal path) for %s: %s",
+                        tournament_id, e)
+
+        await interaction.followup.send(
+            f"✅ Created **{name_value}** (FT3, no cap) in {signup_channel.mention}. "
+            f"Run `/tournament-start name:{name_value}` when ready.",
+            ephemeral=True,
+        )
+
+
+async def _flow_active_list(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "Server-only.", ephemeral=True, delete_after=8)
+        return
+    rows = await db.list_tournaments(
+        guild.id, states=("SIGNUPS_OPEN", "IN_PROGRESS"),
+    )
+    if not rows:
+        await interaction.response.send_message(
+            "No active tournaments. An organizer can start one with the "
+            "**Create Tournament** button or `/tournament-create`.",
+            ephemeral=True, delete_after=15,
+        )
+        return
+
+    lines: list[str] = []
+    for r in rows:
+        count = await db.count_participants(r["id"])
+        state_icon = "🟢" if r["state"] == "SIGNUPS_OPEN" else "🔴"
+        cap = f"/{r['max_players']}" if r["max_players"] else ""
+        lines.append(
+            f"{state_icon} **{r['name']}** · {r['match_format']} · "
+            f"{count}{cap} players · *{r['state']}*"
+        )
+
+    await interaction.response.send_message(
+        "**Active tournaments**\n" + "\n".join(lines),
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Cog                                                                          #
+# --------------------------------------------------------------------------- #
+
 class Tournament(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -534,6 +699,7 @@ class Tournament(commands.Cog):
         # routes clicks by custom_id, and the callbacks resolve the tournament
         # from interaction.message.id.
         self.bot.add_view(SignupView())
+        self.bot.add_view(TournamentsPanelView())
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,
