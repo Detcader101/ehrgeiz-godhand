@@ -715,6 +715,42 @@ class Setup(commands.Cog):
         )
 
     @app_commands.command(
+        name="purge-server",
+        description="[Admin] DESTRUCTIVE: remove bot-created channels, roles, panels, and rank emojis.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def purge_server(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        preview = await _compute_purge_preview(guild)
+        await interaction.response.send_message(
+            embed=preview.to_embed(rebuild=False),
+            view=_ConfirmPurgeView(interaction.user.id, rebuild=False),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="reset-server",
+        description="[Admin] DESTRUCTIVE: purge everything AND rebuild from scratch.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def reset_server(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        preview = await _compute_purge_preview(guild)
+        await interaction.response.send_message(
+            embed=preview.to_embed(rebuild=True),
+            view=_ConfirmPurgeView(interaction.user.id, rebuild=True),
+            ephemeral=True,
+        )
+
+    @app_commands.command(
         name="upload-rank-emojis",
         description="[Admin] Upload Tekken rank icons to this server as custom emojis.",
     )
@@ -875,6 +911,371 @@ async def _upload_rank_emojis_for_guild(
                 result.failed.append((rank_name, str(e)))
 
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Purge + Reset                                                                #
+# --------------------------------------------------------------------------- #
+
+PLANNED_CATEGORY_NAMES = {c.name for c in SERVER_PLAN}
+PLANNED_CHANNEL_NAMES = {ch.name for cat in SERVER_PLAN for ch in cat.channels}
+PLANNED_ROLE_NAMES = {r.name for r in ROLE_PLAN}
+RANK_EMOJI_PREFIX = "t8_"
+
+
+@dataclass
+class PurgePreview:
+    """Snapshot of what /purge-server or /reset-server would remove.
+    Computed up-front so the admin sees real counts before they click
+    through the destructive confirm."""
+    categories: list[str] = field(default_factory=list)
+    channels: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)
+    emojis: list[str] = field(default_factory=list)
+    panels: int = 0
+    tournaments: int = 0
+
+    def to_embed(self, *, rebuild: bool) -> discord.Embed:
+        verb = "RESET" if rebuild else "PURGE"
+        suffix = (" and then rebuild the standard Ehrgeiz layout from scratch."
+                  if rebuild else ".")
+        embed = discord.Embed(
+            title=f"⚠ {verb} SERVER — confirm",
+            description=(
+                f"This will **permanently delete** the Ehrgeiz-managed "
+                f"artifacts below from **{self.summary_total()} objects**"
+                f"{suffix}\n\n"
+                "**Kept** (not touched): player verifications (Tekken ID "
+                "links), warnings, silencer cooldowns, pending verifications."
+            ),
+            color=discord.Color.red(),
+        )
+        embed.set_thumbnail(url=media.LOGO_URL)
+        embed.add_field(
+            name=f"📂 Categories ({len(self.categories)})",
+            value=", ".join(self.categories) or "—",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"📺 Channels ({len(self.channels)})",
+            value=(", ".join(self.channels) or "—") + "\n*(includes all message history)*",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"👥 Roles ({len(self.roles)})",
+            value=(", ".join(self.roles) or "—") + "\n*(removes from every member)*",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"🎌 Custom rank emojis ({len(self.emojis)})",
+            value=(", ".join(self.emojis[:15])
+                   + ("…" if len(self.emojis) > 15 else ""))
+                  or "—",
+            inline=False,
+        )
+        embed.add_field(
+            name="🗂 DB records",
+            value=(f"Panel records: **{self.panels}**\n"
+                   f"Tournament rows (with participants + matches): "
+                   f"**{self.tournaments}**"),
+            inline=False,
+        )
+        embed.set_footer(
+            text="This cannot be undone. Click the red button to proceed, "
+                 "or Cancel to back out."
+        )
+        return embed
+
+    def summary_total(self) -> int:
+        return (len(self.categories) + len(self.channels) + len(self.roles)
+                + len(self.emojis) + self.panels + self.tournaments)
+
+
+async def _compute_purge_preview(guild: discord.Guild) -> PurgePreview:
+    p = PurgePreview()
+    for cat in guild.categories:
+        if cat.name in PLANNED_CATEGORY_NAMES:
+            p.categories.append(cat.name)
+    for ch in guild.channels:
+        if ch.name in PLANNED_CHANNEL_NAMES:
+            p.channels.append(ch.name)
+    for role in guild.roles:
+        if role.name in PLANNED_ROLE_NAMES:
+            p.roles.append(role.name)
+    for emo in guild.emojis:
+        if emo.name.startswith(RANK_EMOJI_PREFIX):
+            p.emojis.append(emo.name)
+    panel_rows = await _count_panels(guild.id)
+    p.panels = panel_rows
+    tournament_rows = await _count_tournaments(guild.id)
+    p.tournaments = tournament_rows
+    return p
+
+
+async def _count_panels(guild_id: int) -> int:
+    import aiosqlite
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT COUNT(*) FROM panels WHERE guild_id = ?", (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+
+async def _count_tournaments(guild_id: int) -> int:
+    import aiosqlite
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT COUNT(*) FROM tournaments WHERE guild_id = ?", (guild_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+
+@dataclass
+class PurgeReport:
+    categories_deleted: int = 0
+    channels_deleted: int = 0
+    roles_deleted: int = 0
+    emojis_deleted: int = 0
+    panels_wiped: int = 0
+    tournaments_wiped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+async def _execute_purge(guild: discord.Guild) -> PurgeReport:
+    """Actually delete the bot-managed artifacts. Order matters: remove
+    banner messages before the channels they live in (the channel delete
+    would otherwise throw 404s); wipe DB rows after the Discord objects
+    are gone so a partial failure doesn't leave orphan references."""
+    report = PurgeReport()
+
+    # Unpin + delete tracked banner messages up front. Channels get
+    # nuked next anyway, but this keeps the db.panels wipe clean.
+    panels_cleaned = await _unpin_and_remove_panels(guild, report)
+    _ = panels_cleaned  # informational
+
+    # Delete matching channels first (including voice), then categories.
+    # Iterate guild.channels once and filter to avoid mutating live list.
+    for ch in list(guild.channels):
+        if isinstance(ch, discord.CategoryChannel):
+            continue
+        if ch.name in PLANNED_CHANNEL_NAMES:
+            try:
+                await ch.delete(reason="Ehrgeiz Godhand /purge-server")
+                report.channels_deleted += 1
+            except (discord.Forbidden, discord.HTTPException) as e:
+                report.errors.append(f"channel '{ch.name}': {e}")
+
+    for cat in list(guild.categories):
+        if cat.name in PLANNED_CATEGORY_NAMES:
+            try:
+                await cat.delete(reason="Ehrgeiz Godhand /purge-server")
+                report.categories_deleted += 1
+            except (discord.Forbidden, discord.HTTPException) as e:
+                report.errors.append(f"category '{cat.name}': {e}")
+
+    # Roles — skip @everyone and the bot's own managed role.
+    bot_role = guild.me.top_role if guild.me else None
+    for role in list(guild.roles):
+        if role.name not in PLANNED_ROLE_NAMES:
+            continue
+        if role.is_default() or (bot_role and role.id == bot_role.id):
+            continue
+        try:
+            await role.delete(reason="Ehrgeiz Godhand /purge-server")
+            report.roles_deleted += 1
+        except (discord.Forbidden, discord.HTTPException) as e:
+            report.errors.append(f"role '{role.name}': {e}")
+
+    # Custom rank emojis (t8_ prefix).
+    for emo in list(guild.emojis):
+        if not emo.name.startswith(RANK_EMOJI_PREFIX):
+            continue
+        try:
+            await emo.delete(reason="Ehrgeiz Godhand /purge-server")
+            report.emojis_deleted += 1
+        except (discord.Forbidden, discord.HTTPException) as e:
+            report.errors.append(f"emoji '{emo.name}': {e}")
+
+    # DB wipe happens last so errors in Discord deletions don't orphan
+    # records (a failed channel delete would still leave a usable panel
+    # row). Panels already unpinned above, now wipe the DB rows.
+    report.panels_wiped = await db.purge_panels_for_guild(guild.id)
+    report.tournaments_wiped = await db.purge_tournaments_for_guild(guild.id)
+    await db.purge_rank_emojis_for_guild(guild.id)
+
+    return report
+
+
+async def _unpin_and_remove_panels(
+    guild: discord.Guild, report: PurgeReport,
+) -> int:
+    """Best-effort unpin + delete of every tracked panel message in this
+    guild BEFORE we nuke the channels. Failures are silent because the
+    subsequent channel deletion will take care of the message anyway."""
+    import aiosqlite
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT channel_id, message_id FROM panels WHERE guild_id = ?",
+            (guild.id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    for row in rows:
+        channel = guild.get_channel(row["channel_id"])
+        if channel is None:
+            continue
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+            try:
+                await msg.unpin()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            await msg.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+    return len(rows)
+
+
+class _ConfirmPurgeView(discord.ui.View):
+    """Confirmation UI for the destructive /purge-server and
+    /reset-server commands. The same view handles both — if
+    `rebuild=True`, we kick off /setup-server's build after the purge
+    completes."""
+
+    def __init__(self, invoker_id: int, *, rebuild: bool):
+        super().__init__(timeout=120)
+        self.invoker_id = invoker_id
+        self.rebuild = rebuild
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This isn't for you.", ephemeral=True, delete_after=8,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Wipe and REBUILD", style=discord.ButtonStyle.danger,
+    )
+    async def confirm(self, interaction: discord.Interaction, btn: discord.ui.Button):
+        # Button label + copy swap depending on rebuild flag. We set the
+        # label here rather than at __init__ so the dataclass init order
+        # is simpler; either label makes the intent clear.
+        label = "Wipe and REBUILD" if self.rebuild else "WIPE IT ALL"
+        btn.label = label  # only affects the view that was sent; harmless
+
+        await interaction.response.edit_message(
+            content=f"{'Purging and rebuilding' if self.rebuild else 'Purging'}… "
+                    "this may take a couple of minutes.",
+            embed=None, view=None,
+        )
+
+        guild = interaction.guild
+        report = await _execute_purge(guild)
+
+        if self.rebuild:
+            build = await _build_server(guild)
+            # Re-run banner + player hub posts against the fresh server.
+            await _post_player_hub_if_channel_exists(
+                interaction.client, guild, build,
+            )
+            await _post_channel_banners(guild, build)
+            await interaction.edit_original_response(
+                content=None,
+                embed=_combined_report_embed(report, build),
+            )
+        else:
+            await interaction.edit_original_response(
+                content=None, embed=_purge_only_report_embed(report),
+            )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="Cancelled. Nothing was deleted.",
+            embed=None, view=None,
+        )
+
+
+def _purge_only_report_embed(r: PurgeReport) -> discord.Embed:
+    embed = discord.Embed(
+        title="🧹 Purge complete",
+        description=(
+            "All Ehrgeiz-managed artifacts have been removed. Run "
+            "`/setup-server` to rebuild when ready, or `/reset-server` "
+            "next time to do both in one shot."
+        ),
+        color=discord.Color.dark_red() if r.errors else discord.Color.green(),
+    )
+    embed.set_thumbnail(url=media.LOGO_URL)
+    embed.add_field(
+        name="Removed",
+        value=(f"📂 Categories: **{r.categories_deleted}**\n"
+               f"📺 Channels: **{r.channels_deleted}**\n"
+               f"👥 Roles: **{r.roles_deleted}**\n"
+               f"🎌 Rank emojis: **{r.emojis_deleted}**\n"
+               f"🗂 Panel records: **{r.panels_wiped}**\n"
+               f"🏆 Tournaments: **{r.tournaments_wiped}**"),
+        inline=False,
+    )
+    if r.errors:
+        embed.add_field(
+            name=f"⚠ Errors ({len(r.errors)})",
+            value="\n".join(r.errors[:5]),
+            inline=False,
+        )
+    return embed
+
+
+def _combined_report_embed(
+    purge: PurgeReport, build: SetupReport,
+) -> discord.Embed:
+    """Merge the purge + rebuild outputs into one narrative embed so the
+    admin sees the whole story in a single message."""
+    color = (discord.Color.green() if not (purge.errors or build.errors)
+             else discord.Color.orange())
+    embed = discord.Embed(
+        title="♻️ Reset complete",
+        description=(
+            "The server was purged and rebuilt from the standard Ehrgeiz "
+            "layout. Banners are pinned; run `/upload-rank-emojis` to "
+            "re-upload custom rank emojis."
+        ),
+        color=color,
+    )
+    embed.set_thumbnail(url=media.LOGO_URL)
+    embed.add_field(
+        name="🧹 Purged",
+        value=(f"📂 Categories: **{purge.categories_deleted}**, "
+               f"📺 Channels: **{purge.channels_deleted}**, "
+               f"👥 Roles: **{purge.roles_deleted}**, "
+               f"🎌 Emojis: **{purge.emojis_deleted}**, "
+               f"🗂 Panels: **{purge.panels_wiped}**, "
+               f"🏆 Tournaments: **{purge.tournaments_wiped}**"),
+        inline=False,
+    )
+    embed.add_field(
+        name="🏗 Rebuilt",
+        value=(f"📂 Categories: **{len(build.categories_created)}**, "
+               f"📺 Channels: **{len(build.channels_created)}**, "
+               f"👥 Roles: **{len(build.roles_created)}**, "
+               f"🖼 Banners: **{build.banners_posted}**"),
+        inline=False,
+    )
+    combined_errors = purge.errors + build.errors
+    if combined_errors:
+        embed.add_field(
+            name=f"⚠ Errors ({len(combined_errors)})",
+            value="\n".join(combined_errors[:5]),
+            inline=False,
+        )
+    embed.set_footer(
+        text="Ehrgeiz Godhand • player verifications were preserved"
+    )
+    return embed
 
 
 async def _read_or_fetch_icon(

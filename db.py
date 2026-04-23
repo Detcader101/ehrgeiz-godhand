@@ -658,6 +658,52 @@ async def delete_fake_players() -> int:
         return cur.rowcount or 0
 
 
+async def purge_panels_for_guild(guild_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM panels WHERE guild_id = ?", (guild_id,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def purge_rank_emojis_for_guild(guild_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM guild_rank_emojis WHERE guild_id = ?", (guild_id,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def purge_tournaments_for_guild(guild_id: int) -> int:
+    """Nuke every tournament row for the guild, plus its participants
+    and matches. FK cascades aren't enabled globally, so we wipe the
+    child tables explicitly. Used by /purge-server because tournament
+    rows reference channel IDs that the purge is about to delete."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM tournaments WHERE guild_id = ?", (guild_id,),
+        ) as cur:
+            ids = [row[0] for row in await cur.fetchall()]
+        if not ids:
+            return 0
+        placeholders = ",".join("?" * len(ids))
+        await db.execute(
+            f"DELETE FROM tournament_matches WHERE tournament_id IN ({placeholders})",
+            ids,
+        )
+        await db.execute(
+            f"DELETE FROM tournament_participants WHERE tournament_id IN ({placeholders})",
+            ids,
+        )
+        cur = await db.execute(
+            "DELETE FROM tournaments WHERE guild_id = ?", (guild_id,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
 async def set_rank_emoji(
     guild_id: int, rank_name: str,
     emoji_id: int, emoji_name: str, now_iso: str,
