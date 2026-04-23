@@ -68,6 +68,8 @@ class CategorySpec:
 # channel_util.find_text_channel, which matches both the bare and the
 # emoji-prefixed form so existing installs don't shatter when renaming.
 SERVER_PLAN: list[CategorySpec] = [
+    # Info is public — sits at the top so joining users see the route
+    # to verify (rules + player-hub) before anything else.
     CategorySpec("📋 Info", [
         ChannelSpec("📜-rules", "text",
                     "📜 Server rules. Breaking them gets you warned, timed out, or banned."),
@@ -76,7 +78,21 @@ SERVER_PLAN: list[CategorySpec] = [
         ChannelSpec("🎴-player-hub", "text",
                     "🎴 Your account, ranks, and profile. Click the buttons."),
     ]),
-    CategorySpec("💬 General", [
+    # Matchmaking sits above chat categories deliberately — this server
+    # is UK/EU-focused and its primary reason to exist is getting people
+    # into games. EU listed first so UK/EU players land on their channel
+    # without scrolling past foreign regions.
+    CategorySpec("🎮 Matchmaking", [
+        ChannelSpec("🇪🇺-matchmaking-eu", "text",
+                    "🇪🇺 Primary region. UK + EU looking for games."),
+        ChannelSpec("🌎-matchmaking-na", "text",
+                    "🌎 North America."),
+        ChannelSpec("🌏-matchmaking-asia", "text",
+                    "🌏 Asia."),
+        ChannelSpec("🦘-matchmaking-oce", "text",
+                    "🦘 Oceania."),
+    ], verified_only=True),
+    CategorySpec("💬 Community", [
         ChannelSpec("💬-general", "text",
                     "💬 Main hangout chat."),
         ChannelSpec("🎬-clips-and-highlights", "text",
@@ -94,24 +110,21 @@ SERVER_PLAN: list[CategorySpec] = [
         ChannelSpec("🆚-matchup-help", "text",
                     "🆚 Ask about specific matchups."),
     ], verified_only=True),
-    CategorySpec("🔎 Matchmaking", [
-        ChannelSpec("🌎-matchmaking-na", "text",
-                    "🌎 Looking for games — North America."),
-        ChannelSpec("🌍-matchmaking-eu", "text",
-                    "🌍 Looking for games — Europe."),
-        ChannelSpec("🌏-matchmaking-asia", "text",
-                    "🌏 Looking for games — Asia."),
-        ChannelSpec("🦘-matchmaking-oce", "text",
-                    "🦘 Looking for games — Oceania."),
-    ], verified_only=True),
     CategorySpec("🏆 Competitive", [
         ChannelSpec("🏆-tournaments", "text",
                     "🏆 Tournament signups and chat. Organizers post here."),
         ChannelSpec("🗂️-tournament-history", "text",
                     "🗂️ Archived brackets and results. Posted by the bot."),
     ], verified_only=True),
+    # Voice: a handful of rooms so people can drop in and play ad-hoc.
+    # Lobby is the default hangout; Casuals are for pickup sets; Match
+    # rooms stay empty unless a tournament or private match fills them.
     CategorySpec("🔊 Voice", [
-        ChannelSpec("🎙️ General VC", "voice"),
+        ChannelSpec("🎙️ Lobby", "voice"),
+        ChannelSpec("🎮 Casuals 1", "voice"),
+        ChannelSpec("🎮 Casuals 2", "voice"),
+        ChannelSpec("⚔️ Match 1", "voice"),
+        ChannelSpec("⚔️ Match 2", "voice"),
     ], verified_only=True),
     CategorySpec("🛠️ Staff", [
         ChannelSpec("🛡️-mod-log", "text",
@@ -291,14 +304,17 @@ BANNER_PLAN: list[BannerSpec] = [
     ),
     BannerSpec(
         channel_name="matchmaking-eu", kind="banner_mm_eu",
-        kicker="Europe", title="Matchmaking · EU",
-        subtitle="Looking for games",
+        kicker="Primary Region · UK + EU", title="Matchmaking · EU",
+        subtitle="Where the games happen",
         body=(
             "## Click I'm Looking\n"
             "Posts an LFG with your rank + main.\n"
             "\n"
             "## Auto-clears\n"
-            "After 30 minutes. Click again any time."
+            "After 30 minutes. Click again any time.\n"
+            "\n"
+            "## This is home\n"
+            "Most of this server plays EU. Drop LFGs here first."
         ),
         view_factory=LFGPanelView,
     ),
@@ -1177,13 +1193,29 @@ async def _upload_rank_emojis_for_guild(
 # Purge + Reset                                                                #
 # --------------------------------------------------------------------------- #
 
-PLANNED_CATEGORY_NAMES = {c.name for c in SERVER_PLAN}
+# Legacy category names from earlier iterations of SERVER_PLAN — listed
+# here so /purge-server still cleans them up after a rename. Add an
+# entry every time a category gets renamed in the plan above.
+LEGACY_CATEGORY_NAMES = {
+    "💬 General",           # renamed to "💬 Community"
+    "🔎 Matchmaking",       # renamed to "🎮 Matchmaking"
+}
+
+# Legacy channel names (same idea). Mostly the pre-multi-VC voice
+# channel name and anything else that gets replaced over time.
+LEGACY_CHANNEL_NAMES = {
+    "🎙️ General VC",       # replaced by Lobby + Casuals/Match VCs
+    "General VC",           # further-legacy no-emoji voice channel name
+}
+
+
+PLANNED_CATEGORY_NAMES = {c.name for c in SERVER_PLAN} | LEGACY_CATEGORY_NAMES
 
 # Both the emoji-prefixed (current SERVER_PLAN) and base-form (pre-
 # emoji, or user-renamed) channel names count as Ehrgeiz-managed, so
 # /purge-server cleans both up on re-run after a rename.
 def _planned_channel_names() -> set[str]:
-    names: set[str] = set()
+    names: set[str] = set(LEGACY_CHANNEL_NAMES)
     for cat in SERVER_PLAN:
         for ch in cat.channels:
             names.add(ch.name)
