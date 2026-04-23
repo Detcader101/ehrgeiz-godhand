@@ -379,20 +379,23 @@ BANNER_PLAN: list[BannerSpec] = [
 ]
 
 
+# Every role here ships with hoist=False — only the bot's own role
+# (auto-created by Discord when the bot was invited) should separate in
+# the member list. Keeps the sidebar tidy regardless of staff headcount.
 ROLE_PLAN: list[RoleSpec] = [
     RoleSpec("Admin", discord.Color.red(),
              discord.Permissions(administrator=True),
-             hoist=True, mentionable=False),
+             hoist=False, mentionable=False),
     RoleSpec("Moderator", discord.Color.orange(),
              discord.Permissions(
                  kick_members=True, ban_members=True, moderate_members=True,
                  manage_messages=True, view_audit_log=True,
                  manage_nicknames=True,
              ),
-             hoist=True, mentionable=True),
+             hoist=False, mentionable=True),
     RoleSpec("Organizer", discord.Color.blue(),
              discord.Permissions.none(),  # marker role; power enforced in cog
-             hoist=True, mentionable=True),
+             hoist=False, mentionable=True),
     RoleSpec("Verified", discord.Color.green(),
              discord.Permissions.none(),
              hoist=False, mentionable=False),
@@ -400,7 +403,7 @@ ROLE_PLAN: list[RoleSpec] = [
     # limit. No Discord-level perms — authority is checked in cogs/mod.py.
     RoleSpec("The Silencerz", discord.Color.from_rgb(180, 0, 200),
              discord.Permissions.none(),
-             hoist=True, mentionable=False),
+             hoist=False, mentionable=False),
 ]
 
 
@@ -547,14 +550,19 @@ async def _reposition_roles(
         return
 
     # Order from just-below-bot downwards. We stop early if we run out
-    # of positions above @everyone (position 0).
-    desired_order = [
+    # of positions above @everyone (position 0). Rank roles sit between
+    # the Silencerz and Verified band, in highest→lowest tier order, so
+    # God of Destruction ∞ hovers just under the Silencerz and Beginner
+    # sits right above Verified.
+    desired_order: list[str] = [
         "Admin",
         "Moderator",
         "Organizer",
         "The Silencerz",
-        "Verified",
     ]
+    for rank_name in reversed(wavu.ALL_RANK_NAMES):
+        desired_order.append(rank_name)
+    desired_order.append("Verified")
 
     positions: dict[discord.Role, int] = {}
     slot = base - 1
@@ -749,6 +757,26 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
             report.roles_created.append(spec.name)
         except discord.HTTPException as e:
             report.errors.append(f"Role '{spec.name}': {e}")
+
+    # --- Pre-create every Tekken rank role -------------------------- #
+    # Rank tier roles used to spawn on-demand during verification; that
+    # worked but meant fresh tiers arrived at position 1 at the bottom
+    # until the next onboarding shuffled them up. Create every rank up
+    # front so they exist in the right hierarchy band from day one.
+    for rank_name in wavu.ALL_RANK_NAMES:
+        if rank_name in role_by_name:
+            continue
+        try:
+            role = await guild.create_role(
+                name=rank_name,
+                hoist=False,
+                mentionable=False,
+                reason="Ehrgeiz Godhand /setup-server (rank role)",
+            )
+            role_by_name[rank_name] = role
+            report.roles_created.append(rank_name)
+        except discord.HTTPException as e:
+            report.errors.append(f"Rank role '{rank_name}': {e}")
 
     admin_role = role_by_name.get("Admin")
     mod_role = role_by_name.get("Moderator")
