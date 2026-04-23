@@ -22,6 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import channel_util
 import db
 import media
 import tournament_render
@@ -55,63 +56,71 @@ class CategorySpec:
     name: str
     channels: list[ChannelSpec]
     staff_only: bool = False
+    # When True, the category is hidden from @everyone until the Verified
+    # role is granted — the onboarding gate. Info category stays public
+    # so new arrivals can see rules + player-hub to complete verification.
+    verified_only: bool = False
 
 
+# Channel names carry a leading emoji prefix for visual flair in the
+# channel list. Lookups elsewhere in the codebase use
+# channel_util.find_text_channel, which matches both the bare and the
+# emoji-prefixed form so existing installs don't shatter when renaming.
 SERVER_PLAN: list[CategorySpec] = [
     CategorySpec("📋 Info", [
-        ChannelSpec("rules", "text",
+        ChannelSpec("📜-rules", "text",
                     "📜 Server rules. Breaking them gets you warned, timed out, or banned."),
-        ChannelSpec("announcements", "text",
+        ChannelSpec("📣-announcements", "text",
                     "📣 Server-wide announcements. Staff-only posting."),
-        ChannelSpec("player-hub", "text",
+        ChannelSpec("🎴-player-hub", "text",
                     "🎴 Your account, ranks, and profile. Click the buttons."),
     ]),
     CategorySpec("💬 General", [
-        ChannelSpec("general", "text",
+        ChannelSpec("💬-general", "text",
                     "💬 Main hangout chat."),
-        ChannelSpec("clips-and-highlights", "text",
+        ChannelSpec("🎬-clips-and-highlights", "text",
                     "🎬 Drop your clips. Use threads for per-character discussion."),
-        ChannelSpec("off-topic", "text",
+        ChannelSpec("🌀-off-topic", "text",
                     "🌀 Non-Tekken stuff."),
-    ]),
+    ], verified_only=True),
     CategorySpec("🥊 Tekken", [
-        ChannelSpec("tech-talk", "text",
+        ChannelSpec("🧠-tech-talk", "text",
                     "🧠 Frame data, strategy, combo routes, meta."),
-        ChannelSpec("fundamentals", "text",
+        ChannelSpec("📚-fundamentals", "text",
                     "📚 Newbies welcome. Ask the basics here without judgement."),
-        ChannelSpec("combos", "text",
+        ChannelSpec("🎯-combos", "text",
                     "🎯 Labbing, combo routes, optimisation."),
-        ChannelSpec("matchup-help", "text",
+        ChannelSpec("🆚-matchup-help", "text",
                     "🆚 Ask about specific matchups."),
-    ]),
+    ], verified_only=True),
     CategorySpec("🔎 Matchmaking", [
-        ChannelSpec("matchmaking-na", "text",
-                    "🇺🇸 Looking for games — North America."),
-        ChannelSpec("matchmaking-eu", "text",
-                    "🇪🇺 Looking for games — Europe."),
-        ChannelSpec("matchmaking-asia", "text",
+        ChannelSpec("🌎-matchmaking-na", "text",
+                    "🌎 Looking for games — North America."),
+        ChannelSpec("🌍-matchmaking-eu", "text",
+                    "🌍 Looking for games — Europe."),
+        ChannelSpec("🌏-matchmaking-asia", "text",
                     "🌏 Looking for games — Asia."),
-        ChannelSpec("matchmaking-oce", "text",
+        ChannelSpec("🦘-matchmaking-oce", "text",
                     "🦘 Looking for games — Oceania."),
-    ]),
+    ], verified_only=True),
     CategorySpec("🏆 Competitive", [
-        ChannelSpec("tournaments", "text",
+        ChannelSpec("🏆-tournaments", "text",
                     "🏆 Tournament signups and chat. Organizers post here."),
-        ChannelSpec("tournament-history", "text",
-                    "📜 Archived brackets and results. Posted by the bot."),
-    ]),
+        ChannelSpec("🗂️-tournament-history", "text",
+                    "🗂️ Archived brackets and results. Posted by the bot."),
+    ], verified_only=True),
     CategorySpec("🔊 Voice", [
-        ChannelSpec("General VC", "voice"),
-    ]),
+        ChannelSpec("🎙️ General VC", "voice"),
+    ], verified_only=True),
     CategorySpec("🛠️ Staff", [
-        ChannelSpec("mod-log", "text",
+        ChannelSpec("🛡️-mod-log", "text",
                     "📋 Every mod action the bot performs is logged here."),
-        ChannelSpec("verification-log", "text",
+        ChannelSpec("🔍-verification-log", "text",
                     "🔍 Audit trail for player verification: links, unlinks, "
                     "rank changes, admin overrides, and high-rank pending "
                     "claims (Confirm/Reject buttons live here).",
                     extra_access_roles=["Organizer"]),
-        ChannelSpec("staff-chat", "text",
+        ChannelSpec("🤐-staff-chat", "text",
                     "🤐 Private admin + moderator discussion."),
     ], staff_only=True),
 ]
@@ -450,6 +459,39 @@ class SetupReport:
         return embed
 
 
+def _category_overwrites(
+    guild: discord.Guild,
+    cat_spec: CategorySpec,
+    admin_role: discord.Role | None,
+    mod_role: discord.Role | None,
+    verified_role: discord.Role | None,
+) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+    """Compute permission overwrites for a category.
+      - staff_only: hidden from @everyone, visible to Admin/Mod + bot
+      - verified_only: hidden from @everyone, visible to Verified
+        (and Admin/Mod/bot); this is the onboarding gate
+      - neither: no overwrites (inherit guild defaults)
+    """
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
+    if cat_spec.staff_only:
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        if admin_role:
+            overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True)
+        if mod_role:
+            overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True)
+    elif cat_spec.verified_only:
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        if verified_role:
+            overwrites[verified_role] = discord.PermissionOverwrite(view_channel=True)
+        if admin_role:
+            overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True)
+        if mod_role:
+            overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
+        overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True)
+    return overwrites
+
+
 async def _reposition_roles(
     guild: discord.Guild,
     role_by_name: dict[str, discord.Role],
@@ -540,7 +582,7 @@ async def _post_or_refresh_banner(
     Idempotent: on re-run we fetch the existing message from db.panels,
     edit it with a freshly-rendered banner, and skip the pin step since
     it's already pinned."""
-    channel = discord.utils.get(guild.text_channels, name=spec.channel_name)
+    channel = channel_util.find_text_channel(guild, spec.channel_name)
     if channel is None:
         # Channel isn't in the server — user either renamed it or opted
         # out of this part of the layout. Silent skip; not an error.
@@ -630,7 +672,7 @@ async def _post_player_hub_if_channel_exists(
 ) -> None:
     """If a #player-hub text channel exists, post the Player Hub panel there
     (deleting any prior bot-tracked panel first) and record outcome on report."""
-    channel = discord.utils.get(guild.text_channels, name="player-hub")
+    channel = channel_util.find_text_channel(guild, "player-hub")
     if channel is None:
         report.panel_skip_reason = "no #player-hub channel found"
         return
@@ -697,19 +739,15 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
     # them the rest of the way up if they want them above the bot.
     await _reposition_roles(guild, role_by_name, report)
 
+    verified_role = role_by_name.get("Verified")
+
     # --- Categories + channels --- #
     for cat_spec in SERVER_PLAN:
         category = discord.utils.get(guild.categories, name=cat_spec.name)
+        overwrites = _category_overwrites(
+            guild, cat_spec, admin_role, mod_role, verified_role,
+        )
         if category is None:
-            overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {}
-            if cat_spec.staff_only:
-                overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
-                if admin_role:
-                    overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True)
-                if mod_role:
-                    overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
-                # Bot needs to see staff channels for mod-log writes
-                overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True)
             try:
                 category = await guild.create_category(
                     cat_spec.name, overwrites=overwrites,
@@ -721,12 +759,35 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
                 continue
         else:
             report.categories_existing.append(cat_spec.name)
+            # Re-apply overwrites on existing categories so toggling
+            # verified_only/staff_only in SERVER_PLAN takes effect on
+            # re-run without requiring /reset-server.
+            if overwrites:
+                try:
+                    await category.edit(
+                        overwrites=overwrites,
+                        reason="Ehrgeiz Godhand /setup-server (perm refresh)",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    report.errors.append(
+                        f"Category '{cat_spec.name}' perm refresh: {e}"
+                    )
 
         for ch_spec in cat_spec.channels:
-            existing = discord.utils.get(
-                category.channels if category else guild.channels,
-                name=ch_spec.name,
-            ) or discord.utils.get(guild.channels, name=ch_spec.name)
+            # Match against either the emoji-prefixed form in SERVER_PLAN
+            # or the bare base-name (in case the admin renamed, or this
+            # is an upgrade from pre-emoji plan). For voice channels
+            # we only match exact name since find_text_channel is
+            # text-only.
+            base = ch_spec.name
+            if "-" in base:
+                prefix, _, rest = base.partition("-")
+                if prefix and any(ord(c) > 127 for c in prefix):
+                    base = rest
+            existing = (
+                discord.utils.get(guild.channels, name=ch_spec.name)
+                or discord.utils.get(guild.channels, name=base)
+            )
 
             new_channel = None
             if existing is not None:
@@ -1116,7 +1177,25 @@ async def _upload_rank_emojis_for_guild(
 # --------------------------------------------------------------------------- #
 
 PLANNED_CATEGORY_NAMES = {c.name for c in SERVER_PLAN}
-PLANNED_CHANNEL_NAMES = {ch.name for cat in SERVER_PLAN for ch in cat.channels}
+
+# Both the emoji-prefixed (current SERVER_PLAN) and base-form (pre-
+# emoji, or user-renamed) channel names count as Ehrgeiz-managed, so
+# /purge-server cleans both up on re-run after a rename.
+def _planned_channel_names() -> set[str]:
+    names: set[str] = set()
+    for cat in SERVER_PLAN:
+        for ch in cat.channels:
+            names.add(ch.name)
+            # Derive the emoji-stripped base (e.g. "🏆-tournaments" ->
+            # "tournaments") so purge also matches pre-rename channels.
+            if "-" in ch.name:
+                prefix, _, rest = ch.name.partition("-")
+                if prefix and any(ord(c) > 127 for c in prefix):
+                    names.add(rest)
+    return names
+
+
+PLANNED_CHANNEL_NAMES = _planned_channel_names()
 PLANNED_ROLE_NAMES = {r.name for r in ROLE_PLAN}
 
 

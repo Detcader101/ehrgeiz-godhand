@@ -21,6 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import channel_util
 import db
 import media
 import tournament_render
@@ -598,8 +599,8 @@ class CreateTournamentModal(discord.ui.Modal, title="Create Swiss Tournament"):
                 ephemeral=True, delete_after=15)
             return
 
-        signup_channel = discord.utils.get(
-            guild.text_channels, name=SIGNUPS_CHANNEL_NAME)
+        signup_channel = channel_util.find_text_channel(
+            guild, SIGNUPS_CHANNEL_NAME)
         if signup_channel is None:
             await interaction.response.send_message(
                 f"Couldn't find a `#{SIGNUPS_CHANNEL_NAME}` channel. "
@@ -756,8 +757,8 @@ class Tournament(commands.Cog):
                 ephemeral=True, delete_after=15)
             return
 
-        signup_channel = discord.utils.get(
-            guild.text_channels, name=SIGNUPS_CHANNEL_NAME)
+        signup_channel = channel_util.find_text_channel(
+            guild, SIGNUPS_CHANNEL_NAME)
         if signup_channel is None:
             await interaction.response.send_message(
                 f"Couldn't find a `#{SIGNUPS_CHANNEL_NAME}` channel. Run "

@@ -20,6 +20,8 @@ import logging
 
 import discord
 
+import channel_util
+
 VERIFICATION_LOG_CHANNEL = "verification-log"
 MOD_LOG_CHANNEL = "mod-log"
 
@@ -37,7 +39,10 @@ async def post_event(
 ) -> None:
     if guild is None:
         return
-    channel = discord.utils.get(guild.text_channels, name=channel_name)
+    # Matches both the bare name and any emoji-prefixed variant
+    # (`🛡️-mod-log`, `🔍-verification-log`) so SERVER_PLAN rebranding
+    # doesn't silently break audit logging.
+    channel = channel_util.find_text_channel(guild, channel_name)
     if channel is None:
         return
     embed = discord.Embed(

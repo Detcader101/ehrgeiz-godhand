@@ -14,6 +14,7 @@ from datetime import timedelta
 import discord
 from discord.ext import commands
 
+import channel_util
 import db
 import rank_emoji
 from cogs.onboarding import VERIFIED_ROLE_NAME
@@ -88,7 +89,11 @@ async def _flow_lfg(interaction: discord.Interaction) -> None:
         tag_bits.append(main_char)
     tag = " · ".join(tag_bits) if tag_bits else "Unranked"
 
-    region_label = REGION_LABELS.get(channel.name, channel.name)
+    # Strip any emoji prefix before looking up the pretty region label.
+    # Keeps REGION_LABELS indexed by the stable base name.
+    region_label = REGION_LABELS.get(
+        channel_util.base_name_of(channel), channel.name,
+    )
 
     lfg_content = (
         f"🎮 {member.mention} is **looking for games** in {region_label}!\n"
