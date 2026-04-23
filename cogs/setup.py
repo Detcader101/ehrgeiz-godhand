@@ -838,14 +838,24 @@ class RankEmojiResult:
 def _emoji_name_for_rank(rank_name: str) -> str:
     """Turn a Tekken rank name into a valid Discord emoji name.
 
-    Discord emoji names must be [A-Za-z0-9_] and 2-32 chars. We prefix
-    everything with `t8_` so the emoji-picker groups them together and
-    they don't collide with other server emoji the admin might create.
+    Discord emoji names must be [A-Za-z0-9_] and 2-32 chars. We use the
+    rank name directly (snake_cased) — admins picking emojis from the
+    server picker can type `:garyu` or `:tekken_emperor` and get a hit
+    without needing to remember a namespace prefix.
     """
     slug = rank_name.lower()
     slug = slug.replace("∞", "inf")
     slug = re.sub(r"[^a-z0-9_]+", "_", slug).strip("_")
-    return f"t8_{slug}"[:32]
+    return slug[:32]
+
+
+# The rank emojis we'd upload today, plus the `t8_*` names from the
+# earlier prefixed era — both variants are recognised as Ehrgeiz
+# artifacts so /purge-server cleans up legacy installations in place.
+def _all_rank_emoji_names() -> set[str]:
+    current = {_emoji_name_for_rank(r) for r in wavu.ALL_RANK_NAMES}
+    legacy = {f"t8_{n}" for n in current}
+    return current | legacy
 
 
 async def _upload_rank_emojis_for_guild(
@@ -920,7 +930,6 @@ async def _upload_rank_emojis_for_guild(
 PLANNED_CATEGORY_NAMES = {c.name for c in SERVER_PLAN}
 PLANNED_CHANNEL_NAMES = {ch.name for cat in SERVER_PLAN for ch in cat.channels}
 PLANNED_ROLE_NAMES = {r.name for r in ROLE_PLAN}
-RANK_EMOJI_PREFIX = "t8_"
 
 
 @dataclass
@@ -1002,8 +1011,9 @@ async def _compute_purge_preview(guild: discord.Guild) -> PurgePreview:
     for role in guild.roles:
         if role.name in PLANNED_ROLE_NAMES:
             p.roles.append(role.name)
+    rank_emoji_names = _all_rank_emoji_names()
     for emo in guild.emojis:
-        if emo.name.startswith(RANK_EMOJI_PREFIX):
+        if emo.name in rank_emoji_names:
             p.emojis.append(emo.name)
     panel_rows = await _count_panels(guild.id)
     p.panels = panel_rows
@@ -1088,9 +1098,11 @@ async def _execute_purge(guild: discord.Guild) -> PurgeReport:
         except (discord.Forbidden, discord.HTTPException) as e:
             report.errors.append(f"role '{role.name}': {e}")
 
-    # Custom rank emojis (t8_ prefix).
+    # Custom rank emojis — matches the exact name set of uploaded rank
+    # icons (plus legacy t8_ names from the earlier prefix era).
+    rank_emoji_names = _all_rank_emoji_names()
     for emo in list(guild.emojis):
-        if not emo.name.startswith(RANK_EMOJI_PREFIX):
+        if emo.name not in rank_emoji_names:
             continue
         try:
             await emo.delete(reason="Ehrgeiz Godhand /purge-server")
