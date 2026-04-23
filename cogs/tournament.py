@@ -255,6 +255,7 @@ async def _player_snapshot_for_render(
         return None
     player = await db.get_player_by_discord(user_id)
     return {
+        "user_id": user_id,
         "display_name": part["display_name"],
         "rank_tier": part["rank_tier"],
         "main_char": player["main_char"] if player else None,
@@ -272,6 +273,7 @@ async def _matches_for_render(tournament_id: int, round_number: int) -> list[dic
             "player_a": a,
             "player_b": b,
             "is_bye": r["player_b_id"] is None,
+            "winner_id": r["winner_id"],
         })
     return out
 

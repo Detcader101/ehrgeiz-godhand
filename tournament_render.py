@@ -46,8 +46,16 @@ RANK_ICON_BOX = (120, 60)    # 2:1
 CHAR_ICON_BOX = (52, 72)     # 3:4
 INTER_PAD = 14
 
-# Fonts are located lazily at render time; PIL's default is the fallback.
-_FONT_CANDIDATES = (
+# Typography. We run two families:
+#   - Display (Bebas Neue, condensed all-caps sans) for the broadcast-style
+#     hero text: tournament title, round label, MATCH labels, score cell.
+#     Bundled under assets/fonts/ (OFL-licensed, see OFL.txt).
+#   - Body (system bold sans) for mixed-case player names + metadata.
+# This matches TWT / EVO overlay conventions — condensed caps carry the
+# event branding, a straightforward bold sans keeps names readable.
+_FONT_DIR = Path(__file__).parent / "assets" / "fonts"
+_DISPLAY_FONT_PATH = _FONT_DIR / "BebasNeue-Regular.ttf"
+_BODY_FONT_CANDIDATES = (
     "C:/Windows/Fonts/arialbd.ttf",
     "C:/Windows/Fonts/segoeuib.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -56,12 +64,22 @@ _FONT_CANDIDATES = (
 
 
 def _load_font(size: int):
-    for candidate in _FONT_CANDIDATES:
+    """Body font — bold sans for mixed-case text."""
+    for candidate in _BODY_FONT_CANDIDATES:
         try:
             return ImageFont.truetype(candidate, size)
         except (OSError, IOError):
             continue
     return ImageFont.load_default()
+
+
+def _load_display_font(size: int):
+    """Display font — Bebas Neue (bundled). Falls back to body bold if
+    the TTF is missing for any reason."""
+    try:
+        return ImageFont.truetype(str(_DISPLAY_FONT_PATH), size)
+    except (OSError, IOError):
+        return _load_font(size)
 
 
 def _cache_path_for(url: str, cache_dir: Path) -> Path:
@@ -117,6 +135,23 @@ def _any_missing_cache(participants: list[dict]) -> bool:
     return False
 
 
+def _paint_header_gradient(
+    canvas: Image.Image, y_top: int, y_bot: int,
+) -> None:
+    """Subtle vertical gradient from HEADER_BG (lighter) at the top to
+    BG_COLOR (darker) at the bottom — broadcast-overlay depth trick."""
+    width = canvas.width
+    span = max(1, y_bot - y_top)
+    top_r, top_g, top_b = HEADER_BG
+    bot_r, bot_g, bot_b = BG_COLOR
+    for i in range(span):
+        t = i / span
+        r = int(top_r + (bot_r - top_r) * t)
+        g = int(top_g + (bot_g - top_g) * t)
+        b = int(top_b + (bot_b - top_b) * t)
+        canvas.paste((r, g, b, 255), (0, y_top + i, width, y_top + i + 1))
+
+
 def _paste_icon(
     canvas: Image.Image, icon: Image.Image | None,
     x: int, y: int, box_w: int, box_h: int,
@@ -151,15 +186,16 @@ async def render_roster(participants: list[dict]) -> io.BytesIO:
     img = Image.new("RGBA", (WIDTH, height), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # Header bar.
-    draw.rectangle([(0, 0), (WIDTH, HEADER_HEIGHT)], fill=HEADER_BG)
+    # Header bar — subtle vertical gradient behind the title for depth,
+    # then the accent underline.
+    _paint_header_gradient(img, 0, HEADER_HEIGHT)
     draw.line(
         [(0, HEADER_HEIGHT), (WIDTH, HEADER_HEIGHT)],
         fill=ACCENT, width=2,
     )
-    title_font = _load_font(26)
+    title_font = _load_display_font(36)
     draw.text(
-        (PADDING_X, 13),
+        (PADDING_X, 8),
         f"ENTRANTS  ·  {len(participants)}",
         fill=TEXT, font=title_font,
     )
@@ -247,12 +283,15 @@ def _to_png_buf(img: Image.Image) -> io.BytesIO:
 # --------------------------------------------------------------------------- #
 
 BRACKET_WIDTH = 880
-BRACKET_HEADER_H = 100
-BRACKET_MATCH_H = 150
+BRACKET_HEADER_H = 120
+BRACKET_MATCH_H = 168
 BRACKET_MATCH_GAP = 14
 BRACKET_SIDE_PAD = 28
 BRACKET_RANK_BOX = (140, 70)   # 2:1
 BRACKET_CHAR_BOX = (58, 80)    # 3:4
+# A subtle red wash painted onto the winner's half of a reported match.
+# Low alpha so it tints without overpowering the stripe.
+WINNER_TINT = (200, 30, 40, 28)
 
 
 async def _prefetch_icons_for_players(
@@ -325,31 +364,32 @@ async def render_bracket(
     img = Image.new("RGBA", (BRACKET_WIDTH, height), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    # Header with tournament name and round label.
-    draw.rectangle(
-        [(0, 0), (BRACKET_WIDTH, BRACKET_HEADER_H)], fill=HEADER_BG,
-    )
+    # Header with tournament name and round label — gradient background +
+    # accent underline. Title is upper-cased for broadcast feel; Bebas
+    # Neue (all-caps display face) carries the TWT/EVO overlay idiom.
+    _paint_header_gradient(img, 0, BRACKET_HEADER_H)
     draw.line(
         [(0, BRACKET_HEADER_H), (BRACKET_WIDTH, BRACKET_HEADER_H)],
         fill=ACCENT, width=3,
     )
-    name_font = _load_font(34)
-    round_font = _load_font(22)
+    title_font = _load_display_font(58)
+    round_font = _load_display_font(28)
     draw.text(
-        (BRACKET_SIDE_PAD, 18), tournament_name,
-        fill=TEXT, font=name_font,
+        (BRACKET_SIDE_PAD, 14), tournament_name.upper(),
+        fill=TEXT, font=title_font,
     )
     draw.text(
-        (BRACKET_SIDE_PAD, 60),
+        (BRACKET_SIDE_PAD, 74),
         f"ROUND {round_number}  ·  PAIRINGS",
         fill=ACCENT, font=round_font,
     )
 
-    match_label_font = _load_font(16)
+    match_label_font = _load_display_font(24)
     name_font_m = _load_font(24)
-    rank_font_m = _load_font(16)
-    vs_font = _load_font(34)
-    bye_font = _load_font(20)
+    rank_font_m = _load_font(15)
+    char_name_font = _load_display_font(18)
+    vs_font = _load_display_font(48)
+    bye_font = _load_display_font(22)
 
     for idx, match in enumerate(matches):
         y = (
@@ -362,16 +402,30 @@ async def render_bracket(
                 fill=ROW_BG_ALT,
             )
 
+        # Winner-side tint (painted onto the full card half) — a quiet
+        # red wash that indicates "this side won". Pre-match it's
+        # absent; byes show the bye player's side tinted automatically
+        # because winner_id is pre-filled.
+        winner_id = match.get("winner_id")
+        if winner_id is not None and not match["is_bye"]:
+            a_uid = match["player_a"]["user_id"] if match["player_a"] else None
+            b_uid = match["player_b"]["user_id"] if match["player_b"] else None
+            if winner_id == a_uid:
+                _paint_half_tint(img, y, y + BRACKET_MATCH_H, side="left")
+            elif winner_id == b_uid:
+                _paint_half_tint(img, y, y + BRACKET_MATCH_H, side="right")
+
         # Thin accent stripe on the left of each card.
         draw.rectangle(
             [(0, y), (4, y + BRACKET_MATCH_H)], fill=ACCENT,
         )
 
+        label = f"MATCH {match['match_number']}"
+        if match["is_bye"]:
+            label += "  ·  BYE"
         draw.text(
-            (BRACKET_SIDE_PAD, y + 8),
-            f"MATCH {match['match_number']}"
-            + ("  —  BYE" if match["is_bye"] else ""),
-            fill=TEXT_DIM, font=match_label_font,
+            (BRACKET_SIDE_PAD, y + 6),
+            label, fill=TEXT_DIM, font=match_label_font,
         )
 
         if match["is_bye"]:
@@ -380,7 +434,7 @@ async def render_bracket(
                 y=y, match=match,
                 rank_lookup=rank_lookup, char_lookup=char_lookup,
                 name_font=name_font_m, rank_font=rank_font_m,
-                bye_font=bye_font,
+                char_name_font=char_name_font, bye_font=bye_font,
             )
         else:
             _render_versus(
@@ -388,56 +442,79 @@ async def render_bracket(
                 y=y, match=match,
                 rank_lookup=rank_lookup, char_lookup=char_lookup,
                 name_font=name_font_m, rank_font=rank_font_m,
-                vs_font=vs_font,
+                char_name_font=char_name_font, vs_font=vs_font,
             )
 
     return _to_png_buf(img)
+
+
+def _paint_half_tint(
+    canvas: Image.Image, y_top: int, y_bot: int, side: str,
+) -> None:
+    """Lay a low-opacity red wash over one half of a match card to mark
+    the winner. Uses RGBA compositing so the existing background
+    (including alt-row stripes) shows through faintly."""
+    mid_x = canvas.width // 2
+    x0, x1 = (0, mid_x) if side == "left" else (mid_x, canvas.width)
+    tint = Image.new("RGBA", (x1 - x0, y_bot - y_top), WINNER_TINT)
+    canvas.alpha_composite(tint, (x0, y_top))
 
 
 def _render_versus(
     draw: ImageDraw.ImageDraw, canvas: Image.Image,
     *, y: int, match: dict,
     rank_lookup: dict, char_lookup: dict,
-    name_font, rank_font, vs_font,
+    name_font, rank_font, char_name_font, vs_font,
 ) -> None:
-    """Two-column 'A vs B' match card."""
+    """Two-column 'A vs B' match card. If a winner is set, the loser's
+    text is dimmed so the reported outcome reads at a glance."""
     a = match["player_a"]
     b = match["player_b"]
     mid_x = BRACKET_WIDTH // 2
+    winner_id = match.get("winner_id")
+    a_lost = winner_id is not None and a and winner_id != a["user_id"]
+    b_lost = winner_id is not None and b and winner_id != b["user_id"]
 
-    # Player A (left side).
-    content_y = y + 38
+    content_y = y + 48
     _draw_player_row(
         draw, canvas, a, rank_lookup, char_lookup,
         x=BRACKET_SIDE_PAD, y=content_y,
-        max_text_w=mid_x - BRACKET_SIDE_PAD - 60,
+        max_text_w=mid_x - BRACKET_SIDE_PAD - 70,
         name_font=name_font, rank_font=rank_font,
-        align="left",
+        char_name_font=char_name_font,
+        align="left", dim=a_lost,
     )
-    # Player B (right side, mirrored).
     _draw_player_row(
         draw, canvas, b, rank_lookup, char_lookup,
         x=BRACKET_WIDTH - BRACKET_SIDE_PAD, y=content_y,
-        max_text_w=mid_x - BRACKET_SIDE_PAD - 60,
+        max_text_w=mid_x - BRACKET_SIDE_PAD - 70,
         name_font=name_font, rank_font=rank_font,
-        align="right",
+        char_name_font=char_name_font,
+        align="right", dim=b_lost,
     )
 
-    # VS divider in the middle.
-    vs_y = y + (BRACKET_MATCH_H // 2) - 22
-    _draw_vs(draw, canvas, mid_x, vs_y, vs_font)
+    # Center divider: big VS + underline. When a winner is decided the
+    # VS is replaced with a "WINNER" badge tilted toward the winner's
+    # side via the card tint.
+    vs_y = y + (BRACKET_MATCH_H // 2) - 28
+    _draw_vs(draw, canvas, mid_x, vs_y, vs_font,
+             resolved=winner_id is not None)
 
 
 def _draw_player_row(
     draw: ImageDraw.ImageDraw, canvas: Image.Image, player: dict,
     rank_lookup: dict, char_lookup: dict,
     *, x: int, y: int, max_text_w: int,
-    name_font, rank_font, align: str,
+    name_font, rank_font, char_name_font,
+    align: str, dim: bool = False,
 ) -> None:
-    """Render a single player block: icons + name + rank tier. align='left'
-    puts icons first then text; align='right' mirrors it."""
+    """Render a single player block: icons + name + rank tier, plus the
+    character name inscribed beneath the portrait. align='left' puts
+    icons first then text; align='right' mirrors it. dim=True renders
+    the text in TEXT_DIM — used for the loser half of a reported match."""
     rank_img = rank_lookup.get(player.get("rank_tier")) if player else None
     char_img = char_lookup.get(player.get("main_char")) if player else None
+    char_name = (player or {}).get("main_char")
 
     rank_w, rank_h = BRACKET_RANK_BOX
     char_w, char_h = BRACKET_CHAR_BOX
@@ -449,9 +526,11 @@ def _draw_player_row(
                     rank_w, rank_h)
         cx += rank_w + 12
         _paste_icon(canvas, char_img, cx, y, char_w, char_h)
+        _draw_char_name(draw, char_name, cx, y + char_h + 2, char_w,
+                        char_name_font, align="left", dim=dim)
         cx += char_w + 14
         _draw_name_rank(draw, player, cx, y, name_font, rank_font, max_text_w,
-                        text_align="left")
+                        text_align="left", dim=dim)
     else:
         # right-align: compute from the right edge backward.
         cx = x
@@ -462,32 +541,55 @@ def _draw_player_row(
         cx -= 12
         cx -= char_w
         _paste_icon(canvas, char_img, cx, y, char_w, char_h)
+        _draw_char_name(draw, char_name, cx, y + char_h + 2, char_w,
+                        char_name_font, align="center", dim=dim)
         cx -= 14
         _draw_name_rank(draw, player, cx, y, name_font, rank_font, max_text_w,
-                        text_align="right")
+                        text_align="right", dim=dim)
+
+
+def _draw_char_name(
+    draw: ImageDraw.ImageDraw, char_name: str | None,
+    x: int, y: int, box_w: int, font, *, align: str, dim: bool,
+) -> None:
+    """Small uppercase label beneath the character portrait. 'Kazuya',
+    'Devil Jin', etc. Centred within the portrait's width."""
+    if not char_name:
+        return
+    label = char_name.upper()
+    w = _text_width(draw, label, font)
+    if align == "left" or align == "center":
+        # Centered within the portrait box.
+        tx = x + (box_w - w) // 2
+    else:
+        tx = x + (box_w - w) // 2
+    draw.text((tx, y), label,
+              fill=(TEXT_DIM if dim else ACCENT), font=font)
 
 
 def _draw_name_rank(
     draw: ImageDraw.ImageDraw, player: dict,
     x: int, y: int,
     name_font, rank_font, max_w: int,
-    text_align: str,
+    text_align: str, dim: bool = False,
 ) -> None:
     name = player["display_name"]
     rank = player.get("rank_tier") or "Unranked"
 
-    # Truncate name if it overflows the allocated text width.
     name = _ellipsize(draw, name, name_font, max_w)
     rank = _ellipsize(draw, rank, rank_font, max_w)
 
+    name_color = TEXT_DIM if dim else TEXT
+    rank_color = TEXT_DIM if dim else TEXT_DIM  # rank always dim
+
     if text_align == "left":
-        draw.text((x, y + 20), name, fill=TEXT, font=name_font)
-        draw.text((x, y + 52), rank, fill=TEXT_DIM, font=rank_font)
+        draw.text((x, y + 16), name, fill=name_color, font=name_font)
+        draw.text((x, y + 48), rank, fill=rank_color, font=rank_font)
     else:
         name_w = _text_width(draw, name, name_font)
         rank_w = _text_width(draw, rank, rank_font)
-        draw.text((x - name_w, y + 20), name, fill=TEXT, font=name_font)
-        draw.text((x - rank_w, y + 52), rank, fill=TEXT_DIM, font=rank_font)
+        draw.text((x - name_w, y + 16), name, fill=name_color, font=name_font)
+        draw.text((x - rank_w, y + 48), rank, fill=rank_color, font=rank_font)
 
 
 def _text_width(draw: ImageDraw.ImageDraw, text: str, font) -> int:
@@ -514,16 +616,17 @@ def _ellipsize(
 
 def _draw_vs(
     draw: ImageDraw.ImageDraw, canvas: Image.Image,
-    cx: int, y: int, vs_font,
+    cx: int, y: int, vs_font, *, resolved: bool,
 ) -> None:
-    """VS text with a red underline — the hype moment between the two
-    player blocks."""
-    vs = "VS"
-    w = _text_width(draw, vs, vs_font)
-    draw.text((cx - w // 2, y), vs, fill=ACCENT, font=vs_font)
+    """Big VS in Bebas with a short red underline. Once the match is
+    resolved we swap to 'WIN' so the card reads differently at a glance
+    (paired with the winner-side tint)."""
+    label = "WIN" if resolved else "VS"
+    w = _text_width(draw, label, vs_font)
+    draw.text((cx - w // 2, y), label, fill=ACCENT, font=vs_font)
     draw.line(
-        [(cx - 22, y + 44), (cx + 22, y + 44)],
-        fill=ACCENT, width=2,
+        [(cx - 26, y + 56), (cx + 26, y + 56)],
+        fill=ACCENT, width=3,
     )
 
 
@@ -531,11 +634,10 @@ def _render_bye(
     draw: ImageDraw.ImageDraw, canvas: Image.Image,
     *, y: int, match: dict,
     rank_lookup: dict, char_lookup: dict,
-    name_font, rank_font, bye_font,
+    name_font, rank_font, char_name_font, bye_font,
 ) -> None:
     """Single-player centered bye row."""
     player = match["player_a"]
-    # Centered block: char icon + rank icon + name stacked next to "BYE".
     rank_img = rank_lookup.get(player.get("rank_tier")) if player else None
     char_img = char_lookup.get(player.get("main_char")) if player else None
 
@@ -543,20 +645,23 @@ def _render_bye(
     char_w, char_h = BRACKET_CHAR_BOX
 
     cx = BRACKET_WIDTH // 2 - (rank_w + char_w + 100) // 2
-    content_y = y + 38
+    content_y = y + 44
 
     _paste_icon(canvas, rank_img,
                 cx, content_y + (char_h - rank_h) // 2,
                 rank_w, rank_h)
     cx += rank_w + 12
     _paste_icon(canvas, char_img, cx, content_y, char_w, char_h)
+    _draw_char_name(draw, (player or {}).get("main_char"),
+                    cx, content_y + char_h + 2, char_w, char_name_font,
+                    align="center", dim=False)
     cx += char_w + 14
 
     name = _ellipsize(draw, player["display_name"], name_font, 320)
-    draw.text((cx, content_y + 8), name, fill=TEXT, font=name_font)
-    draw.text((cx, content_y + 40),
+    draw.text((cx, content_y + 4), name, fill=TEXT, font=name_font)
+    draw.text((cx, content_y + 36),
               player.get("rank_tier") or "Unranked",
               fill=TEXT_DIM, font=rank_font)
-    draw.text((cx, content_y + 66),
-              "— advances to round 2 —",
+    draw.text((cx, content_y + 62),
+              "— ADVANCES TO ROUND 2 —",
               fill=ACCENT, font=bye_font)
