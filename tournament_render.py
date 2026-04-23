@@ -627,6 +627,10 @@ BRACKET_MATCH_GAP = 14
 BRACKET_SIDE_PAD = 28
 BRACKET_RANK_BOX = (140, 70)   # 2:1
 BRACKET_CHAR_BOX = (58, 80)    # 3:4
+# Horizontal exclusion zone around the center VS cell — name text must
+# never enter this band, so long handles shrink to fit rather than
+# overlapping the VS/WIN label.
+BRACKET_VS_MARGIN = 70
 # A subtle red wash painted onto the winner's half of a reported match.
 # Low alpha so it tints without overpowering the stripe.
 WINNER_TINT = (200, 30, 40, 28)
@@ -723,8 +727,6 @@ async def render_bracket(
     )
 
     match_label_font = _load_display_font(24)
-    name_font_m = _load_font(24)
-    rank_font_m = _load_font(15)
     char_name_font = _load_display_font(18)
     vs_font = _load_display_font(48)
     bye_font = _load_display_font(22)
@@ -771,7 +773,6 @@ async def render_bracket(
                 draw, img,
                 y=y, match=match,
                 rank_lookup=rank_lookup, char_lookup=char_lookup,
-                name_font=name_font_m, rank_font=rank_font_m,
                 char_name_font=char_name_font, bye_font=bye_font,
             )
         else:
@@ -779,7 +780,6 @@ async def render_bracket(
                 draw, img,
                 y=y, match=match,
                 rank_lookup=rank_lookup, char_lookup=char_lookup,
-                name_font=name_font_m, rank_font=rank_font_m,
                 char_name_font=char_name_font, vs_font=vs_font,
             )
 
@@ -802,10 +802,11 @@ def _render_versus(
     draw: ImageDraw.ImageDraw, canvas: Image.Image,
     *, y: int, match: dict,
     rank_lookup: dict, char_lookup: dict,
-    name_font, rank_font, char_name_font, vs_font,
+    char_name_font, vs_font,
 ) -> None:
-    """Two-column 'A vs B' match card. If a winner is set, the loser's
-    text is dimmed so the reported outcome reads at a glance."""
+    """Two-column 'A vs B' match card. Name text auto-sizes to fit its
+    zone (never bleeds into the VS cell). Loser's text dims once a
+    winner is reported."""
     a = match["player_a"]
     b = match["player_b"]
     mid_x = BRACKET_WIDTH // 2
@@ -817,23 +818,18 @@ def _render_versus(
     _draw_player_row(
         draw, canvas, a, rank_lookup, char_lookup,
         x=BRACKET_SIDE_PAD, y=content_y,
-        max_text_w=mid_x - BRACKET_SIDE_PAD - 70,
-        name_font=name_font, rank_font=rank_font,
+        name_zone_right_limit=mid_x - BRACKET_VS_MARGIN,
         char_name_font=char_name_font,
         align="left", dim=a_lost,
     )
     _draw_player_row(
         draw, canvas, b, rank_lookup, char_lookup,
         x=BRACKET_WIDTH - BRACKET_SIDE_PAD, y=content_y,
-        max_text_w=mid_x - BRACKET_SIDE_PAD - 70,
-        name_font=name_font, rank_font=rank_font,
+        name_zone_right_limit=mid_x + BRACKET_VS_MARGIN,
         char_name_font=char_name_font,
         align="right", dim=b_lost,
     )
 
-    # Center divider: big VS + underline. When a winner is decided the
-    # VS is replaced with a "WINNER" badge tilted toward the winner's
-    # side via the card tint.
     vs_y = y + (BRACKET_MATCH_H // 2) - 28
     _draw_vs(draw, canvas, mid_x, vs_y, vs_font,
              resolved=winner_id is not None)
@@ -842,14 +838,15 @@ def _render_versus(
 def _draw_player_row(
     draw: ImageDraw.ImageDraw, canvas: Image.Image, player: dict,
     rank_lookup: dict, char_lookup: dict,
-    *, x: int, y: int, max_text_w: int,
-    name_font, rank_font, char_name_font,
+    *, x: int, y: int, name_zone_right_limit: int,
+    char_name_font,
     align: str, dim: bool = False,
 ) -> None:
-    """Render a single player block: icons + name + rank tier, plus the
-    character name inscribed beneath the portrait. align='left' puts
-    icons first then text; align='right' mirrors it. dim=True renders
-    the text in TEXT_DIM — used for the loser half of a reported match."""
+    """Render icons + name + rank tier. The name zone is bounded
+    explicitly by `name_zone_right_limit` (or left-limit on the right
+    side of the card) so the VS cell is guaranteed clear — names scale
+    down to fit rather than overlapping. Character name chip sits
+    beneath the portrait."""
     rank_img = rank_lookup.get(player.get("rank_tier")) if player else None
     char_img = char_lookup.get(player.get("main_char")) if player else None
     char_name = (player or {}).get("main_char")
@@ -867,10 +864,10 @@ def _draw_player_row(
         _draw_char_name(draw, char_name, cx, y + char_h + 2, char_w,
                         char_name_font, align="left", dim=dim)
         cx += char_w + 14
-        _draw_name_rank(draw, player, cx, y, name_font, rank_font, max_text_w,
+        name_zone_w = max(40, name_zone_right_limit - cx)
+        _draw_name_rank(draw, player, cx, y, name_zone_w,
                         text_align="left", dim=dim)
     else:
-        # right-align: compute from the right edge backward.
         cx = x
         cx -= rank_w
         _paste_icon(canvas, rank_img,
@@ -882,7 +879,8 @@ def _draw_player_row(
         _draw_char_name(draw, char_name, cx, y + char_h + 2, char_w,
                         char_name_font, align="center", dim=dim)
         cx -= 14
-        _draw_name_rank(draw, player, cx, y, name_font, rank_font, max_text_w,
+        name_zone_w = max(40, cx - name_zone_right_limit)
+        _draw_name_rank(draw, player, cx, y, name_zone_w,
                         text_align="right", dim=dim)
 
 
@@ -907,18 +905,29 @@ def _draw_char_name(
 
 def _draw_name_rank(
     draw: ImageDraw.ImageDraw, player: dict,
-    x: int, y: int,
-    name_font, rank_font, max_w: int,
+    x: int, y: int, zone_w: int,
     text_align: str, dim: bool = False,
 ) -> None:
+    """Draw the name + rank-tier lines fitted to a fixed-width zone.
+
+    Name scales 24pt→14pt to stay inside `zone_w`, rank tier scales
+    16pt→12pt. This locks the horizontal silhouette of each match card:
+    icons sit in their slots, VS sits in its cell, names shrink to
+    whatever size is needed to avoid collisions."""
     name = player["display_name"]
     rank = player.get("rank_tier") or "Unranked"
 
-    name = _ellipsize(draw, name, name_font, max_w)
-    rank = _ellipsize(draw, rank, rank_font, max_w)
+    name_font = _fit_text_to_box(
+        draw, name, max_w=zone_w, max_h=30,
+        max_size=24, min_size=14, font_loader=_load_font,
+    )
+    rank_font = _fit_text_to_box(
+        draw, rank, max_w=zone_w, max_h=22,
+        max_size=16, min_size=12, font_loader=_load_font,
+    )
 
     name_color = TEXT_DIM if dim else TEXT
-    rank_color = TEXT_DIM if dim else TEXT_DIM  # rank always dim
+    rank_color = TEXT_DIM
 
     if text_align == "left":
         draw.text((x, y + 16), name, fill=name_color, font=name_font)
@@ -972,7 +981,7 @@ def _render_bye(
     draw: ImageDraw.ImageDraw, canvas: Image.Image,
     *, y: int, match: dict,
     rank_lookup: dict, char_lookup: dict,
-    name_font, rank_font, char_name_font, bye_font,
+    char_name_font, bye_font,
 ) -> None:
     """Single-player centered bye row."""
     player = match["player_a"]
@@ -982,7 +991,9 @@ def _render_bye(
     rank_w, rank_h = BRACKET_RANK_BOX
     char_w, char_h = BRACKET_CHAR_BOX
 
-    cx = BRACKET_WIDTH // 2 - (rank_w + char_w + 100) // 2
+    # Reserve a fixed name zone so long handles don't push icons off-card.
+    bye_name_zone_w = 320
+    cx = BRACKET_WIDTH // 2 - (rank_w + char_w + bye_name_zone_w + 24) // 2
     content_y = y + 44
 
     _paste_icon(canvas, rank_img,
@@ -995,10 +1006,20 @@ def _render_bye(
                     align="center", dim=False)
     cx += char_w + 14
 
-    name = _ellipsize(draw, player["display_name"], name_font, 320)
-    draw.text((cx, content_y + 4), name, fill=TEXT, font=name_font)
-    draw.text((cx, content_y + 36),
-              player.get("rank_tier") or "Unranked",
+    name_font = _fit_text_to_box(
+        draw, player["display_name"],
+        max_w=bye_name_zone_w, max_h=30,
+        max_size=24, min_size=14, font_loader=_load_font,
+    )
+    rank_text = player.get("rank_tier") or "Unranked"
+    rank_font = _fit_text_to_box(
+        draw, rank_text,
+        max_w=bye_name_zone_w, max_h=22,
+        max_size=16, min_size=12, font_loader=_load_font,
+    )
+    draw.text((cx, content_y + 4), player["display_name"],
+              fill=TEXT, font=name_font)
+    draw.text((cx, content_y + 36), rank_text,
               fill=TEXT_DIM, font=rank_font)
     draw.text((cx, content_y + 62),
               "— ADVANCES TO ROUND 2 —",
