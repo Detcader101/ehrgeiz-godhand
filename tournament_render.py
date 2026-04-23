@@ -727,6 +727,222 @@ async def render_bot_profile_banner() -> io.BytesIO:
 
 
 # --------------------------------------------------------------------------- #
+# README artwork                                                               #
+# --------------------------------------------------------------------------- #
+
+README_HERO_W = 1200
+README_HERO_H = 360
+
+
+async def render_readme_hero() -> io.BytesIO:
+    """Wide Ehrgeiz hero for the top of README.md. Logo anchored left,
+    bold Bebas title, tagline, brand accent strips — sized generously
+    for GitHub which downsizes to fit the reader's column."""
+    img = Image.new("RGBA", (README_HERO_W, README_HERO_H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    _paint_banner_gradient(img, y_start=0, y_end=README_HERO_H)
+    draw.rectangle([(0, 0), (README_HERO_W, 5)], fill=ACCENT)
+    draw.rectangle(
+        [(0, README_HERO_H - 5), (README_HERO_W, README_HERO_H)],
+        fill=ACCENT,
+    )
+
+    logo_x = 60
+    logo_box = 260
+    if LOGO_PATH.exists():
+        try:
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            src_w, src_h = logo.size
+            scale = min(logo_box / src_w, logo_box / src_h)
+            new_w = max(1, int(src_w * scale))
+            new_h = max(1, int(src_h * scale))
+            resized = logo.resize((new_w, new_h), Image.LANCZOS)
+            img.alpha_composite(
+                resized,
+                (logo_x + (logo_box - new_w) // 2,
+                 (README_HERO_H - new_h) // 2),
+            )
+        except (OSError, IOError) as e:
+            log.warning("readme hero logo load failed: %s", e)
+
+    text_x = logo_x + logo_box + 36
+    text_max_w = README_HERO_W - text_x - 60
+
+    kicker = "TEKKEN 8 DISCORD BOT"
+    title = "EHRGEIZ GODHAND"
+    tagline = (
+        "ONBOARDING · RANK SYNC · SWISS TOURNAMENTS"
+    )
+    footer = "PANEL-DRIVEN · OPEN SOURCE · MIT LICENSED"
+
+    kicker_h = 26
+    title_h = 108
+    tag_h = 28
+    footer_h = 20
+    gap_small = 10
+    gap_large = 18
+    block_h = (kicker_h + gap_small + title_h + gap_small
+               + tag_h + gap_large + footer_h)
+    block_y = (README_HERO_H - block_h) // 2
+
+    kicker_font = _fit_text_to_box(
+        draw, kicker, max_w=text_max_w, max_h=kicker_h,
+        max_size=22, min_size=16,
+    )
+    title_font = _fit_text_to_box(
+        draw, title, max_w=text_max_w, max_h=title_h,
+        max_size=96, min_size=48,
+    )
+    tag_font = _fit_text_to_box(
+        draw, tagline, max_w=text_max_w, max_h=tag_h,
+        max_size=24, min_size=16,
+    )
+    footer_font = _fit_text_to_box(
+        draw, footer, max_w=text_max_w, max_h=footer_h,
+        max_size=18, min_size=12,
+    )
+
+    y = block_y
+    draw.text((text_x, y), kicker, fill=ACCENT, font=kicker_font)
+    y += kicker_h + gap_small
+    draw.text((text_x, y), title, fill=TEXT, font=title_font)
+    y += title_h + gap_small
+    draw.text((text_x, y), tagline, fill=TEXT_DIM, font=tag_font)
+    y += tag_h + gap_large
+    draw.text((text_x, y), footer, fill=ACCENT, font=footer_font)
+
+    return _to_png_buf(img)
+
+
+# --- Rank lookup flow diagram --------------------------------------------- #
+
+RANK_FLOW_W = 1200
+RANK_FLOW_H = 340
+RANK_FLOW_BOX_W = 300
+RANK_FLOW_BOX_H = 180
+RANK_FLOW_BOX_GAP = 50
+
+
+async def render_rank_flow_diagram() -> io.BytesIO:
+    """Three-box horizontal flowchart illustrating the wavu → ewgf →
+    self-report rank-lookup chain."""
+    img = Image.new("RGBA", (RANK_FLOW_W, RANK_FLOW_H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    _paint_banner_gradient(img, y_start=0, y_end=RANK_FLOW_H)
+    draw.rectangle([(0, 0), (RANK_FLOW_W, 4)], fill=ACCENT)
+    draw.rectangle(
+        [(0, RANK_FLOW_H - 4), (RANK_FLOW_W, RANK_FLOW_H)], fill=ACCENT,
+    )
+
+    title_font = _load_display_font(32)
+    draw.text(
+        (40, 28), "RANK LOOKUP CHAIN",
+        fill=TEXT, font=title_font,
+    )
+
+    sub_font = _load_display_font(18)
+    draw.text(
+        (40, 68),
+        "Try each source in order · fall through to the next if it has nothing",
+        fill=ACCENT, font=sub_font,
+    )
+
+    # Three cards side-by-side, centered horizontally.
+    total_w = 3 * RANK_FLOW_BOX_W + 2 * RANK_FLOW_BOX_GAP
+    start_x = (RANK_FLOW_W - total_w) // 2
+    card_y = 140
+
+    steps = [
+        {
+            "label": "PRIMARY",
+            "heading": "wavu.wiki",
+            "sub": "/api/replays",
+            "body": "Scrapes recent matches\nfor rank_id.",
+            "note": "Authoritative\nfor last ~35 min.",
+        },
+        {
+            "label": "SECONDARY",
+            "heading": "ewgf.gg",
+            "sub": "RSC payload",
+            "body": "Player page scrape\nfor current season.",
+            "note": "Covers inactive\nplayers wavu misses.",
+        },
+        {
+            "label": "FALLBACK",
+            "heading": "Self-report",
+            "sub": "two-stage picker",
+            "body": "User selects tier\nfrom a dropdown.",
+            "note": "Last resort —\nuser is trusted.",
+        },
+    ]
+
+    label_font = _load_display_font(18)
+    head_font = _load_display_font(30)
+    sub_step_font = _load_font(14)
+    body_font = _load_font(15)
+    note_font = _load_font(13)
+    # Body (DejaVu) covers the Unicode arrow glyph — Bebas doesn't.
+    arrow_font = _load_font(56)
+
+    for i, step in enumerate(steps):
+        x = start_x + i * (RANK_FLOW_BOX_W + RANK_FLOW_BOX_GAP)
+        _draw_flow_card(
+            draw, img, x, card_y,
+            step, label_font, head_font, sub_step_font,
+            body_font, note_font,
+        )
+        if i < len(steps) - 1:
+            arrow_x = x + RANK_FLOW_BOX_W + (RANK_FLOW_BOX_GAP // 2)
+            arrow_y = card_y + (RANK_FLOW_BOX_H // 2) - 28
+            w = _text_width(draw, "→", arrow_font)
+            draw.text(
+                (arrow_x - w // 2, arrow_y), "→",
+                fill=ACCENT, font=arrow_font,
+            )
+
+    return _to_png_buf(img)
+
+
+def _draw_flow_card(
+    draw: ImageDraw.ImageDraw, canvas: Image.Image,
+    x: int, y: int, step: dict,
+    label_font, head_font, sub_step_font, body_font, note_font,
+) -> None:
+    # Card body + left accent stripe.
+    draw.rectangle(
+        [(x, y), (x + RANK_FLOW_BOX_W, y + RANK_FLOW_BOX_H)],
+        fill=ROW_BG_ALT,
+    )
+    draw.rectangle([(x, y), (x + 5, y + RANK_FLOW_BOX_H)], fill=ACCENT)
+
+    # Label (PRIMARY / SECONDARY / FALLBACK) in red.
+    draw.text((x + 18, y + 12), step["label"],
+              fill=ACCENT, font=label_font)
+
+    # Heading (wavu.wiki, etc.) — Bebas white.
+    draw.text((x + 18, y + 38), step["heading"],
+              fill=TEXT, font=head_font)
+    draw.text((x + 18, y + 76), step["sub"],
+              fill=TEXT_DIM, font=sub_step_font)
+
+    # Body lines.
+    by = y + 104
+    for line in step["body"].split("\n"):
+        draw.text((x + 18, by), line,
+                  fill=TEXT, font=body_font)
+        by += 18
+
+    # Note (small dim footer in the card).
+    ny = y + RANK_FLOW_BOX_H - 36
+    for line in step["note"].split("\n"):
+        draw.text((x + 18, ny), line,
+                  fill=TEXT_DIM, font=note_font)
+        ny += 15
+
+
+# --------------------------------------------------------------------------- #
 # Round bracket render                                                         #
 # --------------------------------------------------------------------------- #
 

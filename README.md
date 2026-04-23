@@ -1,7 +1,5 @@
-# Ehrgeiz Godhand
-
 <p align="center">
-  <img src="assets/ehrgeiz.png" alt="Ehrgeiz Godhand — red and black fist logo with lightning slashes" width="280">
+  <img src="assets/readme/hero.png" alt="Ehrgeiz Godhand — Tekken 8 Discord bot. Onboarding, rank sync, Swiss tournaments.">
 </p>
 
 **Panel-driven Discord bot for Tekken 8 communities — role assignment by rank/ELO, bracket forming, and general moderation.**
@@ -107,6 +105,10 @@ The command is idempotent — anything that already exists by name is skipped. S
 After setup, drag the bot's role **above** the new rank/admin/mod roles in Server Settings → Roles (Discord requires this for the bot to manage those roles).
 
 ## How the rank lookup works
+
+<p align="center">
+  <img src="assets/readme/rank_flow.png" alt="Rank lookup chain: wavu.wiki primary, ewgf.gg secondary, self-report fallback">
+</p>
 
 There's no official Tekken player-lookup API, so the bot uses two community sites in a chain:
 
