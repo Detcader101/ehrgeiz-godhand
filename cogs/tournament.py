@@ -21,6 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import audit
 import channel_util
 import db
 import media
@@ -485,12 +486,13 @@ async def _unpin_signup(client: discord.Client, t) -> None:
 async def _announce_state_change(
     client: discord.Client, t, kind: str,
     attachment: discord.File | None = None,
+    view: discord.ui.View | None = None,
 ) -> None:
     """Post a separate, non-editable message in the signup channel that
     mentions every participant — this is the notification vehicle,
     separate from the persistent panel. kind is 'started' or 'cancelled'.
-    If attachment is provided it ships in the same message (so Discord's
-    image preview hangs directly under the hype text)."""
+    Attachment + view are both optional; view is how the round-start
+    announcement gets its Report-a-Win button."""
     if t["signup_channel_id"] is None:
         return
     channel = client.get_channel(t["signup_channel_id"])
@@ -504,8 +506,9 @@ async def _announce_state_change(
         headline = f"⚔️ **{t['name']} — BRACKET LIVE!**"
         body = (
             f"{t['match_format']} · Swiss · rank-weighted seeding.\n"
-            "Round 1 pairings below. Run your matches and report results to "
-            "the organizer for now — `/report-win` lands next slice."
+            "Round 1 pairings below. Play your match, then hit "
+            "**⚔️ Report a Win** — the loser confirms, disputes route to "
+            "the organizer."
         )
     else:
         headline = f"❌ **{t['name']} — CANCELLED.**"
@@ -514,6 +517,8 @@ async def _announce_state_change(
     kwargs: dict = {"allowed_mentions": discord.AllowedMentions(users=True)}
     if attachment is not None:
         kwargs["file"] = attachment
+    if view is not None:
+        kwargs["view"] = view
     try:
         await channel.send(
             f"{headline}\n{body}\n\n{mentions}", **kwargs,
@@ -702,6 +707,10 @@ class Tournament(commands.Cog):
         # from interaction.message.id.
         self.bot.add_view(SignupView())
         self.bot.add_view(TournamentsPanelView())
+        # Match-reporting persistent views (slice 2).
+        self.bot.add_view(ReportWinView())
+        self.bot.add_view(MatchReportPublicView())
+        self.bot.add_view(DisputeResolveView())
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,
@@ -872,7 +881,9 @@ class Tournament(commands.Cog):
         bracket_file = await _build_round_bracket_file(t["name"], t["id"], 1)
 
         await _announce_state_change(
-            self.bot, t_after, "started", attachment=bracket_file,
+            self.bot, t_after, "started",
+            attachment=bracket_file,
+            view=ReportWinView(),
         )
 
         await interaction.followup.send(
@@ -937,6 +948,113 @@ class Tournament(commands.Cog):
     ) -> list[app_commands.Choice[str]]:
         return await _autocomplete_tournaments(
             interaction, current, states=("SIGNUPS_OPEN", "IN_PROGRESS"),
+        )
+
+    # ---- Organizer override ---------------------------------------------- #
+
+    @app_commands.command(
+        name="tournament-set-result",
+        description="[Organizer] Override a match result — escape hatch for mistakes.",
+    )
+    @app_commands.describe(
+        name="Tournament name",
+        round_number="Round number (1, 2, …)",
+        match_number="Match number within the round",
+        winner="The player who actually won",
+    )
+    async def tournament_set_result(
+        self, interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 60],
+        round_number: app_commands.Range[int, 1, 16],
+        match_number: app_commands.Range[int, 1, 128],
+        winner: discord.Member,
+    ):
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        if not _is_organizer(member):
+            await interaction.response.send_message(
+                f"Need the **{ORGANIZER_ROLE_NAME}** role (or Administrator).",
+                ephemeral=True, delete_after=12)
+            return
+
+        t = await db.get_active_tournament_by_name(guild.id, name)
+        if t is None:
+            await interaction.response.send_message(
+                f"No live tournament named **{name}**.",
+                ephemeral=True, delete_after=12)
+            return
+
+        rows = await db.list_matches_for_round(t["id"], round_number)
+        match = next(
+            (r for r in rows if r["match_number"] == match_number),
+            None,
+        )
+        if match is None:
+            await interaction.response.send_message(
+                f"No match **R{round_number} · #{match_number}** in "
+                f"**{name}**.",
+                ephemeral=True, delete_after=12)
+            return
+
+        if winner.id not in (match["player_a_id"], match["player_b_id"]):
+            await interaction.response.send_message(
+                f"{winner.mention} isn't a player in that match.",
+                ephemeral=True, delete_after=12)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await db.override_match_result(match["id"], winner.id, _now_iso())
+
+        # Update the public report message in place if one exists so
+        # onlookers see the correction.
+        if match["report_message_id"]:
+            channel = guild.get_channel(t["signup_channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(
+                        match["report_message_id"])
+                    await msg.edit(
+                        content=(
+                            f"🔧 **Match {match_number} overridden** "
+                            f"({t['name']} · Round {round_number}).\n"
+                            f"Winner set to {winner.mention} by "
+                            f"{member.mention}."
+                        ),
+                        view=None,
+                    )
+                except (discord.NotFound, discord.Forbidden,
+                        discord.HTTPException):
+                    pass
+
+        await audit.post_event(
+            guild,
+            title="Tournament · result OVERRIDDEN",
+            color=discord.Color.dark_red(),
+            fields=[
+                ("Tournament", t["name"], True),
+                ("Match", f"R{round_number} · #{match_number}", True),
+                ("New winner", winner.mention, True),
+                ("Organizer", member.mention, True),
+                ("Previous state", str(match["state"]), True),
+            ],
+        )
+
+        await interaction.followup.send(
+            f"🔧 Overrode **{name} · R{round_number} · Match {match_number}** "
+            f"— winner set to {winner.mention}.",
+            ephemeral=True,
+        )
+
+    @tournament_set_result.autocomplete("name")
+    async def _tournament_set_result_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await _autocomplete_tournaments(
+            interaction, current, states=("IN_PROGRESS",),
         )
 
     # ---- Test mode ------------------------------------------------------- #
@@ -1099,6 +1217,577 @@ async def _autocomplete_tournaments(
     hits = [r for r in rows if needle in r["name"].lower()]
     # Discord caps autocomplete at 25 options.
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in hits[:25]]
+
+
+# --------------------------------------------------------------------------- #
+# Match reporting (slice 2)                                                    #
+# --------------------------------------------------------------------------- #
+
+REPORTER_CANCEL_WINDOW_SECONDS = 60
+
+
+class ReportWinView(ErrorHandledView):
+    """Persistent single-button view attached to every round-start
+    announcement. The button's callback queries the clicker's PENDING
+    matches across the guild — 0 matches bails, 1 match proceeds
+    directly, 2+ matches show a select menu picker."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Report a Win", emoji="⚔️",
+        style=discord.ButtonStyle.success,
+        custom_id="mreport:start",
+    )
+    async def report_start(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_report_win_start(interaction)
+
+
+class MatchReportPublicView(ErrorHandledView):
+    """Persistent Confirm/Dispute buttons on the public report-request
+    message pinged at the loser. Looks up the match by message_id on
+    click so one registered view handles every in-flight report."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Confirm", emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="mreport:confirm",
+    )
+    async def confirm(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_loser_confirm(interaction)
+
+    @discord.ui.button(
+        label="Dispute", emoji="⚠️",
+        style=discord.ButtonStyle.danger,
+        custom_id="mreport:dispute",
+    )
+    async def dispute(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_loser_dispute(interaction)
+
+
+class DisputeResolveView(ErrorHandledView):
+    """Attached to the same message once it transitions to DISPUTED.
+    Organizer/Admin/Mod picks which player won; locks the result in as
+    CONFIRMED."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(
+        self, interaction: discord.Interaction,
+    ) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        if any(r.name in (ORGANIZER_ROLE_NAME, "Moderator")
+               for r in member.roles):
+            return True
+        await interaction.response.send_message(
+            f"Only **{ORGANIZER_ROLE_NAME}** / **Moderator** / **Admin** "
+            "can resolve disputes.",
+            ephemeral=True, delete_after=10,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Player A wins", emoji="🅰️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mreport:resolve_a",
+    )
+    async def pick_a(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_organizer_resolve(interaction, side="a")
+
+    @discord.ui.button(
+        label="Player B wins", emoji="🅱️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="mreport:resolve_b",
+    )
+    async def pick_b(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_organizer_resolve(interaction, side="b")
+
+
+class MatchPickerView(ErrorHandledView):
+    """Ephemeral select menu — shown when the clicker has 2+ pending
+    matches and needs to say which one they won."""
+
+    def __init__(self, matches: list):
+        super().__init__(timeout=180)
+        options = []
+        for m in matches[:25]:
+            opp_id = (m["player_b_id"] if m["player_a_id"] == m.get("viewer_id")
+                      else m["player_a_id"])
+            opp_label = m.get("opponent_display") or f"vs <user {opp_id}>"
+            options.append(discord.SelectOption(
+                label=f"{m['tournament_name']} · Match {m['match_number']}"[:100],
+                description=f"Round {m['round_number']} · {opp_label}"[:100],
+                value=str(m["id"]),
+            ))
+        self.select = discord.ui.Select(
+            placeholder="Which match did you win?",
+            options=options or [discord.SelectOption(label="no matches", value="0")],
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        match_id = int(self.select.values[0])
+        match = await db.get_match(match_id)
+        if match is None or match["state"] != "PENDING":
+            await interaction.response.edit_message(
+                content="That match isn't pending anymore. Try again.",
+                view=None, embed=None,
+            )
+            return
+        await _flow_confirm_opponent(interaction, match)
+
+
+class ConfirmReportView(ErrorHandledView):
+    """Final 'You beat <opponent>? Yes/Cancel' gate before we record
+    the claim and ping the loser publicly."""
+
+    def __init__(self, match_id: int):
+        super().__init__(timeout=60)
+        self.match_id = match_id
+
+    @discord.ui.button(
+        label="Yes — I won", emoji="⚔️",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_execute_report(interaction, self.match_id)
+
+    @discord.ui.button(
+        label="Cancel", style=discord.ButtonStyle.secondary,
+    )
+    async def cancel(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await interaction.response.edit_message(
+            content="Cancelled. No claim filed.", view=None, embed=None,
+        )
+
+
+class ReporterCancelView(ErrorHandledView):
+    """Ephemeral 60-second 'Oops, cancel my report' undo button — only
+    the reporter sees this and only the match is revertable while the
+    loser hasn't clicked Confirm/Dispute yet."""
+
+    def __init__(self, match_id: int):
+        super().__init__(timeout=REPORTER_CANCEL_WINDOW_SECONDS)
+        self.match_id = match_id
+
+    @discord.ui.button(
+        label="Cancel my report", style=discord.ButtonStyle.danger,
+        emoji="↩️",
+    )
+    async def undo(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        ok = await db.cancel_match_report(self.match_id, interaction.user.id)
+        if not ok:
+            await interaction.response.edit_message(
+                content=("Too late — the loser already confirmed or "
+                         "disputed. Ask the organizer if you need a fix."),
+                view=None,
+            )
+            return
+        # Delete the public request message if we can find it.
+        match = await db.get_match(self.match_id)
+        if match and match["report_message_id"]:
+            tournament = await db.get_tournament(match["tournament_id"])
+            if tournament and tournament["signup_channel_id"]:
+                channel = interaction.client.get_channel(
+                    tournament["signup_channel_id"])
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        msg = await channel.fetch_message(
+                            match["report_message_id"])
+                        await msg.delete()
+                    except (discord.NotFound, discord.Forbidden,
+                            discord.HTTPException):
+                        pass
+        await interaction.response.edit_message(
+            content="✅ Report cancelled. Match is back in PENDING.",
+            view=None,
+        )
+
+
+# ---- Flow functions ------------------------------------------------------- #
+
+async def _flow_report_win_start(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    member = interaction.user
+    if guild is None or not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "Server-only.", ephemeral=True, delete_after=8)
+        return
+
+    matches = await db.list_pending_matches_for_user_in_guild(
+        guild.id, member.id)
+    if not matches:
+        await interaction.response.send_message(
+            "You don't have any pending matches right now. If you think "
+            "this is wrong, ping the organizer.",
+            ephemeral=True, delete_after=15,
+        )
+        return
+
+    if len(matches) == 1:
+        await _flow_confirm_opponent(interaction, matches[0])
+        return
+
+    # Multiple tournaments in flight: enrich each match option with the
+    # opponent's display name for the select-menu description.
+    enriched: list[dict] = []
+    for m in matches:
+        opp_id = (m["player_b_id"] if m["player_a_id"] == member.id
+                  else m["player_a_id"])
+        opp = await db.get_participant(m["tournament_id"], opp_id) if opp_id else None
+        enriched.append({
+            "id": m["id"],
+            "tournament_name": m["tournament_name"],
+            "match_number": m["match_number"],
+            "round_number": m["round_number"],
+            "player_a_id": m["player_a_id"],
+            "player_b_id": m["player_b_id"],
+            "viewer_id": member.id,
+            "opponent_display": opp["display_name"] if opp else f"user {opp_id}",
+        })
+    view = MatchPickerView(enriched)
+    await interaction.response.send_message(
+        "Pick the match you won:", view=view, ephemeral=True,
+    )
+
+
+async def _flow_confirm_opponent(
+    interaction: discord.Interaction, match,
+) -> None:
+    user_id = interaction.user.id
+    if user_id not in (match["player_a_id"], match["player_b_id"]):
+        await interaction.response.send_message(
+            "You're not a participant in that match.", ephemeral=True,
+            delete_after=10,
+        )
+        return
+    opp_id = (match["player_b_id"] if match["player_a_id"] == user_id
+              else match["player_a_id"])
+    opp = await db.get_participant(match["tournament_id"], opp_id) if opp_id else None
+    opp_name = opp["display_name"] if opp else f"user {opp_id}"
+    tournament = await db.get_tournament(match["tournament_id"])
+
+    embed = discord.Embed(
+        title=f"Confirm: you beat {opp_name}?",
+        description=(
+            f"**{tournament['name']} · Match {match['match_number']}**\n"
+            f"Round {match['round_number']}\n\n"
+            f"Clicking **Yes** pings <@{opp_id}> to confirm or dispute.\n"
+            "You'll have **60 seconds** to cancel if you picked the wrong match."
+        ),
+        color=discord.Color.red(),
+    )
+
+    view = ConfirmReportView(match_id=match["id"])
+    # If we got here from a select menu (already has an ephemeral
+    # response open), edit it; otherwise send a fresh ephemeral.
+    if interaction.response.is_done():
+        await interaction.edit_original_response(embed=embed, view=view, content=None)
+    else:
+        await interaction.response.send_message(
+            embed=embed, view=view, ephemeral=True,
+        )
+
+
+async def _flow_execute_report(
+    interaction: discord.Interaction, match_id: int,
+) -> None:
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message(
+            "Server-only.", ephemeral=True, delete_after=8)
+        return
+
+    match = await db.get_match(match_id)
+    if match is None:
+        await interaction.response.edit_message(
+            content="Match not found.", view=None, embed=None)
+        return
+    if match["state"] != "PENDING":
+        await interaction.response.edit_message(
+            content="That match was already reported by someone else.",
+            view=None, embed=None)
+        return
+    if member.id not in (match["player_a_id"], match["player_b_id"]):
+        await interaction.response.edit_message(
+            content="You're not a participant in that match.",
+            view=None, embed=None)
+        return
+
+    opp_id = (match["player_b_id"] if match["player_a_id"] == member.id
+              else match["player_a_id"])
+    if opp_id is None:
+        # Bye — shouldn't happen since byes are CONFIRMED at pairing,
+        # but belt-and-braces.
+        await interaction.response.edit_message(
+            content="That match is a bye, nothing to report.",
+            view=None, embed=None)
+        return
+
+    now = _now_iso()
+    ok = await db.report_match_win(match_id, member.id, member.id, now)
+    if not ok:
+        await interaction.response.edit_message(
+            content="Someone else already reported that match.",
+            view=None, embed=None)
+        return
+
+    tournament = await db.get_tournament(match["tournament_id"])
+    channel = interaction.client.get_channel(tournament["signup_channel_id"])
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.edit_message(
+            content="Couldn't find the tournament channel to post in.",
+            view=None, embed=None)
+        return
+
+    msg_content = (
+        f"⚔️ <@{member.id}> reported a **win** over <@{opp_id}> in "
+        f"**{tournament['name']} · Match {match['match_number']}** "
+        f"(Round {match['round_number']}).\n\n"
+        f"<@{opp_id}> — **Confirm** if correct, **Dispute** if not.\n"
+        "Dispute routes to the organizer for a manual call."
+    )
+    try:
+        posted = await channel.send(
+            msg_content,
+            view=MatchReportPublicView(),
+            allowed_mentions=discord.AllowedMentions(
+                users=[discord.Object(opp_id)], roles=False, everyone=False,
+            ),
+        )
+    except discord.HTTPException as e:
+        # Roll back the state transition — the DB-visible report without
+        # a loser-facing message would be a ghost.
+        await db.cancel_match_report(match_id, member.id)
+        await interaction.response.edit_message(
+            content=f"Failed to post the confirm message: {e}. "
+                    "Report cancelled — try again.",
+            view=None, embed=None)
+        return
+
+    await db.set_match_report_message(match_id, posted.id)
+
+    audit_fields = [
+        ("Tournament", tournament["name"], True),
+        ("Match", f"R{match['round_number']} · #{match['match_number']}", True),
+        ("Reporter → Winner", f"<@{member.id}>", True),
+        ("Loser (awaiting confirm)", f"<@{opp_id}>", True),
+    ]
+    await audit.post_event(
+        interaction.guild,
+        title="Tournament · result reported",
+        color=discord.Color.red(),
+        fields=audit_fields,
+    )
+
+    await interaction.response.edit_message(
+        content=(
+            f"✅ Report filed. <@{opp_id}> has {REPORTER_CANCEL_WINDOW_SECONDS}s "
+            "to confirm or dispute publicly.\n\n"
+            "Picked the wrong match? Click **Cancel my report** within "
+            f"{REPORTER_CANCEL_WINDOW_SECONDS} seconds."
+        ),
+        view=ReporterCancelView(match_id),
+        embed=None,
+    )
+
+
+async def _flow_loser_confirm(interaction: discord.Interaction) -> None:
+    msg = interaction.message
+    if msg is None:
+        return
+    match = await db.get_match_by_report_message(msg.id)
+    if match is None or match["state"] != "REPORTED":
+        await interaction.response.send_message(
+            "This match isn't awaiting confirmation anymore.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    user_id = interaction.user.id
+    if user_id == match["reporter_id"]:
+        await interaction.response.send_message(
+            "You can't confirm your own win — your opponent confirms.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    if user_id not in (match["player_a_id"], match["player_b_id"]):
+        await interaction.response.send_message(
+            "Only the two players in this match can act.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+
+    ok = await db.confirm_match_report(match["id"])
+    if not ok:
+        await interaction.response.send_message(
+            "State changed — refresh and try again.", ephemeral=True, delete_after=10,
+        )
+        return
+
+    tournament = await db.get_tournament(match["tournament_id"])
+    winner = match["winner_id"]
+    loser = user_id
+    new_content = (
+        f"✅ **Match {match['match_number']} confirmed** "
+        f"({tournament['name']} · Round {match['round_number']}).\n"
+        f"Winner: <@{winner}>. Confirmed by <@{loser}>."
+    )
+    try:
+        await msg.edit(content=new_content, view=None)
+    except discord.HTTPException:
+        pass
+    await interaction.response.defer()
+
+    await audit.post_event(
+        interaction.guild,
+        title="Tournament · result confirmed",
+        color=discord.Color.green(),
+        fields=[
+            ("Tournament", tournament["name"], True),
+            ("Match", f"R{match['round_number']} · #{match['match_number']}", True),
+            ("Winner", f"<@{winner}>", True),
+            ("Confirmed by", f"<@{loser}>", True),
+        ],
+    )
+
+
+async def _flow_loser_dispute(interaction: discord.Interaction) -> None:
+    msg = interaction.message
+    if msg is None:
+        return
+    match = await db.get_match_by_report_message(msg.id)
+    if match is None or match["state"] != "REPORTED":
+        await interaction.response.send_message(
+            "This match isn't awaiting confirmation anymore.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    user_id = interaction.user.id
+    if user_id == match["reporter_id"]:
+        await interaction.response.send_message(
+            "You can't dispute your own claim.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+    if user_id not in (match["player_a_id"], match["player_b_id"]):
+        await interaction.response.send_message(
+            "Only the two players in this match can act.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+
+    ok = await db.dispute_match_report(match["id"])
+    if not ok:
+        await interaction.response.send_message(
+            "State changed — refresh and try again.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+
+    tournament = await db.get_tournament(match["tournament_id"])
+    a_id = match["player_a_id"]
+    b_id = match["player_b_id"]
+    reporter_id = match["reporter_id"]
+    disputer_id = user_id
+    new_content = (
+        f"⚠️ **Match {match['match_number']} disputed** "
+        f"({tournament['name']} · Round {match['round_number']}).\n"
+        f"<@{reporter_id}> claimed the win; <@{disputer_id}> disagreed.\n\n"
+        f"**Organizer call:** who won — <@{a_id}> (A) or <@{b_id}> (B)?"
+    )
+    try:
+        await msg.edit(content=new_content, view=DisputeResolveView())
+    except discord.HTTPException:
+        pass
+    await interaction.response.defer()
+
+    await audit.post_event(
+        interaction.guild,
+        title="Tournament · result DISPUTED",
+        color=discord.Color.orange(),
+        fields=[
+            ("Tournament", tournament["name"], True),
+            ("Match", f"R{match['round_number']} · #{match['match_number']}", True),
+            ("Claimed by", f"<@{reporter_id}>", True),
+            ("Disputed by", f"<@{disputer_id}>", True),
+        ],
+    )
+
+
+async def _flow_organizer_resolve(
+    interaction: discord.Interaction, side: str,
+) -> None:
+    msg = interaction.message
+    if msg is None:
+        return
+    match = await db.get_match_by_report_message(msg.id)
+    if match is None or match["state"] != "DISPUTED":
+        await interaction.response.send_message(
+            "This match isn't awaiting resolution.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+
+    winner_id = (match["player_a_id"] if side == "a"
+                 else match["player_b_id"])
+    if winner_id is None:
+        await interaction.response.send_message(
+            "Can't resolve a match with no player on that side.",
+            ephemeral=True, delete_after=10,
+        )
+        return
+
+    await db.resolve_disputed_match(match["id"], winner_id, _now_iso())
+
+    tournament = await db.get_tournament(match["tournament_id"])
+    new_content = (
+        f"✅ **Match {match['match_number']} resolved by organizer.**\n"
+        f"{tournament['name']} · Round {match['round_number']}\n"
+        f"Winner: <@{winner_id}> · Decided by {interaction.user.mention}."
+    )
+    try:
+        await msg.edit(content=new_content, view=None)
+    except discord.HTTPException:
+        pass
+    await interaction.response.defer()
+
+    await audit.post_event(
+        interaction.guild,
+        title="Tournament · dispute resolved",
+        color=discord.Color.green(),
+        fields=[
+            ("Tournament", tournament["name"], True),
+            ("Match", f"R{match['round_number']} · #{match['match_number']}", True),
+            ("Winner", f"<@{winner_id}>", True),
+            ("Organizer", interaction.user.mention, True),
+        ],
+    )
 
 
 async def setup(bot: commands.Bot) -> None:

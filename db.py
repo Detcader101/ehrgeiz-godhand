@@ -127,19 +127,28 @@ CREATE TABLE IF NOT EXISTS tournament_participants (
 CREATE INDEX IF NOT EXISTS idx_participants_tournament
     ON tournament_participants(tournament_id);
 
--- Round pairings. Slice 1.5 uses this to persist round-1 pairings so the
--- bracket survives a restart even before /report-win lands. winner_id is
--- pre-filled for byes (player_b_id IS NULL and winner_id = player_a_id);
--- otherwise NULL until reported.
+-- Round pairings. Slice 2 adds a state machine on top of the raw
+-- (winner_id, reported_at) pair that slice 1 shipped with.
+--   state:  PENDING   → no result yet
+--           REPORTED  → winner claimed, waiting for loser to confirm
+--           DISPUTED  → loser disagreed, awaiting organizer decision
+--           CONFIRMED → result locked; counts toward standings
+--   reporter_id: who clicked "I won" (so Confirm/Dispute buttons can
+--           verify the loser is the one clicking, not the winner).
+--   Byes: player_b_id IS NULL, winner_id = player_a_id, state = CONFIRMED
+--           (pre-set at pairing time — no report step needed).
 CREATE TABLE IF NOT EXISTS tournament_matches (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    tournament_id   INTEGER NOT NULL,
-    round_number    INTEGER NOT NULL,
-    match_number    INTEGER NOT NULL,
-    player_a_id     INTEGER,
-    player_b_id     INTEGER,
-    winner_id       INTEGER,
-    reported_at     TEXT,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    tournament_id       INTEGER NOT NULL,
+    round_number        INTEGER NOT NULL,
+    match_number        INTEGER NOT NULL,
+    player_a_id         INTEGER,
+    player_b_id         INTEGER,
+    winner_id           INTEGER,
+    reporter_id         INTEGER,
+    state               TEXT    NOT NULL DEFAULT 'PENDING',
+    reported_at         TEXT,
+    report_message_id   INTEGER,
     FOREIGN KEY (tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
 );
 
@@ -164,7 +173,40 @@ CREATE TABLE IF NOT EXISTS guild_rank_emojis (
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        # One-shot migrations for columns added after initial release.
+        # SQLite's CREATE TABLE IF NOT EXISTS doesn't alter existing
+        # tables, so new columns go here — wrapped so re-runs are
+        # idempotent.
+        await _safe_add_column(
+            db, "tournament_matches", "state",
+            "TEXT NOT NULL DEFAULT 'PENDING'",
+        )
+        await _safe_add_column(
+            db, "tournament_matches", "reporter_id", "INTEGER",
+        )
+        await _safe_add_column(
+            db, "tournament_matches", "report_message_id", "INTEGER",
+        )
+        # Back-fill state for rows from before the column existed: any
+        # row with a winner was effectively CONFIRMED (it predates the
+        # state machine entirely).
+        await db.execute(
+            "UPDATE tournament_matches SET state = 'CONFIRMED' "
+            "WHERE state = 'PENDING' AND winner_id IS NOT NULL"
+        )
         await db.commit()
+
+
+async def _safe_add_column(
+    db: aiosqlite.Connection, table: str, column: str, coltype: str,
+) -> None:
+    try:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+    except aiosqlite.OperationalError as e:
+        # aiosqlite surfaces 'duplicate column name' for the re-run
+        # case; anything else is a real error and should propagate.
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
 async def get_player_by_discord(discord_id: int):
@@ -622,27 +664,239 @@ async def create_matches(
     tournament_id: int,
     round_number: int,
     matches: list[tuple[int | None, int | None, int | None]],
+    now_iso: str | None = None,
 ) -> None:
     """Bulk-insert pairings for a round. Each tuple is
     (player_a_id, player_b_id, winner_id) in match order — match_number is
-    the list index + 1. winner_id should be set for byes, None otherwise."""
+    the list index + 1. Byes get state='CONFIRMED' inline (no report
+    step needed); regular matches start PENDING."""
     if not matches:
         return
-    rows = [
-        (tournament_id, round_number, i + 1, a, b, w, None)
-        for i, (a, b, w) in enumerate(matches)
-    ]
+    rows: list[tuple] = []
+    for i, (a, b, w) in enumerate(matches):
+        is_bye = a is None or b is None
+        state = "CONFIRMED" if is_bye else "PENDING"
+        reported_at = now_iso if is_bye else None
+        rows.append((
+            tournament_id, round_number, i + 1,
+            a, b, w, state, reported_at,
+        ))
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executemany(
             """
             INSERT INTO tournament_matches
                 (tournament_id, round_number, match_number,
-                 player_a_id, player_b_id, winner_id, reported_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 player_a_id, player_b_id, winner_id, state, reported_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         await db.commit()
+
+
+async def get_match(match_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournament_matches WHERE id = ?", (match_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def get_match_by_report_message(message_id: int):
+    """Find a match by the public 'confirm or dispute' message_id we
+    posted for it — how persistent view button callbacks route back to
+    the right match after a bot restart."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournament_matches WHERE report_message_id = ?",
+            (message_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def find_pending_match_for_user(tournament_id: int, user_id: int):
+    """Find the PENDING match this user is a participant in (for the
+    'Report a Win' match-picker). Excludes byes (already CONFIRMED),
+    excludes matches already in REPORTED / DISPUTED / CONFIRMED state."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM tournament_matches
+            WHERE tournament_id = ? AND state = 'PENDING'
+              AND (player_a_id = ? OR player_b_id = ?)
+            ORDER BY round_number DESC, match_number ASC
+            """,
+            (tournament_id, user_id, user_id),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def set_match_report_message(match_id: int, message_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournament_matches SET report_message_id = ? WHERE id = ?",
+            (message_id, match_id),
+        )
+        await db.commit()
+
+
+async def report_match_win(
+    match_id: int, reporter_id: int, winner_id: int, now_iso: str,
+) -> bool:
+    """PENDING → REPORTED. Returns True on success, False if the match
+    isn't in PENDING state (someone beat us to the claim, or admin
+    already set a result)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE tournament_matches
+            SET state = 'REPORTED', reporter_id = ?, winner_id = ?, reported_at = ?
+            WHERE id = ? AND state = 'PENDING'
+            """,
+            (reporter_id, winner_id, now_iso, match_id),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def cancel_match_report(match_id: int, reporter_id: int) -> bool:
+    """REPORTED → PENDING. Only the original reporter can undo, and only
+    while the match is still REPORTED (loser hasn't touched it yet)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE tournament_matches
+            SET state = 'PENDING', reporter_id = NULL, winner_id = NULL, reported_at = NULL
+            WHERE id = ? AND state = 'REPORTED' AND reporter_id = ?
+            """,
+            (match_id, reporter_id),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def confirm_match_report(match_id: int) -> bool:
+    """REPORTED → CONFIRMED. Caller is expected to be the loser; the
+    check happens at the cog layer (looks up the non-reporter participant)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE tournament_matches
+            SET state = 'CONFIRMED'
+            WHERE id = ? AND state = 'REPORTED'
+            """,
+            (match_id,),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def dispute_match_report(match_id: int) -> bool:
+    """REPORTED → DISPUTED."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE tournament_matches SET state = 'DISPUTED'
+            WHERE id = ? AND state = 'REPORTED'
+            """,
+            (match_id,),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def resolve_disputed_match(
+    match_id: int, winner_id: int, now_iso: str,
+) -> bool:
+    """DISPUTED → CONFIRMED with organizer's chosen winner."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            UPDATE tournament_matches
+            SET state = 'CONFIRMED', winner_id = ?, reported_at = ?
+            WHERE id = ? AND state = 'DISPUTED'
+            """,
+            (winner_id, now_iso, match_id),
+        )
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def override_match_result(
+    match_id: int, winner_id: int, now_iso: str,
+) -> None:
+    """Any state → CONFIRMED. Used by /tournament-set-result — the
+    organizer's escape hatch when something went wrong earlier."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE tournament_matches
+            SET state = 'CONFIRMED', winner_id = ?, reported_at = ?
+            WHERE id = ?
+            """,
+            (winner_id, now_iso, match_id),
+        )
+        await db.commit()
+
+
+async def list_matches_for_tournament(tournament_id: int):
+    """All matches across all rounds — used for Buchholz scoring and
+    the final standings render."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM tournament_matches
+            WHERE tournament_id = ?
+            ORDER BY round_number, match_number
+            """,
+            (tournament_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def list_pending_matches_for_user_in_guild(
+    guild_id: int, user_id: int,
+):
+    """PENDING matches the user is a participant in, across every
+    IN_PROGRESS tournament in the guild. Used by the Report-a-Win
+    match picker — if 0 matches, the button bails; if 1, we proceed
+    direct; if 2+, we show a select menu."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT m.*, t.name AS tournament_name,
+                   t.match_format AS tournament_format
+            FROM tournament_matches m
+            JOIN tournaments t ON t.id = m.tournament_id
+            WHERE t.guild_id = ? AND t.state = 'IN_PROGRESS'
+              AND m.state = 'PENDING'
+              AND (m.player_a_id = ? OR m.player_b_id = ?)
+            ORDER BY t.id, m.round_number DESC, m.match_number
+            """,
+            (guild_id, user_id, user_id),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def is_round_complete(tournament_id: int, round_number: int) -> bool:
+    """A round is 'complete' once every match in it has state=CONFIRMED
+    (byes pre-count as CONFIRMED). Used to decide whether to auto-advance."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM tournament_matches
+            WHERE tournament_id = ? AND round_number = ?
+              AND state != 'CONFIRMED'
+            """,
+            (tournament_id, round_number),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row[0] or 0) == 0
 
 
 async def delete_fake_players() -> int:
