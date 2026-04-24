@@ -31,6 +31,7 @@ from discord.ext import commands
 
 import audit
 import db
+import view_util
 
 log = logging.getLogger(__name__)
 
@@ -95,16 +96,7 @@ class Moderation(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,
     ) -> None:
-        cmd = interaction.command.name if interaction.command else "<unknown>"
-        log.exception("Slash command /%s raised: %s", cmd, error)
-        msg = f"⚠ `/{cmd}` failed: `{type(error).__name__}: {error}`\n*Check the bot console for the traceback.*"
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except discord.HTTPException:
-            pass
+        await view_util.handle_app_command_error(interaction, error, log)
 
     @app_commands.command(
         name="shutup",

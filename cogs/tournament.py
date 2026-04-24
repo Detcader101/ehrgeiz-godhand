@@ -30,6 +30,7 @@ import media
 import tournament_render
 import wavu
 from cogs.onboarding import VERIFIED_ROLE_NAME
+import view_util
 from view_util import ErrorHandledView
 
 # Name → ordinal lookup for seeding. Built once at import time.
@@ -717,17 +718,7 @@ class Tournament(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,
     ) -> None:
-        cmd_name = interaction.command.name if interaction.command else "<unknown>"
-        log.exception("Slash command /%s raised: %s", cmd_name, error)
-        msg = (f"⚠ `/{cmd_name}` failed: `{type(error).__name__}: {error}`\n"
-               "*Check the bot console for the traceback.*")
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(msg, ephemeral=True)
-            else:
-                await interaction.response.send_message(msg, ephemeral=True)
-        except discord.HTTPException:
-            pass
+        await view_util.handle_app_command_error(interaction, error, log)
 
     @app_commands.command(
         name="tournament-create",

@@ -251,25 +251,6 @@ async def render_roster(participants: list[dict]) -> io.BytesIO:
     RANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     CHAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    W = 880
-    COLS = 2
-    CARD_W = 404
-    CARD_H = 180
-    HEADER_H = 120
-    GAP = 16
-    PORTRAIT_W = 140
-    RANK_H = 110
-    NAME_H = CARD_H - RANK_H
-    CELL_PAD = 10
-    PORTRAIT_PAD = 2
-    CHIP_H = 40
-
-    # Cell background tints — the portrait cell stays slightly darker
-    # than the rank/name cells so the grid tiles read without hard
-    # borders.
-    PORTRAIT_CELL_BG = (24, 20, 22)
-    RIGHT_CELL_BG = ROW_BG_ALT
-
     # Pre-fetch all icons in one go (network session opened only if
     # cache misses — steady-state is fully offline).
     session: aiohttp.ClientSession | None = None
@@ -293,6 +274,38 @@ async def render_roster(participants: list[dict]) -> io.BytesIO:
     finally:
         if session is not None:
             await session.close()
+
+    # Pillow compose runs off-loop — a full roster can take hundreds of
+    # ms and would otherwise block the gateway heartbeat during busy
+    # signups (every Join/Leave click re-renders).
+    return await asyncio.to_thread(
+        _compose_roster_png, participants, rank_icons, char_icons,
+    )
+
+
+def _compose_roster_png(
+    participants: list[dict],
+    rank_icons: list[Image.Image | None],
+    char_icons: list[Image.Image | None],
+) -> io.BytesIO:
+    W = 880
+    COLS = 2
+    CARD_W = 404
+    CARD_H = 180
+    HEADER_H = 120
+    GAP = 16
+    PORTRAIT_W = 140
+    RANK_H = 110
+    NAME_H = CARD_H - RANK_H
+    CELL_PAD = 10
+    PORTRAIT_PAD = 2
+    CHIP_H = 40
+
+    # Cell background tints — the portrait cell stays slightly darker
+    # than the rank/name cells so the grid tiles read without hard
+    # borders.
+    PORTRAIT_CELL_BG = (24, 20, 22)
+    RIGHT_CELL_BG = ROW_BG_ALT
 
     rows = max(1, (len(participants) + COLS - 1) // COLS)
     H = HEADER_H + GAP + rows * (CARD_H + GAP) + GAP
@@ -1024,6 +1037,21 @@ async def render_bracket(
             all_players.append(m["player_b"])
     rank_lookup, char_lookup = await _prefetch_icons_for_players(all_players)
 
+    # Pillow compose runs off-loop — a full bracket can take ~500ms and
+    # would otherwise stall every interaction during a round post.
+    return await asyncio.to_thread(
+        _compose_bracket_png,
+        tournament_name, round_number, matches, rank_lookup, char_lookup,
+    )
+
+
+def _compose_bracket_png(
+    tournament_name: str,
+    round_number: int,
+    matches: list[dict],
+    rank_lookup: dict,
+    char_lookup: dict,
+) -> io.BytesIO:
     height = (
         BRACKET_HEADER_H + BRACKET_SIDE_PAD
         + len(matches) * (BRACKET_MATCH_H + BRACKET_MATCH_GAP)
