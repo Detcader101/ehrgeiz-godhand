@@ -76,13 +76,13 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 
 ## Current state
 
-All committed + pushed to `main`. Tournament slice 2 is complete (full Swiss end-to-end). Next priorities in order:
+All committed + pushed to `main`. Tournament slice 2 is complete (full Swiss end-to-end). Bot is **live in prod** on shed-tekken (CT 104, see `../shednet/tekken-bot/`) — deploys auto-update from `origin/main` every ~2 min via systemd timer, and post a Deploy embed to `#🛡️-mod-log` on first `on_ready`. Mandatory-verification onboarding shipped (`#👋-welcome` is verified-only; rules + announcements stay public). Rank auto-refresh sweeper now runs in-process. Next priorities in order:
 
 1. **Slice 3** — auto-provisioned per-tournament category + invite-only per-match voice channels.
 2. **Forum channels** for `#🎯-combos`, `#🆚-matchup-help`, `#🎬-clips-and-highlights`.
 3. **Rank-emoji integration** across more embeds (`/profile`, tournament signup roster text, state announcements).
 4. **Moderation expansion** — `/kick`, `/ban`, `/timeout`, `/warn`, `/warnings`, `/purge` per SPEC.md §9.
-5. **Hosting prep** for Jay's Proxmox homelab — systemd unit / docker / health endpoint.
+5. **Health endpoint** — small HTTP listener so Kuma can probe the bot itself (currently it watches `node_exporter:9100`, which catches host-down but not a bot crashloop with the host alive). Closes the last v1.0 op gap from `SPEC.md` §7.2.
 
 ## Non-obvious gotchas
 
