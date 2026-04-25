@@ -51,6 +51,12 @@ class ChannelSpec:
     # access (e.g. #verification-log inside Staff, but Organizers must also
     # see + click the Confirm/Reject buttons there).
     extra_access_roles: list[str] = field(default_factory=list)
+    # Per-channel Verified gate. Used when the parent category is public
+    # but a specific channel needs to be hidden from unverified members —
+    # e.g. #welcome inside Info, where the banner copy is "you made it
+    # past the gate" and only makes sense post-verify. Overrides inherited
+    # category perms with an explicit channel overwrite.
+    verified_only: bool = False
 
 
 @dataclass
@@ -69,15 +75,29 @@ class CategorySpec:
 # channel_util.find_text_channel, which matches both the bare and the
 # emoji-prefixed form so existing installs don't shatter when renaming.
 SERVER_PLAN: list[CategorySpec] = [
-    # Info is public — sits at the top so joining users see the route
-    # to verify (rules + player-hub) before anything else.
+    # Info is the public funnel: rules + announcements stay visible to
+    # @everyone so newcomers can read what the server is about before
+    # deciding to link a Polaris ID. Verify is therefore a *focus* gate,
+    # not an information gate — clicking it enables matchmaking + rank
+    # roles, it doesn't grant read access.
+    #
+    # #👋-welcome is the only verified-only channel here — its banner copy
+    # is "you made it past the gate" and only makes sense post-verify.
+    # #🎴-player-hub sits last so it's adjacent to the gated categories
+    # below; the visual flow for unverified users is read-the-rules →
+    # click-Verify → sidebar unlocks the rest.
     CategorySpec("📋 Info", [
+        ChannelSpec("👋-welcome", "text",
+                    "👋 Welcome (verified-only — post-verify landing).",
+                    verified_only=True),
         ChannelSpec("📜-rules", "text",
-                    "📜 Server rules. Breaking them gets you warned, timed out, or banned."),
+                    "📜 Server rules. Breaking them gets you warned, "
+                    "timed out, or banned."),
         ChannelSpec("📣-announcements", "text",
                     "📣 Server-wide announcements. Staff-only posting."),
         ChannelSpec("🎴-player-hub", "text",
-                    "🎴 Your account, ranks, and profile. Click the buttons."),
+                    "🎴 START HERE. Click Verify to link your Tekken ID "
+                    "and unlock matchmaking + rank roles."),
     ]),
     # Matchmaking sits above chat categories deliberately — this server
     # is UK/EU-focused and its primary reason to exist is getting people
@@ -177,6 +197,27 @@ class BannerSpec:
 
 BANNER_PLAN: list[BannerSpec] = [
     # ---- Info ---- #
+    # #👋-welcome is now verified-only — only readers that already passed
+    # the gate see this banner, so the copy talks to a new-but-verified
+    # member rather than a pre-verify onboarding prompt.
+    BannerSpec(
+        channel_name="welcome", kind="banner_welcome",
+        kicker="You're in", title="Welcome to Ehrgeiz",
+        subtitle="A UK/EU home for Tekken 8",
+        body=(
+            "## You made it past the gate\n"
+            "Your Tekken ID is linked and your rank role is live.\n"
+            "\n"
+            "## Where to go next\n"
+            "• #matchmaking-eu — find games in your region\n"
+            "• #general — hang out with the crowd\n"
+            "• #tournaments — join the next bracket\n"
+            "\n"
+            "## Keeping your rank fresh\n"
+            "Your rank auto-refreshes in the background. To force an\n"
+            "update, hit Refresh Rank in #player-hub."
+        ),
+    ),
     BannerSpec(
         channel_name="rules", kind="banner_rules",
         kicker="Welcome", title="House Rules",
@@ -188,8 +229,13 @@ BANNER_PLAN: list[BannerSpec] = [
             "## Tekken talk\n"
             "Hype is good. Tilt is fine. Slurs are not.\n"
             "\n"
+            "## Handles and identity\n"
+            "One Tekken ID per Discord account. No impersonation.\n"
+            "High-rank claims are organizer-reviewed.\n"
+            "\n"
             "## Onboarding\n"
-            "Verify your Tekken ID in #player-hub to unlock the server.\n"
+            "Verify your Tekken ID in #player-hub to unlock matchmaking "
+            "and your rank role.\n"
             "\n"
             "## Consequences\n"
             "Warn > timeout > ban. Mods' call is final."
@@ -515,6 +561,31 @@ def _category_overwrites(
         if mod_role:
             overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
         overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True)
+    return overwrites
+
+
+def _channel_verified_only_overwrites(
+    guild: discord.Guild,
+    admin_role: discord.Role | None,
+    mod_role: discord.Role | None,
+    verified_role: discord.Role | None,
+) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+    """Permission overwrite dict for a single channel gated behind Verified,
+    regardless of its parent category's permissions. Used inside the public
+    Info category for #👋-welcome, whose post-verify banner copy doesn't
+    make sense to unverified arrivals. Same shape as the verified-only
+    branch of _category_overwrites — extracted so tests can assert on it
+    without building a CategorySpec."""
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if verified_role:
+        overwrites[verified_role] = discord.PermissionOverwrite(view_channel=True)
+    if admin_role:
+        overwrites[admin_role] = discord.PermissionOverwrite(view_channel=True)
+    if mod_role:
+        overwrites[mod_role] = discord.PermissionOverwrite(view_channel=True)
+    overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True)
     return overwrites
 
 
@@ -877,6 +948,33 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
                     except (discord.Forbidden, discord.HTTPException) as e:
                         report.errors.append(
                             f"Channel '{ch_spec.name}' grant {role_name}: {e}"
+                        )
+
+            # Per-channel verified_only gate (mandatory-verification onboarding
+            # §5.5). Applied AFTER creation so both newly-created and existing
+            # channels get the overwrites — this makes re-running /setup-server
+            # a safe way to tighten permissions after toggling the flag in
+            # SERVER_PLAN. Resolving `target` against the current `existing`
+            # because a fresh create returned None for voice channels above.
+            if ch_spec.verified_only:
+                target = (
+                    new_channel
+                    if new_channel is not None
+                    else discord.utils.get(guild.channels, name=ch_spec.name)
+                )
+                if target is not None:
+                    ch_overwrites = _channel_verified_only_overwrites(
+                        guild, admin_role, mod_role, verified_role,
+                    )
+                    try:
+                        await target.edit(
+                            overwrites=ch_overwrites,
+                            reason="Ehrgeiz Godhand /setup-server "
+                                   "(channel-level verified gate)",
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        report.errors.append(
+                            f"Channel '{ch_spec.name}' verified-gate: {e}"
                         )
 
     return report
@@ -1568,11 +1666,8 @@ class _ConfirmPurgeView(ErrorHandledView):
                         audit_source="/reset-server",
                     )
                 except Exception:
-                    log.exception(
-                        "[reset-server] guild=%s resync failed (rebuild "
-                        "succeeded — admin can run /admin-resync-all to "
-                        "retry)", guild.id,
-                    )
+                    log.exception("[reset-server] guild=%s phase=resync_failed",
+                                  guild.id)
                 await interaction.edit_original_response(
                     content=None,
                     embed=_combined_report_embed(report, build),
