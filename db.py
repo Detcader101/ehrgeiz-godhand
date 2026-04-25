@@ -227,6 +227,19 @@ async def get_player_by_tekken_id(tekken_id: str):
             return await cur.fetchone()
 
 
+async def list_all_players():
+    # Oldest last_synced first — the rank sweeper processes stale rows
+    # before fresh ones, so on a 12h cadence the never-touched players
+    # catch up before repeatedly re-syncing active ones. Schema has
+    # last_synced NOT NULL so there's no NULL case to worry about.
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM players ORDER BY last_synced ASC"
+        ) as cur:
+            return await cur.fetchall()
+
+
 async def upsert_player(
     discord_id: int,
     tekken_id: str,

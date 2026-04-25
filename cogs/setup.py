@@ -32,6 +32,7 @@ from cogs.onboarding import (
     PlayerHubView,
     _player_hub_banner_file,
     _player_hub_embed,
+    resync_all_players,
 )
 from cogs.tournament import TournamentsPanelView
 from cogs.matchmaking import LFGPanelView
@@ -1552,6 +1553,26 @@ class _ConfirmPurgeView(ErrorHandledView):
                     interaction.client, guild, build,
                 )
                 await _post_channel_banners(guild, build)
+                # /reset-server just deleted the Verified role along with
+                # everything else, so every previously-linked player lost
+                # their roles. Replay the cached DB values to re-grant
+                # Verified + rank role right away — no clicks needed.
+                # api_refresh=False so we don't pile hundreds of
+                # wavu/ewgf lookups onto the rebuild; the rank sweeper
+                # will catch up fresh rank data on its next tick.
+                log.info("[reset-server] guild=%s phase=resync_start", guild.id)
+                try:
+                    await resync_all_players(
+                        guild,
+                        api_refresh=False,
+                        audit_source="/reset-server",
+                    )
+                except Exception:
+                    log.exception(
+                        "[reset-server] guild=%s resync failed (rebuild "
+                        "succeeded — admin can run /admin-resync-all to "
+                        "retry)", guild.id,
+                    )
                 await interaction.edit_original_response(
                     content=None,
                     embed=_combined_report_embed(report, build),

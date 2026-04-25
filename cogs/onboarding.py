@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import audit
+import channel_util
 import db
 import ewgf
 import media
@@ -35,6 +36,30 @@ RELINK_COOLDOWN = timedelta(days=7)
 PENDING_THRESHOLD_RANK = "Tekken King"
 PENDING_EXPIRY = timedelta(hours=72)
 PENDING_SWEEP_INTERVAL = timedelta(hours=1)
+
+# Rank sweeper cadence. The sweeper wakes up every RANK_SWEEP_INTERVAL
+# and walks every linked player; per-player API hits are skipped if the
+# row was already refreshed within RANK_SWEEP_SKIP_IF_SYNCED_WITHIN so
+# we don't hammer wavu/ewgf. Both are overridable via env var so an
+# admin can tune API load without a code change.
+RANK_SWEEP_INTERVAL = timedelta(
+    seconds=int(os.environ.get("RANK_SWEEP_INTERVAL_SECONDS", 12 * 3600)),
+)
+RANK_SWEEP_SKIP_IF_SYNCED_WITHIN = timedelta(
+    seconds=int(os.environ.get("RANK_SWEEP_SKIP_IF_SYNCED_WITHIN_SECONDS", 6 * 3600)),
+)
+# First sweep fires this many seconds after the bot reports ready — pushed
+# out so the Pending sweeper (15s offset) and slash-command sync settle
+# first. Env-overridable for dev: set to e.g. 5s when iterating on the
+# sweeper locally.
+RANK_SWEEP_STARTUP_DELAY = timedelta(
+    seconds=int(os.environ.get("RANK_SWEEP_STARTUP_DELAY_SECONDS", 45)),
+)
+
+# Per-member pacing: small sleep between Discord role edits so a resync
+# pass over 100+ members doesn't trip the guild-wide role-edit rate
+# limiter (the same one that whinged at us on /reset-server).
+_RESYNC_PER_MEMBER_DELAY = 0.25
 
 # Roles permitted to confirm/reject a pending verification.
 _RESOLVER_ROLES = {"Admin", "Moderator", ORGANIZER_ROLE_NAME}
@@ -199,19 +224,32 @@ async def _apply_rank_and_verified(member: discord.Member, profile: wavu.PlayerP
     verified = await _ensure_role(guild, VERIFIED_ROLE_NAME, reason="Onboarding")
 
     managed = _bot_managed_rank_names()
+    had_verified = any(r.id == verified.id for r in member.roles)
     if profile.rank_tier:
         rank_role = await _ensure_role(guild, profile.rank_tier, reason="Tekken rank sync")
         to_remove = [r for r in member.roles
                      if r.name in managed and r.id != rank_role.id]
+        removed_names = [r.name for r in to_remove]
         if to_remove:
             await member.remove_roles(*to_remove, reason="Rank re-sync")
         await member.add_roles(verified, rank_role, reason="Onboarding verified")
+        log.info(
+            "[roles] member=%s guild=%s action=apply rank=%r verified_was=%s "
+            "removed=%s",
+            member.id, guild.id, profile.rank_tier, had_verified, removed_names or "-",
+        )
     else:
         # No rank resolved — grant Verified only, strip any stale rank role.
         to_remove = [r for r in member.roles if r.name in managed]
+        removed_names = [r.name for r in to_remove]
         if to_remove:
             await member.remove_roles(*to_remove, reason="Rank cleared")
         await member.add_roles(verified, reason="Onboarding verified (no rank)")
+        log.info(
+            "[roles] member=%s guild=%s action=apply rank=- verified_was=%s "
+            "removed=%s",
+            member.id, guild.id, had_verified, removed_names or "-",
+        )
 
 
 async def _grant_verified_only(member: discord.Member, *, reason: str) -> None:
@@ -682,8 +720,11 @@ async def _flow_verify_start(interaction: discord.Interaction, bot: commands.Bot
 
 
 async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> None:
+    log.info("[refresh/user] user=%s guild=%s", interaction.user.id,
+             interaction.guild.id if interaction.guild else "-")
     row = await db.get_player_by_discord(interaction.user.id)
     if row is None:
+        log.info("[refresh/user] user=%s result=not-linked", interaction.user.id)
         await interaction.response.send_message(
             "You're not linked yet. Click **Verify** first.",
             ephemeral=True, delete_after=10,
@@ -693,6 +734,8 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     try:
         profile = await wavu.lookup_player(row["tekken_id"], force_refresh=True)
     except (wavu.PlayerNotFound, wavu.WavuError) as e:
+        log.warning("[refresh/user] user=%s tekken_id=%s wavu_err=%s",
+                    interaction.user.id, row["tekken_id"], e)
         await interaction.followup.send(f"{e}", ephemeral=True)
         return
 
@@ -984,6 +1027,253 @@ class PendingVerificationView(ErrorHandledView):
 
 
 # --------------------------------------------------------------------------- #
+# Auto-refresh — Interaction-free entry points                                 #
+# --------------------------------------------------------------------------- #
+#
+# `_flow_refresh` above is the interactive version: it defers an Interaction,
+# fetches fresh rank, updates DB + roles, and posts a followup. The functions
+# below are the same core logic with the Interaction bits stripped, so the
+# rank sweeper, on_member_join, /admin-resync-all, and /reset-server can all
+# share a single source of truth for "restore / refresh this player".
+
+async def restore_roles_from_db_cache(
+    member: discord.Member, row,
+) -> None:
+    """Re-grant Verified + the player's cached rank role using ONLY DB values
+    — no wavu/ewgf hit. Used when we just need to get someone's roles back
+    quickly (rejoin, post-/reset-server, etc.). Fresh rank lookup is the
+    rank sweeper's job.
+
+    Pending-verification guard (spec §5.3): if the player has a live
+    pending row, `_PendingSweeper._mark_one_stale` may have written their
+    *claimed* rank back into `players.rank_tier` for profile-display
+    purposes. Applying that rank would silently grant a role the
+    organizers never confirmed — a high-rank claim + 72h of organizer
+    inaction + a rejoin could net the user a Tekken Emperor role without
+    anyone approving. So we drop to Verified-only when a pending row
+    exists; the rank role can only be granted once the pending is
+    explicitly resolved (Confirm button) and the row deleted.
+    """
+    pending = await db.get_pending_by_discord(member.id)
+    if pending is not None:
+        await _grant_verified_only(
+            member, reason="Rejoin/resync — pending verification in flight",
+        )
+        return
+    profile = wavu.PlayerProfile(
+        tekken_id=row["tekken_id"],
+        display_name=row["display_name"],
+        main_char=row["main_char"],
+        rating_mu=row["rating_mu"],
+        rank_tier=row["rank_tier"],
+    )
+    await _apply_rank_and_verified(member, profile)
+
+
+async def refresh_player_from_api(
+    guild: discord.Guild,
+    member: discord.Member,
+    row,
+    *,
+    audit_source: str,
+) -> dict:
+    """Run the wavu → ewgf lookup, apply pending-verification rules, upsert
+    the players row, and re-apply roles. Returns a result dict for logging.
+
+    Status values:
+      - "rank-changed": rank tier differs from stored; roles updated, audit posted
+      - "pending":      new high-rank claim went to Pending Verification
+      - "ok":           no change, roles still re-applied
+      - "error":        wavu lookup or role edit failed; `reason` key explains
+    """
+    try:
+        profile = await wavu.lookup_player(row["tekken_id"], force_refresh=True)
+    except (wavu.PlayerNotFound, wavu.WavuError) as e:
+        return {"status": "error", "reason": f"wavu: {e}"}
+
+    await _upgrade_display_name(profile)
+    rank_name = await _resolve_rank(row["tekken_id"], force_refresh=True)
+
+    stored = row["rank_tier"]
+    stored_is_valid = stored in wavu.ALL_RANK_NAMES
+    # If the auto-detect fails but we have a valid stored rank, keep it —
+    # same conservative fallback as _flow_refresh's `elif stored_is_valid`.
+    new_tier = rank_name if rank_name is not None else (stored if stored_is_valid else None)
+
+    # Spec §5.3: only *new* high-rank claims trigger Pending Verification.
+    needs_pending = (
+        new_tier is not None
+        and new_tier != stored
+        and _requires_pending(new_tier)
+    )
+
+    if needs_pending:
+        # Post the pending request BEFORE updating the DB. If the audit
+        # channel is gone or Discord rejects the post, we want the old
+        # rank preserved in the DB — not blanked out. A retry on the
+        # next sweep will detect the same high-rank claim and try again
+        # against the old stored rank, which is the right behaviour.
+        await _start_pending_verification(
+            guild=guild, member=member,
+            tekken_id=profile.tekken_id,
+            rank_tier=new_tier,  # type: ignore[arg-type]
+            rank_source=audit_source,
+        )
+        profile.rank_tier = None  # withheld until organizer confirm
+        await db.upsert_player(
+            discord_id=member.id,
+            tekken_id=profile.tekken_id,
+            display_name=profile.display_name,
+            main_char=profile.main_char,
+            rating_mu=profile.rating_mu,
+            rank_tier=profile.rank_tier,
+            linked_by=row["linked_by"],
+            now_iso=_now_iso(),
+        )
+        return {"status": "pending", "rank": new_tier}
+
+    # Non-pending path: DB update + role apply happen together; a
+    # Forbidden on the role edit still leaves the DB in a sensible
+    # state (the rank is correct, the grant just didn't land).
+    profile.rank_tier = new_tier
+    await db.upsert_player(
+        discord_id=member.id,
+        tekken_id=profile.tekken_id,
+        display_name=profile.display_name,
+        main_char=profile.main_char,
+        rating_mu=profile.rating_mu,
+        rank_tier=profile.rank_tier,
+        linked_by=row["linked_by"],
+        now_iso=_now_iso(),
+    )
+
+    try:
+        await _apply_rank_and_verified(member, profile)
+    except discord.Forbidden:
+        return {"status": "error", "reason": "role hierarchy"}
+
+    if new_tier is not None and new_tier != stored:
+        await audit.post_event(
+            guild,
+            title="Rank changed",
+            color=discord.Color.gold(),
+            fields=[
+                ("Discord", f"{member.mention} (`{member.id}`)", True),
+                ("Tekken ID", f"`{profile.tekken_id}`", True),
+                ("From", stored or "—", True),
+                ("To", new_tier, True),
+                ("Trigger", audit_source, True),
+            ],
+        )
+        return {"status": "rank-changed", "from": stored, "to": new_tier}
+    return {"status": "ok"}
+
+
+async def resync_all_players(
+    guild: discord.Guild,
+    *,
+    api_refresh: bool,
+    force: bool = False,
+    skip_if_synced_within: timedelta | None = None,
+    audit_source: str = "auto-resync",
+) -> dict:
+    """Walk every linked player row and re-apply their roles.
+
+    api_refresh=False — restore cached Verified + rank role only, no API hit.
+                        Cheap enough to run over hundreds of members.
+    api_refresh=True  — re-run wavu/ewgf lookup per player; picks up rank
+                        changes and promotes to Pending for high-rank jumps.
+
+    force=True ignores skip_if_synced_within. Used by /admin-resync-all."""
+    rows = await db.list_all_players()
+    log.info(
+        "[resync] guild=%s starting rows=%d api_refresh=%s force=%s "
+        "skip_if_synced_within=%ss source=%r",
+        guild.id, len(rows), api_refresh, force,
+        int(skip_if_synced_within.total_seconds()) if skip_if_synced_within else "-",
+        audit_source,
+    )
+    results = {
+        "total": 0,
+        "restored": 0,
+        "rank_changed": 0,
+        "pending": 0,
+        "skipped_not_in_guild": 0,
+        "skipped_recent": 0,
+        "errors": 0,
+    }
+    now = datetime.now(timezone.utc)
+
+    for row in rows:
+        results["total"] += 1
+        member = guild.get_member(row["discord_id"])
+        if member is None:
+            results["skipped_not_in_guild"] += 1
+            continue
+
+        if (api_refresh and not force and skip_if_synced_within is not None
+                and row["last_synced"]):
+            try:
+                last = datetime.fromisoformat(row["last_synced"])
+            except ValueError:
+                last = None
+            if last is not None and (now - last) < skip_if_synced_within:
+                # Still re-grant Verified + cached rank role on the cheap path
+                # so a user who lost their role between syncs still gets it
+                # back without waiting for their per-player sync window.
+                try:
+                    await restore_roles_from_db_cache(member, row)
+                    results["skipped_recent"] += 1
+                except discord.Forbidden:
+                    results["errors"] += 1
+                except Exception:
+                    log.exception("resync: cached-restore failed for %s", member.id)
+                    results["errors"] += 1
+                await asyncio.sleep(_RESYNC_PER_MEMBER_DELAY)
+                continue
+
+        try:
+            if api_refresh:
+                r = await refresh_player_from_api(
+                    guild, member, row, audit_source=audit_source,
+                )
+                status = r.get("status")
+                if status == "rank-changed":
+                    results["rank_changed"] += 1
+                elif status == "pending":
+                    results["pending"] += 1
+                elif status == "error":
+                    log.warning("resync: API refresh error for %s: %s",
+                                member.id, r.get("reason"))
+                    results["errors"] += 1
+                else:
+                    results["restored"] += 1
+            else:
+                await restore_roles_from_db_cache(member, row)
+                results["restored"] += 1
+        except discord.Forbidden:
+            # Almost always role hierarchy — the bot's own role is below a
+            # role it's trying to manage. Log and keep going.
+            results["errors"] += 1
+        except Exception:
+            log.exception("resync: per-player failure for %s", member.id)
+            results["errors"] += 1
+
+        await asyncio.sleep(_RESYNC_PER_MEMBER_DELAY)
+
+    log.info(
+        "[resync] guild=%s done total=%d restored=%d rank_changed=%d "
+        "pending=%d skipped_recent=%d skipped_not_in_guild=%d errors=%d "
+        "source=%r",
+        guild.id, results["total"], results["restored"],
+        results["rank_changed"], results["pending"],
+        results["skipped_recent"], results["skipped_not_in_guild"],
+        results["errors"], audit_source,
+    )
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # 72h Pending sweeper (spec §5.3 — auto-stale after expiry)                    #
 # --------------------------------------------------------------------------- #
 
@@ -1082,6 +1372,62 @@ class _PendingSweeper:
             log.warning("Couldn't edit stale pending message: %s", e)
 
 
+# --------------------------------------------------------------------------- #
+# Rank auto-refresh sweeper                                                    #
+# --------------------------------------------------------------------------- #
+#
+# Jay Jay's friend didn't realise he had to click Refresh in the Player Hub
+# to pick up rank changes. This sweeper runs the same refresh flow
+# automatically for every linked player, on a cadence. Per-player API
+# calls are skipped if the row was synced within RANK_SWEEP_SKIP_IF_SYNCED_WITHIN
+# so we don't hammer wavu/ewgf on every tick.
+
+class _RankSweeper:
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop(), name="rank-sweeper")
+
+    def stop(self) -> None:
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+
+    async def _loop(self) -> None:
+        await self.bot.wait_until_ready()
+        # Offset from the pending sweeper's first run so the two aren't
+        # contending for the API-call budget on a fresh boot.
+        await asyncio.sleep(RANK_SWEEP_STARTUP_DELAY.total_seconds())
+        while True:
+            try:
+                await self._sweep_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Rank sweeper iteration failed")
+            await asyncio.sleep(RANK_SWEEP_INTERVAL.total_seconds())
+
+    async def _sweep_once(self) -> None:
+        log.info(
+            "[rank-sweeper] tick guilds=%d interval=%ss skip_if_synced_within=%ss",
+            len(self.bot.guilds),
+            int(RANK_SWEEP_INTERVAL.total_seconds()),
+            int(RANK_SWEEP_SKIP_IF_SYNCED_WITHIN.total_seconds()),
+        )
+        for guild in self.bot.guilds:
+            # resync_all_players emits its own [resync] start/done lines,
+            # so no need to double-log the per-guild summary here.
+            await resync_all_players(
+                guild,
+                api_refresh=True,
+                force=False,
+                skip_if_synced_within=RANK_SWEEP_SKIP_IF_SYNCED_WITHIN,
+                audit_source="auto-refresh (sweeper)",
+            )
+
+
 class _ConfirmUnlinkView(ErrorHandledView):
     def __init__(self, user_id: int, tekken_id: str | None, display_name: str | None):
         super().__init__(timeout=60)
@@ -1171,23 +1517,29 @@ class PlayerHubView(ErrorHandledView):
     def _resolve_bot(self, interaction: discord.Interaction) -> commands.Bot:
         return self._bot or interaction.client  # type: ignore[return-value]
 
-    @discord.ui.button(label="Verify",
+    # Row 0 is deliberately ONE button — Verify alone, primary (blurple).
+    # This is the mandatory-verification onboarding gate: new arrivals
+    # see only this channel, and the only action they can take is the
+    # one button that sits visually by itself above the rest. Splitting
+    # the post-verify actions onto rows 1–2 trades a little vertical
+    # space for a huge clarity win for first-time visitors.
+    @discord.ui.button(label="▶  Verify — Click to enter the server",
                        style=discord.ButtonStyle.primary,
                        custom_id="hub:verify", row=0)
     async def verify(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await _flow_verify_start(interaction, self._resolve_bot(interaction))
-
-    @discord.ui.button(label="My Profile",
-                       style=discord.ButtonStyle.secondary,
-                       custom_id="hub:profile", row=0)
-    async def profile(self, interaction: discord.Interaction, _b: discord.ui.Button):
-        await _flow_profile(interaction)
 
     @discord.ui.button(label="Refresh Rank",
                        style=discord.ButtonStyle.success,
                        custom_id="hub:refresh", row=1)
     async def refresh(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await _flow_refresh(interaction, self._resolve_bot(interaction))
+
+    @discord.ui.button(label="My Profile",
+                       style=discord.ButtonStyle.secondary,
+                       custom_id="hub:profile", row=1)
+    async def profile(self, interaction: discord.Interaction, _b: discord.ui.Button):
+        await _flow_profile(interaction)
 
     @discord.ui.button(label="Set Rank Manually",
                        style=discord.ButtonStyle.secondary,
@@ -1197,7 +1549,7 @@ class PlayerHubView(ErrorHandledView):
 
     @discord.ui.button(label="Unlink Me",
                        style=discord.ButtonStyle.danger,
-                       custom_id="hub:unlink", row=1)
+                       custom_id="hub:unlink", row=2)
     async def unlink(self, interaction: discord.Interaction, _b: discord.ui.Button):
         await _flow_unlink(interaction)
 
@@ -1209,26 +1561,56 @@ PLAYER_HUB_BANNER_FILENAME = "player_hub_banner.png"
 # renders every glyph — colour-emojis aren't in DejaVu and would tofu.
 # The button labels carry their own emoji in Discord's UI, so players
 # still see them where it matters.
+#
+# Copy is deliberately blunt: this channel is the ONLY visible channel
+# to unverified members, so the body has to do the work of (a) telling
+# them what to do and (b) condensing the rules they'd otherwise read
+# in #📜-rules (which is now gated behind Verified).
 _PLAYER_HUB_BODY = (
-    "## New here?\n"
-    "Click VERIFY and paste your Tekken ID.\n"
-    "(Find it at Main Menu > Community > My Profile.)\n"
+    "## One click to enter\n"
+    "This is the only way into the server. Click VERIFY below, paste your\n"
+    "Tekken ID, and the rest of the server unlocks instantly.\n"
+    "(Find your ID at Main Menu > Community > My Profile.)\n"
+    "\n"
+    "## By clicking Verify you agree to\n"
+    "• Be kind. No harassment, slurs, or doxxing.\n"
+    "• Hype and tilt are fine. Personal attacks are not.\n"
+    "• Don't cheat. Don't impersonate. Mods' call is final.\n"
     "\n"
     "## Already verified?\n"
-    "• Refresh Rank — pull latest from recent matches\n"
-    "• Set Rank Manually — pick from a dropdown\n"
-    "• My Profile — see what's on file\n"
-    "• Unlink Me — disconnect your account"
+    "Use the buttons below to refresh your rank, set it manually,\n"
+    "check your profile, or unlink."
+)
+
+
+# Text block shown in the embed next to the banner image, so users who
+# read text faster than pictures still land on the same instruction.
+# The banner does the visual work, the description does the scannable
+# work — redundant on purpose so no-one misses the Verify call to action.
+_PLAYER_HUB_DESCRIPTION = (
+    "## ▶  Step 1 — Click **Verify**\n"
+    "It's the only way into the rest of the server. One click, paste your "
+    "Tekken ID, done.\n\n"
+    "By clicking Verify you agree to the server rules (summary on the "
+    "banner above — full rules unlock in **#📜-rules** the moment you're in)."
 )
 
 
 def _player_hub_embed() -> discord.Embed:
-    """Container embed for the Player Hub banner attachment. The body
-    text lives inside the image itself (see _player_hub_banner_file),
-    so this embed carries only the accent colour bar and the footer."""
-    embed = discord.Embed(color=discord.Color.red())
+    """Container embed for the Player Hub banner attachment. The banner
+    PNG carries the full body (so the image alone is self-sufficient
+    when Discord lazy-loads embeds), and the embed description mirrors
+    the Verify CTA in text — redundant on purpose so skimmers and
+    deep-readers both land on the same instruction."""
+    embed = discord.Embed(
+        description=_PLAYER_HUB_DESCRIPTION,
+        color=discord.Color.red(),
+    )
     embed.set_image(url=f"attachment://{PLAYER_HUB_BANNER_FILENAME}")
-    embed.set_footer(text="One Tekken ID per Discord account • Admins can override")
+    embed.set_footer(
+        text="One Tekken ID per Discord account  •  Admins can override  "
+             "•  Verify is the only entry to the server",
+    )
     return embed
 
 
@@ -1269,6 +1651,7 @@ class Onboarding(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._sweeper = _PendingSweeper(bot)
+        self._rank_sweeper = _RankSweeper(bot)
 
     async def cog_load(self) -> None:
         # Persistent views: custom_ids let Discord route button clicks back to
@@ -1276,9 +1659,147 @@ class Onboarding(commands.Cog):
         self.bot.add_view(PlayerHubView(self.bot))
         self.bot.add_view(PendingVerificationView())
         self._sweeper.start()
+        self._rank_sweeper.start()
 
     async def cog_unload(self) -> None:
         self._sweeper.stop()
+        self._rank_sweeper.stop()
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        """Auto-restore roles for returning members + DM the verify nudge.
+
+        If the member was previously linked (row in `players`), re-grant their
+        Verified + cached rank role immediately. This covers rejoin-after-leave
+        and the post-/reset-server case where the Verified role was deleted
+        and needs to come back without asking the user to click anything.
+        A fresh rank lookup is left to the rank sweeper so on_member_join
+        doesn't block on a wavu/ewgf round-trip.
+        """
+        if member.bot:
+            log.info("[join] member=%s guild=%s bot=yes ignored",
+                     member.id, member.guild.id)
+            return
+
+        row = await db.get_player_by_discord(member.id)
+        linked = row is not None
+        log.info(
+            "[join] member=%s name=%r guild=%s linked=%s tekken_id=%s "
+            "stored_rank=%r",
+            member.id, str(member), member.guild.id,
+            "yes" if linked else "no",
+            row["tekken_id"] if linked else "-",
+            row["rank_tier"] if linked else None,
+        )
+        if linked:
+            try:
+                await restore_roles_from_db_cache(member, row)
+                log.info("[join] member=%s action=restore_cache result=ok", member.id)
+            except discord.Forbidden:
+                log.warning(
+                    "[join] member=%s action=restore_cache result=forbidden "
+                    "(bot role below target — drag bot role up)",
+                    member.id,
+                )
+            except Exception:
+                log.exception("[join] member=%s action=restore_cache result=exception",
+                              member.id)
+
+        try:
+            await self._send_join_dm(member, already_linked=linked)
+            log.info("[join] member=%s action=send_dm already_linked=%s",
+                     member.id, "yes" if linked else "no")
+        except Exception:
+            log.exception("[join] member=%s action=send_dm result=exception", member.id)
+
+    async def _send_join_dm(
+        self, member: discord.Member, *, already_linked: bool,
+    ) -> None:
+        """Friendly DM pointing new (or returning) members at #🎴-player-hub.
+        Silently ignored if the member blocks DMs from the server."""
+        hub_channel = channel_util.find_text_channel(member.guild, "player-hub")
+        # Channel mentions (<#id>) only hyperlink inside a guild — in DMs
+        # they render as raw text. Use a discord.com deep-link instead so
+        # clicking in the DM jumps straight to #player-hub.
+        if hub_channel is not None:
+            hub_url = (
+                f"https://discord.com/channels/{member.guild.id}/{hub_channel.id}"
+            )
+            hub_jump = f"[#🎴-player-hub]({hub_url})"
+        else:
+            hub_jump = "**#🎴-player-hub**"
+
+        if already_linked:
+            description = (
+                f"Welcome back to **{member.guild.name}**, {member.mention}!\n\n"
+                "Your Tekken link is already on file — I've re-applied your "
+                f"Verified role and rank so you can jump straight back in.\n\n"
+                f"If anything looks off, pop into {hub_jump} and click "
+                "**Refresh Rank**."
+            )
+        else:
+            description = (
+                f"Welcome to **{member.guild.name}**, {member.mention}!\n\n"
+                f"**{hub_jump} is the only channel you can see right now** "
+                "— and that's on purpose. Click the **▶  Verify** button "
+                "there, paste your Tekken ID, and the whole server unlocks "
+                "instantly.\n\n"
+                "No verify, no access — no exceptions. One click is all "
+                "it takes, and we'll auto-assign your current rank role "
+                "from your recent matches."
+            )
+
+        embed = discord.Embed(
+            title="🎴 Welcome to the server",
+            description=description,
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="Ehrgeiz Godhand • auto-sent on join")
+
+        try:
+            await member.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            # User has DMs disabled, or Discord blocked us. No retry —
+            # the #👋-welcome channel's pinned banner is the fallback.
+            pass
+
+    @app_commands.command(
+        name="admin-resync-all",
+        description="[Admin] Re-check every linked player's rank + re-grant Verified if missing.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    async def admin_resync_all(self, interaction: discord.Interaction):
+        """Manual trigger for the same sweep the _RankSweeper runs.
+        Bypasses the skip-if-recent threshold (force=True) so an admin
+        can demand a fresh pass right now — e.g. after a bulk role edit
+        or when chasing a suspected drift bug."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only command.", ephemeral=True, delete_after=8,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        results = await resync_all_players(
+            guild,
+            api_refresh=True,
+            force=True,
+            audit_source="admin-resync-all",
+        )
+        embed = discord.Embed(
+            title="🔄 Resync complete",
+            color=(discord.Color.green() if results["errors"] == 0
+                   else discord.Color.orange()),
+            description=(
+                f"Checked **{results['total']}** linked player(s).\n\n"
+                f"• ✅ **{results['restored']}** roles re-applied\n"
+                f"• 📈 **{results['rank_changed']}** rank changes detected\n"
+                f"• ⏳ **{results['pending']}** new pending verification(s)\n"
+                f"• 👋 **{results['skipped_not_in_guild']}** no longer in this server\n"
+                f"• ⚠ **{results['errors']}** error(s) — see bot console"
+            ),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,

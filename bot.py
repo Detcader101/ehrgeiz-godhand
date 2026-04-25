@@ -54,9 +54,39 @@ class TekkenBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
+        # on_ready fires on every gateway reconnect; one-shot everything
+        # below so the banner doesn't re-log and the deploy embed doesn't
+        # re-post on a flaky network.
         if self._deploy_announced:
             return
         self._deploy_announced = True
+
+        try:
+            from cogs.onboarding import (
+                PENDING_SWEEP_INTERVAL,
+                RANK_SWEEP_INTERVAL,
+                RANK_SWEEP_SKIP_IF_SYNCED_WITHIN,
+                VERIFIED_ROLE_NAME,
+            )
+        except ImportError:
+            pass
+        else:
+            log.info(
+                "[startup] intents members=%s msg_content=%s guilds=%d",
+                INTENTS.members, INTENTS.message_content, len(self.guilds),
+            )
+            for g in self.guilds:
+                log.info("[startup] guild id=%s name=%r members=%d",
+                         g.id, g.name, g.member_count)
+            log.info(
+                "[startup] config verified_role=%r pending_sweep=%ss "
+                "rank_sweep=%ss rank_skip_if_synced_within=%ss",
+                VERIFIED_ROLE_NAME,
+                int(PENDING_SWEEP_INTERVAL.total_seconds()),
+                int(RANK_SWEEP_INTERVAL.total_seconds()),
+                int(RANK_SWEEP_SKIP_IF_SYNCED_WITHIN.total_seconds()),
+            )
+
         sha = os.getenv("BOT_GIT_SHA")
         subject = os.getenv("BOT_GIT_SUBJECT")
         if not sha:
