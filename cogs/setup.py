@@ -709,6 +709,37 @@ async def _post_or_refresh_banner(
     view = spec.view_factory() if spec.view_factory else None
 
     existing = await db.get_panel(guild.id, spec.kind)
+    tracked_message_id = existing["message_id"] if existing is not None else None
+
+    # Orphan-pin sweep: scan pinned messages for prior bot-authored
+    # banners that aren't the one we're tracking, and delete them. This
+    # is the recovery path for cases where db.panels lost track of a
+    # message it once posted (e.g. fresh DB on a redeploy into the same
+    # Discord guild — happened when the bot moved from a local dev
+    # bot.db to the shed-tekken bind-mount). Pinned-only is cheap (≤50
+    # pins per channel, single API call) and banners are always pinned,
+    # so this catches the duplicates without touching unrelated messages.
+    bot_member = guild.me
+    if bot_member is not None:
+        try:
+            pins = await channel.pins()
+        except (discord.Forbidden, discord.HTTPException):
+            pins = []
+        for pinned in pins:
+            if pinned.author.id != bot_member.id:
+                continue
+            if pinned.id == tracked_message_id:
+                continue
+            if not any(a.filename == "banner.png" for a in pinned.attachments):
+                continue
+            try:
+                await pinned.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning(
+                    "orphan banner sweep: failed to delete msg %s in #%s: %s",
+                    pinned.id, channel.name, e,
+                )
+
     msg: discord.Message | None = None
     if existing is not None:
         try:
