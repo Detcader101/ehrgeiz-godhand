@@ -2049,6 +2049,122 @@ class Onboarding(commands.Cog):
             ],
         )
 
+    @app_commands.command(
+        name="admin-pending-resolve",
+        description="Admin: confirm or reject a player's pending high-rank claim "
+                    "without using the audit-log buttons.",
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.describe(
+        member="The user whose pending claim you want to resolve",
+        action="Confirm grants the rank role; Reject leaves them as Verified-only",
+    )
+    @app_commands.choices(action=[
+        app_commands.Choice(name="Confirm — grant the claimed rank", value="confirm"),
+        app_commands.Choice(name="Reject — strip the pending claim",   value="reject"),
+    ])
+    async def admin_pending_resolve(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        action: app_commands.Choice[str],
+    ):
+        """Escape hatch for when the audit-log Confirm/Reject message is gone
+        (deleted, channel purged, etc.) but the pending row is still live.
+        Mirrors the resolution path the buttons take."""
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+
+        pending = await db.get_pending_by_discord(member.id)
+        if pending is None:
+            await interaction.response.send_message(
+                f"{member.mention} has no pending verification on file.",
+                ephemeral=True, delete_after=10,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        granted = False
+        if action.value == "confirm":
+            player_row = await db.get_player_by_discord(member.id)
+            if player_row is None:
+                await interaction.followup.send(
+                    f"Pending row exists for {member.mention} but no players "
+                    "row — clear it manually with `/admin-unlink` then "
+                    "re-run `/admin-link`.",
+                    ephemeral=True,
+                )
+                return
+            await db.upsert_player(
+                discord_id=member.id,
+                tekken_id=player_row["tekken_id"],
+                display_name=player_row["display_name"],
+                main_char=player_row["main_char"],
+                rating_mu=player_row["rating_mu"],
+                rank_tier=pending["rank_tier"],
+                linked_by=player_row["linked_by"],
+                now_iso=_now_iso(),
+            )
+            confirmed_profile = wavu.PlayerProfile(
+                tekken_id=pending["tekken_id"],
+                display_name=player_row["display_name"],
+                main_char=player_row["main_char"],
+                rating_mu=player_row["rating_mu"],
+                rank_tier=pending["rank_tier"],
+            )
+            try:
+                await _apply_rank_and_verified(member, confirmed_profile)
+                granted = True
+            except discord.Forbidden:
+                granted = False
+
+        # Drop the pending row in both branches — Reject leaves the player
+        # with no rank role; Confirm's grant is best-effort.
+        await db.delete_pending_verification(member.id)
+
+        # Strip the buttons from the audit message if it still exists.
+        if pending["channel_id"] and pending["message_id"]:
+            channel = guild.get_channel(pending["channel_id"])
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    msg = await channel.fetch_message(pending["message_id"])
+                    await msg.edit(view=None)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+
+        if action.value == "confirm":
+            summary = (
+                f"✅ Confirmed **{pending['rank_tier']}** for {member.mention}"
+                + ("." if granted else " — DB updated, role grant failed (hierarchy?).")
+            )
+        else:
+            summary = (
+                f"❌ Rejected the **{pending['rank_tier']}** claim for "
+                f"{member.mention}. They keep Verified, no rank role."
+            )
+        await interaction.followup.send(summary, ephemeral=True)
+
+        await audit.post_event(
+            guild,
+            title=f"Pending verification {action.value.upper()} (admin)",
+            color=(
+                discord.Color.green() if (action.value == "confirm" and granted)
+                else discord.Color.orange() if action.value == "confirm"
+                else discord.Color.dark_red()
+            ),
+            fields=[
+                ("Target", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{interaction.user.mention}", True),
+                ("Claim", pending["rank_tier"], True),
+                ("Source", pending["rank_source"], True),
+                ("Role granted", "yes" if granted else "no", True),
+            ],
+        )
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Onboarding(bot))

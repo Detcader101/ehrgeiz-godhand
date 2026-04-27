@@ -573,6 +573,132 @@ class Fitcheck(commands.Cog):
         )
         await interaction.followup.send(result, ephemeral=True)
 
+    # --- /fitcheck-set-drip-lord ---------------------------------------- #
+
+    @app_commands.command(
+        name="fitcheck-set-drip-lord",
+        description="(Admin) Manually crown a specific user as Drip Lord.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        member="The user to crown",
+        reason="Why — included in the announcement and audit log",
+        announce="Post a celebration in #announcements (default true)",
+    )
+    async def fitcheck_set_drip_lord(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        reason: str | None = None,
+        announce: bool = True,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Server-only command.", ephemeral=True, delete_after=8,
+            )
+            return
+
+        role = discord.utils.get(guild.roles, name=DRIP_LORD_ROLE_NAME)
+        if role is None:
+            await interaction.response.send_message(
+                f"`{DRIP_LORD_ROLE_NAME}` role doesn't exist yet — run "
+                "/setup-server first.",
+                ephemeral=True, delete_after=12,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            await self._rotator._rotate_role(guild, role, member)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"Can't move the `{role.name}` role — bot's role needs to be "
+                "above it. Drag the bot's role up in Server Settings → Roles.",
+                ephemeral=True,
+            )
+            return
+
+        # Stamp the rotation timestamp so the weekly auto-rotator doesn't
+        # immediately overwrite this manual crown with the leaderboard pick.
+        # The manual crown effectively resets the cycle clock.
+        now_iso = _now_iso()
+        await db.set_bot_state(
+            guild.id, DRIP_LORD_STATE_KEY, now_iso, now_iso,
+        )
+
+        announce_msg: discord.Message | None = None
+        if announce:
+            player = await db.get_player_by_discord(member.id)
+            rank_tier = player["rank_tier"] if player else None
+            character = (player["main_char"] if player else None) or "—"
+            try:
+                card_buf = await tournament_render.render_drip_lord_card(
+                    winner_name=member.display_name,
+                    character=character,
+                    rank_tier=rank_tier,
+                    fit_image_bytes=None,
+                    net_score=0,
+                )
+            except Exception:
+                log.exception(
+                    "[drip-lord] guild=%s manual-crown card render failed",
+                    guild.id,
+                )
+                card_buf = None
+
+            announcements = channel_util.find_text_channel(
+                guild, ANNOUNCEMENTS_CHANNEL,
+            )
+            if announcements is not None:
+                embed = discord.Embed(
+                    title=f"👑 Drip Lord · {member.display_name}",
+                    description=(
+                        f"{member.mention} has been crowned Drip Lord "
+                        f"by {interaction.user.mention}."
+                        + (f"\n\n*{reason}*" if reason else "")
+                    ),
+                    color=discord.Color.from_rgb(212, 175, 55),
+                )
+                files: list[discord.File] = []
+                if card_buf is not None:
+                    files.append(discord.File(card_buf, filename="drip-lord.png"))
+                    embed.set_image(url="attachment://drip-lord.png")
+                try:
+                    announce_msg = await announcements.send(
+                        content=member.mention, embed=embed, files=files,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(
+                        "[drip-lord] guild=%s manual announce failed: %s",
+                        guild.id, e,
+                    )
+
+        await audit.post_dump_event(
+            guild,
+            title="Drip Lord rotated (manual crown)",
+            color=discord.Color.from_rgb(212, 175, 55),
+            fields=[
+                ("Crowned", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{interaction.user.mention}", True),
+                ("Reason", reason or "—", False),
+                (
+                    "Announcement",
+                    (f"[Open]({announce_msg.jump_url})"
+                     if announce_msg else "skipped" if not announce else "failed"),
+                    False,
+                ),
+            ],
+        )
+
+        await interaction.followup.send(
+            f"👑 Crowned {member.mention} as Drip Lord."
+            + (f" Announcement: {announce_msg.jump_url}" if announce_msg else
+               " (no announcement posted)"),
+            ephemeral=True,
+        )
+
     # --- error routing -------------------------------------------------- #
 
     async def cog_app_command_error(
