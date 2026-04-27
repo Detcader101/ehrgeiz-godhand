@@ -446,32 +446,78 @@ class Fitcheck(commands.Cog):
             )
             return
 
-        embed = discord.Embed(
-            title=f"Fit Check Leaderboard · last {window_days} day(s)",
-            color=discord.Color.from_rgb(200, 30, 40),
-        )
+        await interaction.response.defer()
+
+        # Build the entry list for the Pillow renderer + a parallel list
+        # of jump links for the embed body. Renderer carries the visual
+        # weight (medal + score + portrait), the embed carries the
+        # clickable [Jump to post] links since attachments aren't
+        # hyperlinkable from inside a Pillow image.
+        entries: list[dict] = []
+        jump_lines: list[str] = []
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         for i, row in enumerate(rows):
-            medal = medals[i] if i < len(medals) else f"{i+1}."
+            poster_member = interaction.guild.get_member(row["poster_id"])
+            poster_name = (
+                poster_member.display_name
+                if poster_member else f"User {row['poster_id']}"
+            )
+            poster_player = await db.get_player_by_discord(row["poster_id"])
+            entries.append({
+                "position": i + 1,
+                "poster_name": poster_name,
+                "character": row["character"],
+                "rank_tier": (
+                    poster_player["rank_tier"] if poster_player else None
+                ),
+                "ups": int(row["ups"]),
+                "downs": int(row["downs"]),
+                # Composite-card URL — leaderboard render fetches it
+                # and crops out a bust-style preview of the user's
+                # actual submitted image.
+                "image_url": row["image_url"],
+            })
+            medal = medals[i] if i < len(medals) else f"#{i + 1}"
             jump = (
                 f"https://discord.com/channels/"
                 f"{row['guild_id']}/{row['channel_id']}/{row['message_id']}"
             )
-            poster = interaction.guild.get_member(row["poster_id"])
-            poster_label = (
-                poster.display_name if poster else f"<@{row['poster_id']}>"
-            )
             net = int(row["ups"]) - int(row["downs"])
-            embed.add_field(
-                name=f"{medal} {poster_label} · {row['character']}",
-                value=(
-                    f"**{net:+d}** net "
-                    f"(👍 {int(row['ups'])} · 👎 {int(row['downs'])})\n"
-                    f"[Jump to post]({jump})"
-                ),
-                inline=False,
+            mention = (
+                poster_member.mention
+                if poster_member else f"<@{row['poster_id']}>"
             )
-        await interaction.response.send_message(embed=embed)
+            jump_lines.append(
+                f"{medal} {mention} · **{net:+d}** "
+                f"({row['character']}) · [Jump]({jump})"
+            )
+
+        try:
+            buf = await tournament_render.render_fitcheck_leaderboard(
+                entries=entries,
+                window_label=f"last {window_days} day(s)",
+            )
+        except Exception:
+            log.exception("[fitcheck] leaderboard render failed")
+            # Fallback to text-only embed so the command still answers.
+            text_embed = discord.Embed(
+                title=f"Fit Check Leaderboard · last {window_days} day(s)",
+                description="\n".join(jump_lines),
+                color=discord.Color.from_rgb(200, 30, 40),
+            )
+            await interaction.followup.send(embed=text_embed)
+            return
+
+        embed = discord.Embed(
+            title=f"Fit Check Leaderboard · last {window_days} day(s)",
+            description="\n".join(jump_lines),
+            color=discord.Color.from_rgb(200, 30, 40),
+        )
+        embed.set_image(url="attachment://fitcheck-leaderboard.png")
+        await interaction.followup.send(
+            embed=embed,
+            file=discord.File(buf, filename="fitcheck-leaderboard.png"),
+        )
 
     # --- /fitcheck-delete ----------------------------------------------- #
 

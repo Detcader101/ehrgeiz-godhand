@@ -1284,6 +1284,309 @@ def _compose_rank_up_png(
 
 
 # --------------------------------------------------------------------------- #
+# Fit-check leaderboard                                                        #
+# --------------------------------------------------------------------------- #
+
+
+async def render_fitcheck_leaderboard(
+    *,
+    entries: list[dict],
+    window_label: str,
+) -> io.BytesIO:
+    """Top-N fit-check leaderboard rendered as a 2-column card grid,
+    visually mirroring the tournament roster (`render_roster`) so the
+    server's broadcast aesthetic stays consistent.
+
+    Each entry dict needs:
+        poster_name (str)
+        character (str | None)
+        ups (int)
+        downs (int)
+        rank_tier (str | None)
+        position (int, 1-based)
+        image_url (str | None)   # composite card URL from the original
+                                 # post; we fetch it and crop the user's
+                                 # submitted image out of our brand frame
+                                 # to get a bust-style preview cell.
+    """
+    CHAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    RANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    char_urls = [media.character_icon_url(e.get("character")) for e in entries]
+    rank_urls = [media.rank_icon_url(e.get("rank_tier")) for e in entries]
+
+    # Composite-card fetches happen on the same session so we open at
+    # most one. Each entry's bust crop is best-effort: a 404 (post was
+    # deleted, CDN blip) silently falls back to the character icon
+    # cover-crop, matching the roster behaviour.
+    session: aiohttp.ClientSession | None = None
+    try:
+        needs_net = any(
+            (u and not _cache_path_for(
+                u, CHAR_CACHE_DIR if "character" in u else RANK_CACHE_DIR,
+            ).exists())
+            for u in char_urls + rank_urls if u
+        )
+        if needs_net or any(e.get("image_url") for e in entries):
+            session = aiohttp.ClientSession()
+        char_icons = await asyncio.gather(*(
+            _fetch_icon(u, CHAR_CACHE_DIR, session) for u in char_urls
+        ))
+        rank_icons = await asyncio.gather(*(
+            _fetch_icon(u, RANK_CACHE_DIR, session) for u in rank_urls
+        ))
+        bust_crops = await asyncio.gather(*(
+            _fetch_fitcheck_bust(e.get("image_url"), session)
+            for e in entries
+        ))
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_fitcheck_leaderboard_png,
+        entries, window_label, char_icons, rank_icons, bust_crops,
+    )
+
+
+async def _fetch_fitcheck_bust(
+    composite_url: str | None,
+    session: aiohttp.ClientSession | None,
+) -> Image.Image | None:
+    """Download a previously-posted fit-check composite card, strip the
+    Ehrgeiz brand frame, and return a top-third bust crop ready to
+    paste into a leaderboard portrait cell.
+
+    The crop uses the FITCHECK_* layout constants the original render
+    baked in — header (100px) + a 14px pad on every side + a 64px
+    footer — so we slice out exactly the region the user's screenshot
+    occupied. Callers that fall back here when the URL is missing or
+    the fetch fails should swap in the character icon instead.
+    """
+    if not composite_url or session is None:
+        return None
+    try:
+        async with session.get(
+            composite_url,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status != 200:
+                log.info(
+                    "fitcheck bust fetch %s returned HTTP %d",
+                    composite_url, resp.status,
+                )
+                return None
+            data = await resp.read()
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        log.info("fitcheck bust fetch %s failed: %s", composite_url, e)
+        return None
+    try:
+        composite = Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as e:
+        log.info("fitcheck bust open failed: %s", e)
+        return None
+    return _crop_fitcheck_source_region(composite)
+
+
+def _crop_fitcheck_source_region(composite: Image.Image) -> Image.Image:
+    """Recover the user's submitted image from one of our composite
+    fit-check cards by stripping the brand frame. Falls back to the
+    raw composite if it's smaller than the expected frame chrome —
+    won't crash on hand-crafted test inputs."""
+    W, H = composite.size
+    PAD = FITCHECK_PAD
+    top = FITCHECK_HEADER_H + PAD
+    bottom = H - PAD - FITCHECK_FOOTER_H
+    if bottom <= top + 4 or W <= 2 * PAD:
+        return composite
+    return composite.crop((PAD, top, W - PAD, bottom))
+
+
+def _compose_fitcheck_leaderboard_png(
+    entries: list[dict],
+    window_label: str,
+    char_icons: list[Image.Image | None],
+    rank_icons: list[Image.Image | None],
+    bust_crops: list[Image.Image | None],
+) -> io.BytesIO:
+    # Layout intentionally clones render_roster's geometry so the two
+    # visuals read as siblings — same card silhouette, same gradient
+    # header, same red accent strip.
+    W = 880
+    COLS = 2
+    CARD_W = 404
+    CARD_H = 180
+    HEADER_H = 120
+    GAP = 16
+    PORTRAIT_W = 140
+    SCORE_H = 110
+    NAME_H = CARD_H - SCORE_H
+    CELL_PAD = 10
+    PORTRAIT_PAD = 2
+    CHIP_H = 40
+
+    PORTRAIT_CELL_BG = (24, 20, 22)
+    RIGHT_CELL_BG = ROW_BG_ALT
+
+    rows = max(1, (len(entries) + COLS - 1) // COLS)
+    H = HEADER_H + GAP + rows * (CARD_H + GAP) + GAP
+    img = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Header band (kicker / title / window label).
+    _paint_header_gradient(img, 0, HEADER_H)
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=ACCENT, width=3)
+    draw.text((24, 14), "EHRGEIZ GODHAND",
+              fill=TEXT, font=_load_display_font(48))
+    draw.text((24, 70), f"FIT CHECK  ·  {window_label.upper()}",
+              fill=ACCENT, font=_load_display_font(26))
+
+    if not entries:
+        note_font = _load_font(20)
+        draw.text(
+            (24, HEADER_H + GAP + 24),
+            "No fit checks in this window — `/fitcheck-post` to start it.",
+            fill=TEXT_DIM, font=note_font,
+        )
+        return _to_png_buf(img)
+
+    medal_chars = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    for i, entry in enumerate(entries):
+        col = i % COLS
+        row = i // COLS
+        cx = 24 + col * (CARD_W + 24)
+        cy = HEADER_H + GAP + row * (CARD_H + GAP)
+
+        portrait_rect = (cx, cy, cx + PORTRAIT_W, cy + CARD_H)
+        score_rect = (cx + PORTRAIT_W, cy,
+                      cx + CARD_W, cy + SCORE_H)
+        name_rect = (cx + PORTRAIT_W, cy + SCORE_H,
+                     cx + CARD_W, cy + CARD_H)
+
+        draw.rectangle(portrait_rect, fill=PORTRAIT_CELL_BG)
+        draw.rectangle(score_rect, fill=RIGHT_CELL_BG)
+        draw.rectangle(name_rect, fill=RIGHT_CELL_BG)
+        # Position-coloured accent stripe — gold/silver/bronze for top-3,
+        # brand red below — so the podium is legible at a glance.
+        position = entry.get("position", i + 1)
+        position_color = {
+            1: (212, 175, 55),
+            2: (192, 192, 192),
+            3: (180, 130, 70),
+        }.get(position, ACCENT)
+        draw.rectangle([(cx, cy), (cx + 4, cy + CARD_H)], fill=position_color)
+        draw.line([(cx + PORTRAIT_W, cy),
+                   (cx + PORTRAIT_W, cy + CARD_H)],
+                  fill=BG_COLOR, width=1)
+        draw.line([(cx + PORTRAIT_W, cy + SCORE_H),
+                   (cx + CARD_W, cy + SCORE_H)],
+                  fill=BG_COLOR, width=1)
+
+        # Portrait + character chip. Prefer the user's actual fit-check
+        # bust (top portion of their submitted screenshot) when we
+        # successfully fetched and cropped it; fall back to the
+        # character icon cover-crop when the fetch failed.
+        portrait_image_rect = (
+            portrait_rect[0], portrait_rect[1],
+            portrait_rect[2], portrait_rect[3] - CHIP_H,
+        )
+        bust = bust_crops[i] if i < len(bust_crops) else None
+        if bust is not None:
+            # Vertical anchor 0 = top-aligned, so the cover crop keeps
+            # the head/shoulders region of the user's image visible.
+            _fill_cell_with_icon_cover(
+                img, bust,
+                portrait_image_rect, pad=PORTRAIT_PAD,
+                vertical_anchor=0.0,
+            )
+        else:
+            _fill_cell_with_icon_cover(
+                img, char_icons[i],
+                portrait_image_rect, pad=PORTRAIT_PAD,
+                vertical_anchor=0.18,
+            )
+        if entry.get("character"):
+            chip_top = cy + CARD_H - CHIP_H
+            draw.rectangle(
+                [(cx, chip_top), (cx + PORTRAIT_W, cy + CARD_H)],
+                fill=ACCENT,
+            )
+            label = entry["character"].upper()
+            chip_font = _fit_text_to_box(
+                draw, label,
+                max_w=PORTRAIT_W - 12, max_h=CHIP_H - 10,
+                max_size=34, min_size=20,
+            )
+            bbox = draw.textbbox((0, 0), label, font=chip_font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            draw.text(
+                (cx + (PORTRAIT_W - tw) // 2,
+                 chip_top + (CHIP_H - th) // 2 - bbox[1]),
+                label, fill=TEXT, font=chip_font,
+            )
+
+        # --- Score cell — medal + signed net + small ups/downs ----------- #
+        ups = int(entry.get("ups", 0))
+        downs = int(entry.get("downs", 0))
+        net = ups - downs
+        medal = medal_chars.get(position, f"#{position}")
+        score_text = f"{medal}  {net:+d}"
+        score_font = _fit_text_to_box(
+            draw, score_text,
+            max_w=score_rect[2] - score_rect[0] - 2 * CELL_PAD,
+            max_h=score_rect[3] - score_rect[1] - 24,
+            max_size=58, min_size=28,
+            font_loader=_load_font,
+        )
+        bbox = draw.textbbox((0, 0), score_text, font=score_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (score_rect[0] + (score_rect[2] - score_rect[0] - tw) // 2,
+             score_rect[1] + (score_rect[3] - score_rect[1] - th) // 2 - 6
+             - bbox[1]),
+            score_text, fill=position_color, font=score_font,
+        )
+        # Small ups/downs subtitle below the medal.
+        sub_text = f"👍 {ups}  ·  👎 {downs}"
+        sub_font = _fit_text_to_box(
+            draw, sub_text,
+            max_w=score_rect[2] - score_rect[0] - 2 * CELL_PAD,
+            max_h=20,
+            max_size=18, min_size=14,
+        )
+        bbox = draw.textbbox((0, 0), sub_text, font=sub_font)
+        tw = bbox[2] - bbox[0]
+        draw.text(
+            (score_rect[0] + (score_rect[2] - score_rect[0] - tw) // 2,
+             score_rect[3] - 22 - bbox[1]),
+            sub_text, fill=TEXT_DIM, font=sub_font,
+        )
+
+        # --- Name cell — body font, mixed-case preserved ----------------- #
+        name = entry.get("poster_name", "—")
+        name_font = _fit_text_to_box(
+            draw, name,
+            max_w=name_rect[2] - name_rect[0] - 2 * CELL_PAD,
+            max_h=name_rect[3] - name_rect[1] - 2 * CELL_PAD,
+            max_size=34, min_size=18,
+            font_loader=_load_font,
+        )
+        bbox = draw.textbbox((0, 0), name, font=name_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = name_rect[0] + ((name_rect[2] - name_rect[0]) - tw) // 2
+        ty = (name_rect[1]
+              + ((name_rect[3] - name_rect[1]) - th) // 2
+              - bbox[1])
+        draw.text((tx, ty), name, fill=TEXT, font=name_font)
+
+    return _to_png_buf(img)
+
+
+# --------------------------------------------------------------------------- #
 # Tournament champion card                                                     #
 # --------------------------------------------------------------------------- #
 
@@ -1707,6 +2010,208 @@ def _compose_weekly_recap_png(
         subline=f"{fitchecks_posted} fit checks posted",
     )
 
+    draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
+    return _to_png_buf(canvas)
+
+
+# --------------------------------------------------------------------------- #
+# What's That Move — frame quiz card                                           #
+# --------------------------------------------------------------------------- #
+
+
+async def render_whats_that_move_card(
+    *,
+    character: str,
+    notation: str,
+    move_name: str,
+    revealed_frames: int | None = None,
+) -> io.BytesIO:
+    """Pokemon-style "guess the answer" card for a frame-data quiz.
+
+    `revealed_frames=None` renders the question state (obscured answer
+    placeholder); a non-None value renders the post-guess state with
+    the correct frames revealed in big colour-graded text (green for
+    plus / mid-range, amber for slight minus, red for launch-punishable).
+    Same layout in both states so the click swap reads as a card flip
+    rather than a full re-render.
+    """
+    char_url = media.character_icon_url(character)
+    session: aiohttp.ClientSession | None = None
+    char_icon: Image.Image | None = None
+    try:
+        if char_url and not _cache_path_for(char_url, CHAR_CACHE_DIR).exists():
+            session = aiohttp.ClientSession()
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_whats_that_move_png,
+        character, notation, move_name, revealed_frames, char_icon,
+    )
+
+
+def _compose_whats_that_move_png(
+    character: str,
+    notation: str,
+    move_name: str,
+    revealed_frames: int | None,
+    char_icon: Image.Image | None,
+) -> io.BytesIO:
+    W = 760
+    HEADER_H = 90
+    BODY_H = 320
+    H = HEADER_H + BODY_H
+    PAD = 18
+
+    canvas = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # --- Header ---------------------------------------------------------- #
+    _paint_header_gradient(canvas, 0, HEADER_H)
+    kicker = "EHRGEIZ  ·  WHAT'S THAT MOVE?"
+    kicker_font = _load_display_font(28)
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text(
+        ((W - (bbox[2] - bbox[0])) // 2, 18 - bbox[1]),
+        kicker, fill=ACCENT, font=kicker_font,
+    )
+    # Reveal-mode subtitle so the player knows the answer is in.
+    if revealed_frames is not None:
+        sub = "ANSWER REVEALED"
+        sub_color = ACCENT
+    else:
+        sub = "GUESS · FRAMES ON BLOCK"
+        sub_color = TEXT_DIM
+    sub_font = _load_display_font(18)
+    bbox = draw.textbbox((0, 0), sub, font=sub_font)
+    draw.text(
+        ((W - (bbox[2] - bbox[0])) // 2, 54 - bbox[1]),
+        sub, fill=sub_color, font=sub_font,
+    )
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=ACCENT, width=3)
+
+    # --- Body — split portrait left / text right ------------------------- #
+    body_y = HEADER_H + PAD
+    portrait_w = 240
+    portrait_h = BODY_H - 2 * PAD
+    portrait_rect = (PAD, body_y, PAD + portrait_w, body_y + portrait_h)
+
+    draw.rectangle(portrait_rect, fill=(24, 20, 22))
+    if char_icon is not None:
+        _fill_cell_with_icon_cover(
+            canvas, char_icon, portrait_rect, pad=4, vertical_anchor=0.18,
+        )
+    # Character chip on the portrait's bottom edge.
+    chip_h = 44
+    chip_top = body_y + portrait_h - chip_h
+    draw.rectangle(
+        [(portrait_rect[0], chip_top),
+         (portrait_rect[2], body_y + portrait_h)],
+        fill=ACCENT,
+    )
+    char_label = character.upper()
+    chip_font = _fit_text_to_box(
+        draw, char_label,
+        max_w=portrait_w - 16, max_h=chip_h - 12,
+        max_size=32, min_size=20,
+    )
+    bbox = draw.textbbox((0, 0), char_label, font=chip_font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (portrait_rect[0] + (portrait_w - tw) // 2,
+         chip_top + (chip_h - th) // 2 - bbox[1]),
+        char_label, fill=TEXT, font=chip_font,
+    )
+
+    # Right column — notation + move name + frames placeholder/answer.
+    right_x0 = portrait_rect[2] + PAD
+    right_w = W - right_x0 - PAD
+
+    # Notation, big.
+    notation_font = _fit_text_to_box(
+        draw, notation,
+        max_w=right_w, max_h=64,
+        max_size=44, min_size=22,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), notation, font=notation_font)
+    draw.text(
+        (right_x0, body_y + 4 - bbox[1]),
+        notation, fill=TEXT, font=notation_font,
+    )
+
+    # Move name, smaller body font.
+    name_y = body_y + 80
+    name_font = _fit_text_to_box(
+        draw, move_name,
+        max_w=right_w, max_h=44,
+        max_size=28, min_size=18,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), move_name, font=name_font)
+    draw.text(
+        (right_x0, name_y - bbox[1]),
+        move_name, fill=TEXT_DIM, font=name_font,
+    )
+
+    # Question kicker.
+    q_label = "FRAMES ON BLOCK"
+    q_y = name_y + 70
+    q_font = _load_display_font(24)
+    bbox = draw.textbbox((0, 0), q_label, font=q_font)
+    draw.text(
+        (right_x0, q_y - bbox[1]),
+        q_label, fill=ACCENT, font=q_font,
+    )
+
+    # Big answer slot — placeholder or revealed.
+    slot_y = q_y + 36
+    if revealed_frames is None:
+        # Three obscured boxes that visually beg for an answer.
+        slot_w = 72
+        slot_h = 72
+        slot_gap = 14
+        slot_x = right_x0
+        for _ in range(3):
+            draw.rectangle(
+                [(slot_x, slot_y),
+                 (slot_x + slot_w, slot_y + slot_h)],
+                fill=ROW_BG_ALT, outline=TEXT_DIM, width=2,
+            )
+            slot_x += slot_w + slot_gap
+    else:
+        # Colour the answer by safety bracket so the visual reads at a
+        # glance: green for safe, amber for situational, red for launch
+        # punishable. Boundaries are the rough community-canon thresholds.
+        if revealed_frames >= -9:
+            color = (95, 180, 120)        # safe-ish
+        elif revealed_frames >= -13:
+            color = (245, 180, 95)        # punishable but not launch
+        else:
+            color = (220, 60, 60)         # launch territory
+        answer = f"{revealed_frames:+d}"
+        answer_font = _load_display_font(96)
+        bbox = draw.textbbox((0, 0), answer, font=answer_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (right_x0, slot_y - bbox[1]),
+            answer, fill=color, font=answer_font,
+        )
+        # Small "frames on block" label after the number.
+        unit_x = right_x0 + tw + 14
+        unit_label = "ON BLOCK"
+        unit_font = _load_display_font(22)
+        bbox_u = draw.textbbox((0, 0), unit_label, font=unit_font)
+        draw.text(
+            (unit_x, slot_y + th - 32 - bbox_u[1]),
+            unit_label, fill=TEXT_DIM, font=unit_font,
+        )
+
+    # Bottom accent.
     draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
     return _to_png_buf(canvas)
 

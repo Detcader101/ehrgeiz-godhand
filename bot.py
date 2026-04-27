@@ -36,6 +36,7 @@ INITIAL_COGS = [
     "cogs.fitcheck",
     "cogs.admin",
     "cogs.recap",
+    "cogs.whats_that_move",
 ]
 
 
