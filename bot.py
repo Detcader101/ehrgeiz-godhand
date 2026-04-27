@@ -9,6 +9,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 import audit
+import bot_health
 import db
 
 load_dotenv()
@@ -34,6 +35,7 @@ INITIAL_COGS = [
     "cogs.matchmaking",
     "cogs.fitcheck",
     "cogs.admin",
+    "cogs.recap",
 ]
 
 
@@ -43,6 +45,7 @@ class TekkenBot(commands.Bot):
         # on_ready can fire on every gateway reconnect; gate the deploy
         # announcement so we only post once per process.
         self._deploy_announced = False
+        self._health_server: bot_health.BotHealthServer | None = None
 
     async def setup_hook(self) -> None:
         await db.init_db()
@@ -53,6 +56,16 @@ class TekkenBot(commands.Bot):
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
         log.info("Synced %d slash commands to guild %s", len(synced), GUILD_ID)
+        # Health endpoint — boots only if BOT_HEALTH_PORT is set so dev
+        # runs don't fight a port conflict. The CT systemd unit can opt
+        # in by adding the env var to /opt/tekken-bot/.env.
+        self._health_server = await bot_health.maybe_start_health_server(self)
+
+    async def close(self) -> None:
+        if self._health_server is not None:
+            await self._health_server.stop()
+            self._health_server = None
+        await super().close()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)

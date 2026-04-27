@@ -260,6 +260,21 @@ async def init_db() -> None:
         await _safe_add_column(
             db, "tournament_matches", "report_message_id", "INTEGER",
         )
+        # Champion lookup support: cache the winner on the tournament row
+        # itself when it completes so badge queries don't have to recompute
+        # standings for every profile render.
+        await _safe_add_column(
+            db, "tournaments", "winner_id", "INTEGER",
+        )
+        # First-verify timestamp so the weekly recap can count new joiners
+        # without relying on last_synced (which moves on every refresh).
+        # Existing rows inherit last_synced on first migration so they're
+        # not all flagged as "new this week".
+        await _safe_add_column(db, "players", "created_at", "TEXT")
+        await db.execute(
+            "UPDATE players SET created_at = last_synced "
+            "WHERE created_at IS NULL"
+        )
         # Back-fill state for rows from before the column existed: any
         # row with a winner was effectively CONFIRMED (it predates the
         # state machine entirely).
@@ -324,11 +339,15 @@ async def upsert_player(
     now_iso: str,
 ) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
+        # `created_at` is set on first insert and deliberately untouched
+        # by the conflict update — it's the "first ever linked" timestamp,
+        # used by the weekly recap to count new joiners.
         await db.execute(
             """
             INSERT INTO players (discord_id, tekken_id, display_name, main_char,
-                                 rating_mu, rank_tier, last_synced, linked_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                 rating_mu, rank_tier, last_synced, linked_by,
+                                 created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(discord_id) DO UPDATE SET
                 tekken_id    = excluded.tekken_id,
                 display_name = excluded.display_name,
@@ -339,7 +358,7 @@ async def upsert_player(
                 linked_by    = excluded.linked_by
             """,
             (discord_id, tekken_id, display_name, main_char, rating_mu,
-             rank_tier, now_iso, linked_by),
+             rank_tier, now_iso, linked_by, now_iso),
         )
         await db.commit()
 
@@ -1285,6 +1304,71 @@ async def record_posted_message(
             (kind, identity, guild_id, channel_id, message_id, now_iso),
         )
         await db.commit()
+
+
+async def set_tournament_winner(tournament_id: int, winner_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournaments SET winner_id = ? WHERE id = ?",
+            (winner_id, tournament_id),
+        )
+        await db.commit()
+
+
+async def count_new_players_since(since_iso: str) -> int:
+    """Count player rows first linked on or after `since_iso`. Single-guild
+    bot, so no guild_id filter. Used by the weekly recap."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM players WHERE created_at >= ?",
+            (since_iso,),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+async def count_tournaments_completed_since(
+    guild_id: int, since_iso: str,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM tournaments
+            WHERE guild_id = ? AND state = 'COMPLETED' AND ended_at >= ?
+            """,
+            (guild_id, since_iso),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+async def count_fitchecks_since(guild_id: int, since_iso: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT COUNT(*) FROM fitcheck_entries
+            WHERE guild_id = ? AND created_at >= ?
+            """,
+            (guild_id, since_iso),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+async def has_tournament_win(guild_id: int, user_id: int) -> bool:
+    """True if `user_id` has been recorded as the winner of any
+    COMPLETED tournament in this guild. Used by the achievement-badge
+    system to flag tournament champions on player cards."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT 1 FROM tournaments
+            WHERE guild_id = ? AND winner_id = ? AND state = 'COMPLETED'
+            LIMIT 1
+            """,
+            (guild_id, user_id),
+        ) as cur:
+            return (await cur.fetchone()) is not None
 
 
 async def get_user_fitcheck_stats(
