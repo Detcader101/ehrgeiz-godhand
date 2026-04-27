@@ -766,7 +766,21 @@ class _DripLordRotator:
         self, guild: discord.Guild, *, force: bool,
     ) -> str:
         """Returns a human-readable status line. `force=True` skips the
-        last-rotation check (used by /fitcheck-rotate-now)."""
+        last-rotation check (used by /fitcheck-rotate-now).
+
+        Crash-safety contract:
+          1. The cooldown check skips this call if a recent rotation
+             is on file. So a process restart inside the polling
+             interval can't double-fire.
+          2. The last-rotation timestamp is stamped BEFORE we send the
+             announcement. If we crash between role-rotation and post,
+             the next loop iteration sees a recent stamp and won't
+             retry until the next 7-day boundary — no double crown.
+          3. The announcement post is dedup'd via posted_messages by a
+             per-day identity key. If the bot was restarted *just*
+             before stamping (rare race), the identity check still
+             prevents a duplicate post.
+        """
         now = datetime.now(timezone.utc)
         last_iso = await db.get_bot_state(guild.id, DRIP_LORD_STATE_KEY)
         if not force and last_iso:
@@ -789,32 +803,29 @@ class _DripLordRotator:
                      guild.id)
             return "Seeded — first rotation in 7 days."
 
+        # Helper: stamp last-rotation and bail with a status string. Used
+        # for every "we're not actually crowning anyone" exit so the next
+        # iteration won't re-evaluate until the cooldown elapses again.
+        async def _stamp_skip(reason: str) -> str:
+            await db.set_bot_state(
+                guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
+            )
+            log.info("[drip-lord] guild=%s %s", guild.id, reason.lower())
+            return reason
+
         since = now - DRIP_LORD_INTERVAL
         rows = await db.top_fitchecks_in_window(
             guild_id=guild.id, since_iso=since.isoformat(), limit=1,
         )
         if not rows:
-            await db.set_bot_state(
-                guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
+            return await _stamp_skip(
+                "No fit checks posted in the past week — no Drip Lord crowned."
             )
-            log.info(
-                "[drip-lord] guild=%s no entries in window — skipping crown",
-                guild.id,
-            )
-            return "No fit checks posted in the past week — no Drip Lord crowned."
         winner = rows[0]
         net = int(winner["ups"]) - int(winner["downs"])
         if net <= 0:
-            await db.set_bot_state(
-                guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
-            )
-            log.info(
-                "[drip-lord] guild=%s top entry net=%d (≤0) — skipping crown",
-                guild.id, net,
-            )
-            return (
-                f"Top entry's net score was {net} — skipped, no Drip Lord "
-                "this week."
+            return await _stamp_skip(
+                f"Top entry's net score was {net} — skipped, no Drip Lord this week."
             )
 
         # Resolve the winner member; bail (gracefully) if they've left.
@@ -825,18 +836,8 @@ class _DripLordRotator:
             except (discord.NotFound, discord.HTTPException):
                 member = None
         if member is None:
-            # Mark the rotation as run anyway — leaving the timer stuck
-            # on a ghost winner would freeze every future rotation.
-            await db.set_bot_state(
-                guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
-            )
-            log.warning(
-                "[drip-lord] guild=%s winner %s left — rotation skipped",
-                guild.id, winner["poster_id"],
-            )
-            return "Winner left the server — skipped this week."
+            return await _stamp_skip("Winner left the server — skipped this week.")
 
-        # Role rotation — strip from existing holders, grant to new winner.
         role = discord.utils.get(guild.roles, name=DRIP_LORD_ROLE_NAME)
         if role is None:
             log.warning(
@@ -848,12 +849,43 @@ class _DripLordRotator:
                 "Run /setup-server to create it."
             )
 
+        # Per-day identity key for the announcement. Two rotations on the
+        # same calendar day are forbidden — used both as the dedup key
+        # for posted_messages and as a sanity rail against any future
+        # poll-cadence change firing twice in a day.
+        identity = f"{now:%Y-%m-%d}"
+        already_posted = await db.find_posted_message(
+            "drip_lord", identity, guild.id,
+        )
+
+        # **Stamp eagerly** before any side effects — if the rotation
+        # crashes mid-flow, the next loop iteration will see a recent
+        # stamp and skip until next week. We accept "lost rotation" over
+        # "double-crowned rotation."
+        await db.set_bot_state(
+            guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
+        )
+
         try:
             await self._rotate_role(guild, role, member)
         except discord.Forbidden:
             return (
                 f"Couldn't rotate the `{DRIP_LORD_ROLE_NAME}` role — "
                 "the bot's role needs to be above it. Flag an admin."
+            )
+
+        if already_posted is not None:
+            # We crashed last time after the announcement but before the
+            # bot_state stamp. Role is now in sync with this week's pick;
+            # we don't need to re-announce.
+            log.info(
+                "[drip-lord] guild=%s identity=%s already announced "
+                "(message_id=%s) — role re-synced, no double-post",
+                guild.id, identity, already_posted["message_id"],
+            )
+            return (
+                f"Crowned {member.display_name} as Drip Lord (net {net:+d}); "
+                "announcement was already on record from a prior run."
             )
 
         # Pull the winning fit's image bytes back off the Discord CDN so
@@ -914,6 +946,16 @@ class _DripLordRotator:
                 announce_msg = await announcements.send(
                     content=member.mention, embed=embed, files=files,
                 )
+                # Record the post immediately — narrow window between send
+                # and record means crash-here is rare, and the duplicate
+                # guard above catches it next time.
+                await db.record_posted_message(
+                    kind="drip_lord", identity=identity,
+                    guild_id=guild.id,
+                    channel_id=announcements.id,
+                    message_id=announce_msg.id,
+                    now_iso=now.isoformat(),
+                )
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(
                     "[drip-lord] guild=%s announce failed: %s", guild.id, e,
@@ -923,10 +965,6 @@ class _DripLordRotator:
                 "[drip-lord] guild=%s no #%s channel found",
                 guild.id, ANNOUNCEMENTS_CHANNEL,
             )
-
-        await db.set_bot_state(
-            guild.id, DRIP_LORD_STATE_KEY, now.isoformat(), now.isoformat(),
-        )
 
         # Audit dump so staff can see the rotation happened even if the
         # announcement channel post failed.

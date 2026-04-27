@@ -518,7 +518,7 @@ def _compose_player_card_png(
         chip_font = _fit_text_to_box(
             draw, label,
             max_w=PORTRAIT_W - 16, max_h=CHIP_H - 12,
-            max_size=36, min_size=14,
+            max_size=36, min_size=22,
         )
         bbox = draw.textbbox((0, 0), label, font=chip_font)
         tw = bbox[2] - bbox[0]
@@ -549,7 +549,7 @@ def _compose_player_card_png(
     rank_font = _fit_text_to_box(
         draw, rank_label,
         max_w=rank_label_w, max_h=rank_box_h - 30,
-        max_size=44, min_size=18,
+        max_size=44, min_size=24,
     )
     bbox = draw.textbbox((0, 0), rank_label, font=rank_font)
     th = bbox[3] - bbox[1]
@@ -565,7 +565,7 @@ def _compose_player_card_png(
     name_font = _fit_text_to_box(
         draw, display_name,
         max_w=name_box_w, max_h=name_box_h,
-        max_size=44, min_size=14,
+        max_size=44, min_size=22,
         font_loader=_load_font,
     )
     bbox = draw.textbbox((0, 0), display_name, font=name_font)
@@ -584,7 +584,7 @@ def _compose_player_card_png(
         caption_font = _fit_text_to_box(
             draw, caption,
             max_w=name_box_w, max_h=28,
-            max_size=22, min_size=12,
+            max_size=22, min_size=18,
             font_loader=_load_font,
         )
         bbox = draw.textbbox((0, 0), caption, font=caption_font)
@@ -717,7 +717,7 @@ def _compose_fitcheck_card_png(
     title_font = _fit_text_to_box(
         draw, title,
         max_w=text_max_w, max_h=HEADER_H - 48,
-        max_size=56, min_size=22,
+        max_size=56, min_size=32,
     )
     bbox = draw.textbbox((0, 0), title, font=title_font)
     th = bbox[3] - bbox[1]
@@ -771,7 +771,7 @@ def _compose_fitcheck_card_png(
     left_font = _fit_text_to_box(
         draw, left_label,
         max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 24,
-        max_size=24, min_size=14,
+        max_size=24, min_size=20,
     )
     bbox = draw.textbbox((0, 0), left_label, font=left_font)
     th = bbox[3] - bbox[1]
@@ -793,7 +793,7 @@ def _compose_fitcheck_card_png(
             draw, rk_label,
             max_w=W // 2 - 2 * PAD - rk_size - 12,
             max_h=FOOTER_H - 24,
-            max_size=22, min_size=12,
+            max_size=22, min_size=18,
         )
         bbox = draw.textbbox((0, 0), rk_label, font=rk_font)
         tw = bbox[2] - bbox[0]
@@ -808,7 +808,7 @@ def _compose_fitcheck_card_png(
         cta_font = _fit_text_to_box(
             draw, cta,
             max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 24,
-            max_size=24, min_size=14,
+            max_size=24, min_size=20,
         )
         bbox = draw.textbbox((0, 0), cta, font=cta_font)
         tw = bbox[2] - bbox[0]
@@ -924,7 +924,7 @@ def _compose_drip_lord_png(
     title_font = _fit_text_to_box(
         draw, winner_name,
         max_w=W - 2 * PAD - 24, max_h=HEADER_H - 60,
-        max_size=58, min_size=22,
+        max_size=58, min_size=30,
         font_loader=_load_font,
     )
     bbox = draw.textbbox((0, 0), winner_name, font=title_font)
@@ -983,7 +983,7 @@ def _compose_drip_lord_png(
     char_font = _fit_text_to_box(
         draw, char_label,
         max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 30,
-        max_size=30, min_size=14,
+        max_size=30, min_size=22,
     )
     bbox = draw.textbbox((0, 0), char_label, font=char_font)
     th = bbox[3] - bbox[1]
@@ -997,7 +997,7 @@ def _compose_drip_lord_png(
     score_font = _fit_text_to_box(
         draw, score_label,
         max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 30,
-        max_size=42, min_size=18,
+        max_size=42, min_size=26,
     )
     bbox = draw.textbbox((0, 0), score_label, font=score_font)
     tw = bbox[2] - bbox[0]
