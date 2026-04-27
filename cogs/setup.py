@@ -25,6 +25,7 @@ from discord.ext import commands
 import channel_util
 import db
 import media
+import rank_meta
 import tournament_render
 import wavu
 from cogs.onboarding import (
@@ -95,6 +96,10 @@ SERVER_PLAN: list[CategorySpec] = [
                     "timed out, or banned."),
         ChannelSpec("📣-announcements", "text",
                     "📣 Server-wide announcements. Staff-only posting."),
+        ChannelSpec("📈-rank-ups", "text",
+                    "📈 Promotion celebrations. The bot posts a "
+                    "Pillow card whenever a verified player ranks up.",
+                    verified_only=True),
         ChannelSpec("🎴-player-hub", "text",
                     "🎴 START HERE. Click Verify to link your Tekken ID "
                     "and unlock matchmaking + rank roles."),
@@ -452,75 +457,12 @@ BANNER_PLAN: list[BannerSpec] = [
 ]
 
 
-# Rank-tier role colours — each Tekken section gets its own hue, with
-# the per-tier shade brightening within the section to telegraph "higher
-# rank = brighter". Pulled from the in-game rank-tier colour bands; if
-# Bandai changes the palette in a future patch, edit here and re-run
-# /setup-server (the colour sync is idempotent).
-#
-# Sections (by index in wavu.TEKKEN_RANKS):
-#   0      Beginner             — neutral grey
-#   1-2    Dan tier              — bronze
-#   3-6    Fighter section       — green
-#   7-10   Ranger section        — teal
-#   11-14  Vanquisher section    — blue
-#   15-17  Garyu section         — purple
-#   18-20  Ruler section         — amber
-#   21-24  Fujin section         — red
-#   25-28  Tekken King section   — gold
-#   29-33  God of Destruction    — violet → prismatic gold for ∞
-RANK_COLORS: dict[str, tuple[int, int, int]] = {
-    "Beginner":              (140, 140, 145),
-
-    "1st Dan":               (130, 100,  70),
-    "2nd Dan":               (170, 130,  80),
-
-    "Fighter":               ( 60, 130,  80),
-    "Strategist":            ( 75, 155, 100),
-    "Combatant":             ( 95, 180, 120),
-    "Brawler":               (120, 210, 140),
-
-    "Ranger":                ( 60, 140, 150),
-    "Cavalry":               ( 75, 165, 180),
-    "Warrior":               ( 95, 190, 205),
-    "Assailant":             (120, 215, 230),
-
-    "Dominator":             ( 60,  90, 175),
-    "Vanquisher":            ( 80, 120, 200),
-    "Destroyer":             (100, 145, 220),
-    "Eliminator":            (130, 170, 240),
-
-    "Garyu":                 (110,  60, 175),
-    "Shinryu":               (140,  90, 205),
-    "Tenryu":                (175, 125, 230),
-
-    "Mighty Ruler":          (200, 110,  50),
-    "Flame Ruler":           (225, 145,  70),
-    "Battle Ruler":          (245, 180,  95),
-
-    "Fujin":                 (175,  50,  60),
-    "Raijin":                (200,  80,  90),
-    "Kishin":                (220, 110, 120),
-    "Bushin":                (240, 145, 155),
-
-    "Tekken King":           (200, 165,  50),
-    "Tekken Emperor":        (225, 185,  70),
-    "Tekken God":            (240, 205,  95),
-    "Tekken God Supreme":    (255, 225, 130),
-
-    "God of Destruction":    (180,  80, 200),
-    "God of Destruction I":  (170, 100, 220),
-    "God of Destruction II": (160, 130, 240),
-    "God of Destruction III":(150, 170, 250),
-    "God of Destruction ∞":  (255, 215,   0),  # ∞ — pure gold, the ceiling
-}
-
-
-def _rank_color(rank_name: str) -> discord.Color:
-    rgb = RANK_COLORS.get(rank_name)
-    if rgb is None:
-        return discord.Color.default()
-    return discord.Color.from_rgb(*rgb)
+# Rank-tier colours moved to the top-level `rank_meta` module so per-rank
+# embed tints, the rank-up celebration card, and the recap composite can
+# all reuse the same palette without circular-imports through the cogs
+# package. Re-export under the local name so legacy references still work.
+RANK_COLORS = rank_meta.RANK_COLORS
+_rank_color = rank_meta.rank_color
 
 
 # Every role here ships with hoist=False — only the bot's own role

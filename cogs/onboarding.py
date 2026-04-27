@@ -16,6 +16,7 @@ import channel_util
 import db
 import ewgf
 import media
+import rank_meta
 import tournament_render
 import wavu
 from view_util import ErrorHandledView
@@ -217,6 +218,68 @@ _LEGACY_BOT_RANK_ROLES: set[str] = {
 
 def _bot_managed_rank_names() -> set[str]:
     return set(wavu.ALL_RANK_NAMES) | _LEGACY_BOT_RANK_ROLES
+
+
+RANK_UP_CHANNEL = "rank-ups"
+
+
+async def _post_rank_up_celebration(
+    guild: discord.Guild | None,
+    member: discord.Member,
+    *,
+    character: str | None,
+    from_rank: str | None,
+    to_rank: str | None,
+) -> None:
+    """Best-effort promotion celebration. Fires when a player's rank
+    moves UP the tier list (demotions are silent — promotions are
+    dopamine, demotions are lore). Falls back gracefully if the
+    rank-ups channel isn't provisioned yet."""
+    if guild is None or to_rank is None:
+        return
+    if not rank_meta.is_promotion(from_rank, to_rank):
+        # Same rank, demotion, or unknown — no celebration.
+        return
+    channel = (
+        channel_util.find_text_channel(guild, RANK_UP_CHANNEL)
+        or channel_util.find_text_channel(guild, "player-hub")
+    )
+    if channel is None:
+        log.info(
+            "[rank-up] guild=%s member=%s no rank-ups channel — skipped",
+            guild.id, member.id,
+        )
+        return
+    try:
+        card_buf = await tournament_render.render_rank_up_card(
+            player_name=member.display_name,
+            character=character,
+            from_rank=from_rank,
+            to_rank=to_rank,
+        )
+    except Exception:
+        log.exception(
+            "[rank-up] guild=%s member=%s render failed",
+            guild.id, member.id,
+        )
+        return
+    embed = discord.Embed(
+        title=f"📈 {member.display_name} promoted to {to_rank}",
+        description=(
+            f"{member.mention} climbed from **{from_rank or '—'}** to "
+            f"**{to_rank}**. GG."
+        ),
+        color=rank_meta.rank_color(to_rank),
+    )
+    embed.set_image(url="attachment://rank-up.png")
+    file = discord.File(card_buf, filename="rank-up.png")
+    try:
+        await channel.send(content=member.mention, embed=embed, file=file)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(
+            "[rank-up] guild=%s member=%s post failed: %s",
+            guild.id, member.id, e,
+        )
 
 
 async def _apply_rank_and_verified(member: discord.Member, profile: wavu.PlayerProfile) -> None:
@@ -494,7 +557,16 @@ class TekkenIdModal(discord.ui.Modal, title="Enter your Tekken ID"):
 
 
 def _profile_embed(p: wavu.PlayerProfile) -> discord.Embed:
-    embed = discord.Embed(title=p.display_name, color=discord.Color.blurple())
+    # Tint the embed by the player's rank so the role-list colour story
+    # carries through into every profile rendering. Falls back to
+    # blurple for unranked / unknown so unverified replies still look
+    # consistent.
+    color = (
+        rank_meta.rank_color(p.rank_tier)
+        if p.rank_tier
+        else discord.Color.blurple()
+    )
+    embed = discord.Embed(title=p.display_name, color=color)
     embed.add_field(name="🪪 Tekken ID", value=f"`{p.tekken_id}`", inline=False)
     embed.add_field(name="🥊 Main", value=p.main_char or "—", inline=True)
     embed.add_field(name="🏅 Rank", value=p.rank_tier or "—", inline=True)
@@ -512,31 +584,79 @@ def _profile_embed(p: wavu.PlayerProfile) -> discord.Embed:
     return embed
 
 
+async def _compute_badges_for_member(
+    member: discord.Member | None,
+) -> list[tuple[str, tuple[int, int, int]]]:
+    """Return the badge chips a player has earned. Cheap-only checks —
+    Discord role membership for current-Drip-Lord and Verified, single
+    DB queries for tournament champion and fit-check veteran. Order is
+    deliberate: highest-prestige first so the leftmost chip is the one
+    we'd want visible if Discord scales the card down."""
+    if member is None:
+        return []
+    chips: list[tuple[str, tuple[int, int, int]]] = []
+    role_names = {r.name for r in member.roles}
+
+    # Drip Lord first — current crown-holder, the loudest flair.
+    if "Drip Lord" in role_names:
+        chips.append(("👑 Drip Lord", (212, 175, 55)))
+
+    # Tournament Champion — at least one COMPLETED tournament won here.
+    if member.guild is not None:
+        won = await db.has_tournament_win(member.guild.id, member.id)
+        if won:
+            chips.append(("🏆 Champion", (200, 165, 50)))
+
+    # Fit Check Veteran — 10+ posts. Cheap aggregate query.
+    if member.guild is not None:
+        stats = await db.get_user_fitcheck_stats(member.guild.id, member.id)
+        if stats["posts"] >= 10:
+            chips.append(("📸 Veteran", (200, 30, 40)))
+
+    if VERIFIED_ROLE_NAME in role_names:
+        chips.append(("✅ Verified", (50, 160, 90)))
+
+    return chips
+
+
 async def _profile_card_payload(
     p: wavu.PlayerProfile,
+    *,
+    member: discord.Member | None = None,
 ) -> tuple[discord.Embed, discord.File] | tuple[discord.Embed, None]:
     """Render the broadcast-style player card and pair it with a slim
     embed that hosts the title + tekken ID + rating-mu line. The image
     carries name / rank / character; the embed carries the metadata
     bits that don't fit cleanly inside the card.
 
+    `member`, when supplied, drives the achievement-badge chips along
+    the bottom of the card. Callers without a Member context (admin
+    DMs, no-guild slash commands) skip badges silently.
+
     Returns (embed_with_attachment_image, file) on success or
     (text_only_embed, None) if rendering blew up — callers can splat
     the tuple into followup.send and the fallback is harmless.
     """
-    embed = discord.Embed(title=p.display_name, color=discord.Color.blurple())
+    color = (
+        rank_meta.rank_color(p.rank_tier)
+        if p.rank_tier
+        else discord.Color.blurple()
+    )
+    embed = discord.Embed(title=p.display_name, color=color)
     embed.add_field(name="🪪 Tekken ID", value=f"`{p.tekken_id}`", inline=False)
     if p.rating_mu is not None:
         embed.add_field(
             name="📊 Rating (μ)", value=f"{p.rating_mu:.0f}", inline=True,
         )
     embed.set_footer(text="Sources: wank.wavu.wiki + ewgf.gg")
+    badges = await _compute_badges_for_member(member)
     try:
         card_buf = await tournament_render.render_player_card(
             display_name=p.display_name,
             rank_tier=p.rank_tier,
             main_char=p.main_char,
             tekken_id=p.tekken_id,
+            badges=badges,
         )
     except Exception:
         log.exception("[profile-card] render failed for %s", p.tekken_id)
@@ -714,7 +834,7 @@ class ConfirmProfileView(ErrorHandledView):
             content=f"✅ Verified. Welcome, {self.profile.display_name}.",
             embed=None, view=None,
         )
-        embed, file = await _profile_card_payload(self.profile)
+        embed, file = await _profile_card_payload(self.profile, member=member)
         try:
             if file is not None:
                 await interaction.followup.send(
@@ -844,6 +964,11 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
                     ("Trigger", "self-refresh", True),
                 ],
             )
+            await _post_rank_up_celebration(
+                interaction.guild, member,
+                character=profile.main_char,
+                from_rank=stored, to_rank=rank_tier,
+            )
         return False
 
     if rank_name is not None:
@@ -857,7 +982,7 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
                 ephemeral=True,
             )
         else:
-            embed, file = await _profile_card_payload(profile)
+            embed, file = await _profile_card_payload(profile, member=member)
             kwargs: dict = {"content": "Updated.", "embed": embed, "ephemeral": True}
             if file is not None:
                 kwargs["file"] = file
@@ -865,7 +990,7 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     elif stored_is_valid:
         # rank_tier == stored, so needs_pending is False; safe.
         await _save_and_apply(stored)
-        embed, file = await _profile_card_payload(profile)
+        embed, file = await _profile_card_payload(profile, member=member)
         kwargs = {
             "content": "Updated. *(Couldn't auto-detect rank — kept your existing one.)*",
             "embed": embed, "ephemeral": True,
@@ -933,7 +1058,11 @@ async def _flow_profile(interaction: discord.Interaction) -> None:
                 "organizer confirms — no rank role granted."
             )
     await interaction.response.defer(ephemeral=True, thinking=True)
-    embed, file = await _profile_card_payload(profile)
+    member = (
+        interaction.guild.get_member(interaction.user.id)
+        if interaction.guild else None
+    )
+    embed, file = await _profile_card_payload(profile, member=member)
     if extra is not None:
         embed.add_field(name="Verification status", value=extra, inline=False)
     if file is not None:
@@ -1223,6 +1352,11 @@ async def refresh_player_from_api(
                 ("To", new_tier, True),
                 ("Trigger", audit_source, True),
             ],
+        )
+        await _post_rank_up_celebration(
+            guild, member,
+            character=profile.main_char,
+            from_rank=stored, to_rank=new_tier,
         )
         return {"status": "rank-changed", "from": stored, "to": new_tier}
     return {"status": "ok"}
@@ -1999,7 +2133,7 @@ class Onboarding(commands.Cog):
                 ephemeral=True,
             )
             return
-        embed, file = await _profile_card_payload(profile)
+        embed, file = await _profile_card_payload(profile, member=member)
         kwargs: dict = {
             "content": f"Linked {member.mention}.",
             "embed": embed, "ephemeral": True,

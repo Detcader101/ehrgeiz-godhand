@@ -434,6 +434,7 @@ async def render_player_card(
     main_char: str | None,
     tekken_id: str | None = None,
     badge: str | None = None,
+    badges: list[tuple[str, tuple[int, int, int]]] | None = None,
 ) -> io.BytesIO:
     """Standalone broadcast-style card for one player.
 
@@ -468,7 +469,7 @@ async def render_player_card(
 
     return await asyncio.to_thread(
         _compose_player_card_png,
-        display_name, rank_tier, main_char, tekken_id, badge,
+        display_name, rank_tier, main_char, tekken_id, badge, badges or [],
         rank_icon, char_icon,
     )
 
@@ -479,11 +480,16 @@ def _compose_player_card_png(
     main_char: str | None,
     tekken_id: str | None,
     badge: str | None,
+    badges: list[tuple[str, tuple[int, int, int]]],
     rank_icon: Image.Image | None,
     char_icon: Image.Image | None,
 ) -> io.BytesIO:
+    # Add a footer band when badges are present so they don't crowd the
+    # name/caption above. Each badge is a small chip ~32px tall; we
+    # collapse to a single 44px band for any number of badges.
+    badge_band_h = 44 if badges else 0
     W = PLAYER_CARD_W
-    H = PLAYER_CARD_H
+    H = PLAYER_CARD_H + badge_band_h
     PORTRAIT_W = 220
     CHIP_H = 44
     ACCENT_W = 6
@@ -594,7 +600,48 @@ def _compose_player_card_png(
         )
 
     # Bottom accent strip — mirrors the top, ties the card together.
-    draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
+    # When a badge band is present it sits below this line; otherwise the
+    # line is the very last 2px of the card.
+    main_bottom = PLAYER_CARD_H if badges else H
+    draw.line([(0, main_bottom - 2), (W, main_bottom - 2)], fill=ACCENT, width=2)
+
+    if badges:
+        # Badge chips on the trailing band. Pillow doesn't have rounded
+        # rectangles in older versions, so we use plain solid fills with
+        # 1px breathing on each side. Up to 6 badges fit comfortably at
+        # PLAYER_CARD_W=600; the layout truncates beyond that to avoid
+        # squashed text.
+        band_top = PLAYER_CARD_H
+        chip_h = 30
+        chip_y = band_top + (badge_band_h - chip_h) // 2
+        chip_pad_x = 14
+        chip_gap = 8
+        chip_x = ACCENT_W + 12
+        chip_font_max = 22
+        chip_font_min = 14
+        for label, rgb in badges[:6]:
+            label_str = label.upper()
+            chip_font = _fit_text_to_box(
+                draw, label_str,
+                max_w=200, max_h=chip_h - 8,
+                max_size=chip_font_max, min_size=chip_font_min,
+            )
+            bbox = draw.textbbox((0, 0), label_str, font=chip_font)
+            tw = bbox[2] - bbox[0]
+            chip_w = tw + 2 * chip_pad_x
+            if chip_x + chip_w > W - 8:
+                break  # ran out of space; trailing badges are dropped
+            draw.rectangle(
+                [(chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h)],
+                fill=rgb,
+            )
+            th = bbox[3] - bbox[1]
+            draw.text(
+                (chip_x + chip_pad_x,
+                 chip_y + (chip_h - th) // 2 - bbox[1]),
+                label_str, fill=TEXT, font=chip_font,
+            )
+            chip_x += chip_w + chip_gap
 
     return _to_png_buf(img)
 
@@ -1008,6 +1055,659 @@ def _compose_drip_lord_png(
         score_label, fill=GOLD, font=score_font,
     )
 
+    return _to_png_buf(canvas)
+
+
+# --------------------------------------------------------------------------- #
+# Rank-up celebration card                                                     #
+# --------------------------------------------------------------------------- #
+
+import rank_meta as _rank_meta  # local-ish import; avoids cog/circular setup
+
+
+async def render_rank_up_card(
+    *,
+    player_name: str,
+    character: str | None,
+    from_rank: str | None,
+    to_rank: str,
+) -> io.BytesIO:
+    """Promotion card — fires when a player's rank role moves up.
+
+    Layout:
+      [LEFT]  Gold "PROMOTED" kicker, player name in big body font,
+              "X tier · position-of-section" subtitle.
+      [RIGHT] from_rank icon + arrow + to_rank icon, with rank labels
+              underneath. New rank's section colour tints the right
+              column so the visual feel scales with the ceiling moment.
+    """
+    rank_url_from = media.rank_icon_url(from_rank) if from_rank else None
+    rank_url_to = media.rank_icon_url(to_rank)
+    char_url = media.character_icon_url(character)
+
+    session: aiohttp.ClientSession | None = None
+    try:
+        urls = [u for u in (rank_url_from, rank_url_to, char_url) if u]
+        needs_net = any(
+            not _cache_path_for(u, RANK_CACHE_DIR if "rank-icons" in u else CHAR_CACHE_DIR).exists()
+            for u in urls
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        rank_icon_from = await _fetch_icon(rank_url_from, RANK_CACHE_DIR, session)
+        rank_icon_to = await _fetch_icon(rank_url_to, RANK_CACHE_DIR, session)
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_rank_up_png,
+        player_name, character, from_rank, to_rank,
+        rank_icon_from, rank_icon_to, char_icon,
+    )
+
+
+def _compose_rank_up_png(
+    player_name: str,
+    character: str | None,
+    from_rank: str | None,
+    to_rank: str,
+    rank_icon_from: Image.Image | None,
+    rank_icon_to: Image.Image | None,
+    char_icon: Image.Image | None,
+) -> io.BytesIO:
+    W = 720
+    H = 240
+    PAD = 18
+
+    img = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+    _paint_header_gradient(img, 0, H)
+
+    # Section colour stripe down the right edge — telegraphs the
+    # destination tier at a glance even before icons load.
+    new_rgb = _rank_meta.rank_color_rgb(to_rank) or ACCENT
+    stripe_w = 8
+    draw.rectangle([(W - stripe_w, 0), (W, H)], fill=new_rgb)
+
+    # Top accent rule.
+    draw.line([(0, 0), (W, 6)], fill=ACCENT, width=6)
+
+    # --- LEFT column: kicker + name + subtitle ---------------------------- #
+    LEFT_W = 360
+    kicker = "PROMOTED"
+    kicker_font = _load_display_font(28)
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text((PAD + 4, 22 - bbox[1]), kicker, fill=ACCENT, font=kicker_font)
+
+    # Player name — body font (preserves mixed case).
+    name_y = 60
+    name_font = _fit_text_to_box(
+        draw, player_name,
+        max_w=LEFT_W - PAD, max_h=70,
+        max_size=48, min_size=22,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), player_name, font=name_font)
+    draw.text(
+        (PAD + 4, name_y - bbox[1]),
+        player_name, fill=TEXT, font=name_font,
+    )
+
+    # Section subtitle — "Vanquisher tier · 3 of 4"
+    section = _rank_meta.rank_section(to_rank) or ""
+    pos = _rank_meta.rank_position_in_section(to_rank)
+    subtitle_parts = []
+    if section:
+        subtitle_parts.append(f"{section.upper()} TIER")
+    if pos:
+        subtitle_parts.append(f"{pos[0]} OF {pos[1]}")
+    subtitle = "  ·  ".join(subtitle_parts)
+    if subtitle:
+        sub_y = name_y + 70
+        sub_font = _fit_text_to_box(
+            draw, subtitle,
+            max_w=LEFT_W - PAD, max_h=30,
+            max_size=22, min_size=16,
+        )
+        bbox = draw.textbbox((0, 0), subtitle, font=sub_font)
+        draw.text(
+            (PAD + 4, sub_y - bbox[1]),
+            subtitle, fill=TEXT_DIM, font=sub_font,
+        )
+
+    # Character chip in the bottom-left corner if we know the main.
+    if character:
+        chip_h = 36
+        chip_y = H - chip_h - PAD
+        chip_text = character.upper()
+        chip_font = _fit_text_to_box(
+            draw, chip_text,
+            max_w=LEFT_W - PAD, max_h=chip_h - 12,
+            max_size=22, min_size=16,
+        )
+        bbox = draw.textbbox((0, 0), chip_text, font=chip_font)
+        tw = bbox[2] - bbox[0]
+        chip_w = tw + 32
+        if char_icon is not None:
+            chip_w += chip_h + 4
+        draw.rectangle(
+            [(PAD, chip_y), (PAD + chip_w, chip_y + chip_h)],
+            fill=ACCENT,
+        )
+        text_x = PAD + 16
+        if char_icon is not None:
+            _paste_icon(
+                img, char_icon, PAD + 4, chip_y + 4,
+                chip_h - 8, chip_h - 8,
+            )
+            text_x = PAD + chip_h + 8
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (text_x, chip_y + (chip_h - th) // 2 - bbox[1]),
+            chip_text, fill=TEXT, font=chip_font,
+        )
+
+    # --- RIGHT column: from_rank → to_rank --------------------------- #
+    right_x0 = LEFT_W
+    right_w = W - right_x0 - stripe_w
+    icon_size = 92
+    gap = 28
+    arrow_w = 36
+    block_w = icon_size + gap + arrow_w + gap + icon_size
+    block_x0 = right_x0 + (right_w - block_w) // 2
+    icon_y = (H - icon_size) // 2 - 14
+
+    # FROM icon (or muted placeholder if unranked previously).
+    from_x = block_x0
+    if rank_icon_from is not None:
+        _paste_icon(img, rank_icon_from, from_x, icon_y, icon_size, icon_size)
+    else:
+        draw.ellipse(
+            [(from_x, icon_y), (from_x + icon_size, icon_y + icon_size)],
+            outline=TEXT_DIM, width=2,
+        )
+
+    # Arrow — gold chevron.
+    arrow_x = from_x + icon_size + gap
+    arrow_cy = icon_y + icon_size // 2
+    arrow_pts = [
+        (arrow_x, arrow_cy - 12),
+        (arrow_x + arrow_w - 8, arrow_cy),
+        (arrow_x, arrow_cy + 12),
+    ]
+    draw.polygon(arrow_pts, fill=(212, 175, 55))
+    draw.line(
+        [(arrow_x, arrow_cy), (arrow_x + arrow_w - 8, arrow_cy)],
+        fill=(212, 175, 55), width=4,
+    )
+
+    # TO icon — bigger pop with a coloured ring underneath.
+    to_x = arrow_x + arrow_w + gap
+    ring_pad = 4
+    draw.ellipse(
+        [(to_x - ring_pad, icon_y - ring_pad),
+         (to_x + icon_size + ring_pad, icon_y + icon_size + ring_pad)],
+        fill=new_rgb,
+    )
+    if rank_icon_to is not None:
+        _paste_icon(img, rank_icon_to, to_x, icon_y, icon_size, icon_size)
+
+    # Rank labels under each icon.
+    label_y = icon_y + icon_size + 12
+    label_font = _load_display_font(22)
+    if from_rank:
+        from_label = from_rank.upper()
+        bbox = draw.textbbox((0, 0), from_label, font=label_font)
+        tw = bbox[2] - bbox[0]
+        draw.text(
+            (from_x + (icon_size - tw) // 2, label_y - bbox[1]),
+            from_label, fill=TEXT_DIM, font=label_font,
+        )
+    to_label = to_rank.upper()
+    to_font = _fit_text_to_box(
+        draw, to_label,
+        max_w=icon_size + 60, max_h=28,
+        max_size=24, min_size=16,
+    )
+    bbox = draw.textbbox((0, 0), to_label, font=to_font)
+    tw = bbox[2] - bbox[0]
+    draw.text(
+        (to_x + (icon_size - tw) // 2, label_y - bbox[1]),
+        to_label, fill=TEXT, font=to_font,
+    )
+
+    # Bottom accent.
+    draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
+    return _to_png_buf(img)
+
+
+# --------------------------------------------------------------------------- #
+# Tournament champion card                                                     #
+# --------------------------------------------------------------------------- #
+
+
+async def render_tournament_champion_card(
+    *,
+    tournament_name: str,
+    winner_name: str,
+    winner_character: str | None,
+    winner_rank: str | None,
+    runner_up_name: str | None,
+    entrants: int,
+    rounds_played: int,
+) -> io.BytesIO:
+    """End-of-tournament champion banner — gold trim, big winner block,
+    runner-up + entrants stats footer. Inverse layout of the Drip Lord
+    card so the two read distinctly even side by side in a feed."""
+    char_url = media.character_icon_url(winner_character)
+    rank_url = media.rank_icon_url(winner_rank)
+
+    session: aiohttp.ClientSession | None = None
+    try:
+        urls = [u for u in (char_url, rank_url) if u]
+        needs_net = any(
+            not _cache_path_for(u, RANK_CACHE_DIR if "rank-icons" in u else CHAR_CACHE_DIR).exists()
+            for u in urls
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+        rank_icon = await _fetch_icon(rank_url, RANK_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_tournament_champion_png,
+        tournament_name, winner_name, winner_character, winner_rank,
+        runner_up_name, entrants, rounds_played,
+        char_icon, rank_icon,
+    )
+
+
+def _compose_tournament_champion_png(
+    tournament_name: str,
+    winner_name: str,
+    winner_character: str | None,
+    winner_rank: str | None,
+    runner_up_name: str | None,
+    entrants: int,
+    rounds_played: int,
+    char_icon: Image.Image | None,
+    rank_icon: Image.Image | None,
+) -> io.BytesIO:
+    GOLD = (212, 175, 55)
+    GOLD_DIM = (110, 90, 30)
+    W = 760
+    HEADER_H = 110
+    PORTRAIT_BAND_H = 280
+    FOOTER_H = 92
+    PAD = 18
+    H = HEADER_H + PORTRAIT_BAND_H + FOOTER_H
+
+    canvas = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # Subtle gold-tinted top gradient.
+    for i in range(HEADER_H):
+        t = i / max(1, HEADER_H - 1)
+        r = int(50 + (20 - 50) * t)
+        g = int(40 + (18 - 40) * t)
+        b = int(28 + (20 - 28) * t)
+        canvas.paste((r, g, b, 255), (0, i, W, i + 1))
+
+    # Kicker — "TOURNAMENT CHAMPION".
+    kicker = "TOURNAMENT  ·  CHAMPION"
+    kicker_font = _load_display_font(26)
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text(
+        ((W - (bbox[2] - bbox[0])) // 2, 18 - bbox[1]),
+        kicker, fill=GOLD, font=kicker_font,
+    )
+
+    # Tournament name title.
+    title = tournament_name.upper()
+    title_font = _fit_text_to_box(
+        draw, title,
+        max_w=W - 2 * PAD - 24, max_h=HEADER_H - 60,
+        max_size=46, min_size=24,
+    )
+    bbox = draw.textbbox((0, 0), title, font=title_font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(
+        ((W - tw) // 2, HEADER_H - th - 14 - bbox[1]),
+        title, fill=TEXT, font=title_font,
+    )
+
+    # Gold rule under header.
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=GOLD, width=3)
+    draw.line([(0, HEADER_H + 4), (W, HEADER_H + 4)], fill=GOLD_DIM, width=1)
+
+    # --- Centre band: portrait (left) + winner stack (right) -------------- #
+    band_y = HEADER_H + PAD
+    band_h = PORTRAIT_BAND_H - 2 * PAD
+    portrait_w = 220
+    portrait_rect = (PAD, band_y, PAD + portrait_w, band_y + band_h)
+
+    # Portrait cell — solid backdrop + character cover-crop, gold ring.
+    draw.rectangle(portrait_rect, fill=ROW_BG_ALT)
+    if char_icon is not None:
+        _fill_cell_with_icon_cover(
+            canvas, char_icon, portrait_rect, pad=2, vertical_anchor=0.18,
+        )
+    draw.rectangle(
+        [(portrait_rect[0] - 2, portrait_rect[1] - 2),
+         (portrait_rect[2] + 1, portrait_rect[3] + 1)],
+        outline=GOLD, width=2,
+    )
+
+    # Right column — winner name + character + rank.
+    right_x0 = portrait_rect[2] + 24
+    right_w = W - right_x0 - PAD
+
+    # Trophy mark + WINNER kicker
+    win_kicker = "🏆 CHAMPION"  # emoji may render as box on some Pillow setups; harmless
+    win_kicker_font = _load_display_font(22)
+    draw.text(
+        (right_x0, band_y + 6),
+        "CHAMPION", fill=GOLD, font=win_kicker_font,
+    )
+
+    # Player name (mixed case body).
+    name_y = band_y + 44
+    name_font = _fit_text_to_box(
+        draw, winner_name,
+        max_w=right_w, max_h=70,
+        max_size=58, min_size=28,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), winner_name, font=name_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (right_x0, name_y - bbox[1]),
+        winner_name, fill=TEXT, font=name_font,
+    )
+
+    # Character + rank line.
+    sub_parts: list[str] = []
+    if winner_character:
+        sub_parts.append(winner_character.upper())
+    if winner_rank:
+        sub_parts.append(winner_rank.upper())
+    if sub_parts:
+        sub = "  ·  ".join(sub_parts)
+        sub_y = name_y + 80
+        sub_font = _fit_text_to_box(
+            draw, sub,
+            max_w=right_w, max_h=34,
+            max_size=24, min_size=18,
+        )
+        bbox = draw.textbbox((0, 0), sub, font=sub_font)
+        # Tint colour of the sub by the rank when known.
+        sub_color = (
+            _rank_meta.rank_color_rgb(winner_rank) if winner_rank else TEXT_DIM
+        ) or TEXT_DIM
+        draw.text(
+            (right_x0, sub_y - bbox[1]),
+            sub, fill=sub_color, font=sub_font,
+        )
+
+    # Rank icon medallion bottom-right of the band.
+    if rank_icon is not None:
+        rk_size = 80
+        rk_x = W - PAD - rk_size
+        rk_y = band_y + band_h - rk_size
+        _paste_icon(canvas, rank_icon, rk_x, rk_y, rk_size, rk_size)
+
+    # --- Footer: runner-up + entrants/rounds counters --------------------- #
+    footer_y = HEADER_H + PORTRAIT_BAND_H
+    draw.line([(0, footer_y), (W, footer_y)], fill=GOLD, width=2)
+
+    runner_label = (
+        f"RUNNER-UP  ·  {runner_up_name.upper()}" if runner_up_name
+        else "RUNNER-UP  ·  —"
+    )
+    runner_font = _fit_text_to_box(
+        draw, runner_label,
+        max_w=(W // 2) - PAD, max_h=FOOTER_H - 30,
+        max_size=22, min_size=16,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), runner_label, font=runner_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (PAD + 4, footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+        runner_label, fill=TEXT, font=runner_font,
+    )
+
+    stats_label = f"{entrants} ENTRANTS  ·  {rounds_played}R SWISS"
+    stats_font = _fit_text_to_box(
+        draw, stats_label,
+        max_w=(W // 2) - PAD, max_h=FOOTER_H - 30,
+        max_size=22, min_size=16,
+    )
+    bbox = draw.textbbox((0, 0), stats_label, font=stats_font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (W - PAD - 4 - tw,
+         footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+        stats_label, fill=GOLD, font=stats_font,
+    )
+
+    return _to_png_buf(canvas)
+
+
+# --------------------------------------------------------------------------- #
+# Weekly recap composite                                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def render_weekly_recap_card(
+    *,
+    week_label: str,             # "2026-04-21 → 2026-04-27"
+    drip_lord_name: str | None,
+    drip_lord_character: str | None,
+    top_fit_poster: str | None,
+    top_fit_character: str | None,
+    top_fit_net: int | None,
+    new_members: int,
+    fitchecks_posted: int,
+    tournaments_completed: int,
+) -> io.BytesIO:
+    """One-image weekly digest. Hits the highlights without making the
+    user click through five different commands to see what happened in
+    the server this week."""
+    char_url_top = media.character_icon_url(top_fit_character)
+    char_url_drip = media.character_icon_url(drip_lord_character)
+
+    session: aiohttp.ClientSession | None = None
+    try:
+        urls = [u for u in (char_url_top, char_url_drip) if u]
+        needs_net = any(
+            not _cache_path_for(u, CHAR_CACHE_DIR).exists() for u in urls
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        char_icon_top = await _fetch_icon(char_url_top, CHAR_CACHE_DIR, session)
+        char_icon_drip = await _fetch_icon(char_url_drip, CHAR_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_weekly_recap_png,
+        week_label,
+        drip_lord_name, drip_lord_character, char_icon_drip,
+        top_fit_poster, top_fit_character, top_fit_net, char_icon_top,
+        new_members, fitchecks_posted, tournaments_completed,
+    )
+
+
+def _draw_recap_tile(
+    img: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    *,
+    rect: tuple[int, int, int, int],
+    kicker: str,
+    kicker_color: tuple[int, int, int],
+    headline: str,
+    subline: str | None,
+    icon: Image.Image | None = None,
+) -> None:
+    x0, y0, x1, y1 = rect
+    PAD = 18
+
+    # Tile background — slightly lifted from the canvas so the grid reads.
+    draw.rectangle([(x0, y0), (x1, y1)], fill=ROW_BG_ALT)
+    draw.rectangle([(x0, y0), (x0 + 4, y1)], fill=kicker_color)
+
+    # Kicker line.
+    kicker_font = _load_display_font(22)
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text(
+        (x0 + PAD, y0 + 14 - bbox[1]),
+        kicker, fill=kicker_color, font=kicker_font,
+    )
+
+    # Optional icon medallion in the top-right of the tile.
+    icon_size = 60
+    text_right_limit = x1 - PAD
+    if icon is not None:
+        ic_x = x1 - PAD - icon_size
+        ic_y = y0 + 12
+        draw.rectangle(
+            [(ic_x - 4, ic_y - 4), (ic_x + icon_size + 4, ic_y + icon_size + 4)],
+            fill=ACCENT,
+        )
+        _paste_icon(img, icon, ic_x, ic_y, icon_size, icon_size)
+        text_right_limit = ic_x - 12
+
+    # Headline — body font for mixed-case readability.
+    headline_y = y0 + 56
+    headline_font = _fit_text_to_box(
+        draw, headline,
+        max_w=text_right_limit - x0 - PAD, max_h=36,
+        max_size=30, min_size=20,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), headline, font=headline_font)
+    draw.text(
+        (x0 + PAD, headline_y - bbox[1]),
+        headline, fill=TEXT, font=headline_font,
+    )
+
+    if subline:
+        sub_y = headline_y + 38
+        sub_font = _fit_text_to_box(
+            draw, subline,
+            max_w=text_right_limit - x0 - PAD, max_h=28,
+            max_size=22, min_size=16,
+        )
+        bbox = draw.textbbox((0, 0), subline, font=sub_font)
+        draw.text(
+            (x0 + PAD, sub_y - bbox[1]),
+            subline, fill=TEXT_DIM, font=sub_font,
+        )
+
+
+def _compose_weekly_recap_png(
+    week_label: str,
+    drip_lord_name: str | None, drip_lord_character: str | None,
+    char_icon_drip: Image.Image | None,
+    top_fit_poster: str | None, top_fit_character: str | None,
+    top_fit_net: int | None, char_icon_top: Image.Image | None,
+    new_members: int, fitchecks_posted: int, tournaments_completed: int,
+) -> io.BytesIO:
+    GOLD = (212, 175, 55)
+    W = 800
+    HEADER_H = 130
+    TILE_H = 150
+    GAP = 14
+    PAD = 16
+    H = HEADER_H + 2 * TILE_H + GAP + 2 * PAD
+
+    canvas = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+    _paint_header_gradient(canvas, 0, HEADER_H)
+
+    # Header — kicker / title / week label.
+    kicker_font = _load_display_font(22)
+    draw.text(
+        (PAD + 4, 14),
+        "EHRGEIZ  ·  WEEK IN REVIEW",
+        fill=ACCENT, font=kicker_font,
+    )
+    title_font = _load_display_font(46)
+    draw.text(
+        (PAD + 4, 44),
+        "WEEKLY RECAP",
+        fill=TEXT, font=title_font,
+    )
+    week_font = _load_font(20)
+    draw.text(
+        (PAD + 4, 96),
+        week_label,
+        fill=TEXT_DIM, font=week_font,
+    )
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=ACCENT, width=3)
+
+    # 2x2 tile grid.
+    tile_w = (W - 2 * PAD - GAP) // 2
+    row1_y = HEADER_H + PAD
+    row2_y = row1_y + TILE_H + GAP
+
+    _draw_recap_tile(
+        canvas, draw,
+        rect=(PAD, row1_y, PAD + tile_w, row1_y + TILE_H),
+        kicker="👑  DRIP LORD",
+        kicker_color=GOLD,
+        headline=drip_lord_name or "— No crown this week",
+        subline=(
+            f"{drip_lord_character.upper()}" if drip_lord_character
+            else "Take a fit-check screenshot, post it, get votes — go for the crown."
+        ),
+        icon=char_icon_drip,
+    )
+    _draw_recap_tile(
+        canvas, draw,
+        rect=(PAD + tile_w + GAP, row1_y,
+              W - PAD, row1_y + TILE_H),
+        kicker="📸  TOP FIT",
+        kicker_color=ACCENT,
+        headline=top_fit_poster or "— No fits this week",
+        subline=(
+            f"{top_fit_character.upper()}  ·  net {top_fit_net:+d}"
+            if top_fit_poster and top_fit_character is not None and top_fit_net is not None
+            else "Be first — `/fitcheck-post` to start the week."
+        ),
+        icon=char_icon_top,
+    )
+    _draw_recap_tile(
+        canvas, draw,
+        rect=(PAD, row2_y, PAD + tile_w, row2_y + TILE_H),
+        kicker="🆕  NEW MEMBERS",
+        kicker_color=(95, 180, 120),
+        headline=str(new_members),
+        subline=(
+            "Verified this week."
+            if new_members else "No new joiners this week."
+        ),
+    )
+    _draw_recap_tile(
+        canvas, draw,
+        rect=(PAD + tile_w + GAP, row2_y,
+              W - PAD, row2_y + TILE_H),
+        kicker="🏆  TOURNAMENTS",
+        kicker_color=GOLD,
+        headline=f"{tournaments_completed} completed",
+        subline=f"{fitchecks_posted} fit checks posted",
+    )
+
+    draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
     return _to_png_buf(canvas)
 
 

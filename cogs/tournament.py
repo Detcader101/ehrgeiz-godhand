@@ -2060,6 +2060,10 @@ async def _complete_tournament(
     )
 
     standings = await _compute_final_standings(tournament_id)
+    if standings:
+        # Cache the champion on the tournament row so future badge
+        # queries don't have to recompute standings to ask "did X win".
+        await db.set_tournament_winner(tournament_id, standings[0]["user_id"])
     channel = client.get_channel(tournament["signup_channel_id"])
     if not isinstance(channel, discord.TextChannel):
         return
@@ -2093,6 +2097,48 @@ async def _complete_tournament(
     except discord.HTTPException as e:
         log.warning("completion message failed for %s: %s",
                     tournament_id, e)
+
+    # Champion celebration card — gold trim banner with the winner's
+    # portrait + rank flair. Best-effort: a render or send failure is
+    # logged but doesn't block the rest of the finalisation flow.
+    if standings:
+        winner_row = standings[0]
+        runner_row = standings[1] if len(standings) > 1 else None
+        winner_player = await db.get_player_by_discord(winner_row["user_id"])
+        winner_character = (
+            winner_player["main_char"] if winner_player else None
+        )
+        try:
+            card_buf = await tournament_render.render_tournament_champion_card(
+                tournament_name=tournament["name"],
+                winner_name=winner_row["display_name"],
+                winner_character=winner_character,
+                winner_rank=winner_row["rank_tier"],
+                runner_up_name=(
+                    runner_row["display_name"] if runner_row else None
+                ),
+                entrants=len(standings),
+                rounds_played=_compute_total_rounds(len(standings)),
+            )
+            embed = discord.Embed(
+                title=f"🏆 Champion · {winner_row['display_name']}",
+                description=(
+                    f"<@{winner_row['user_id']}> takes **{tournament['name']}** "
+                    f"with {winner_row['wins']} wins · Buchholz "
+                    f"{winner_row['buchholz']}."
+                ),
+                color=discord.Color.from_rgb(212, 175, 55),
+            )
+            embed.set_image(url="attachment://champion.png")
+            await channel.send(
+                embed=embed,
+                file=discord.File(card_buf, filename="champion.png"),
+            )
+        except Exception:
+            log.exception(
+                "champion card render/post failed for tournament %s",
+                tournament_id,
+            )
 
     await _unpin_signup(client, tournament)
 

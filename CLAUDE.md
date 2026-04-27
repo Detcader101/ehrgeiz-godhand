@@ -31,7 +31,13 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 - **Matchmaking** — LFG panels per region, EU primary for UK/EU audience.
 - **Fit Check** (Slice 3, ace-of-spades) — `#📸-fit-check` channel for character-customisation screenshots. `/fitcheck-post` composites the user image into a Pillow-rendered Ehrgeiz card (header band, character medallion, rank flair). Verified members vote 👍/👎 (Reddit-style toggle, self-votes blocked). `/fitcheck-leaderboard` ranks last week's net-score winners. Weekly background task crowns a **Drip Lord** — rotating role + gold celebration card posted in `#📣-announcements`. `/fitcheck-rotate-now` is the admin force-trigger. Posts and deletes log to `#📦-mod-log-dump`.
 - **Moderation** — `/shutup` (mods bypass rate limit; *The Silencerz* marker role gets one per hour).
-- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front with section-banded colours (Beginner grey · Dan bronze · Fighter green · Ranger teal · Vanquisher blue · Garyu purple · Ruler amber · Fujin red · Tekken gold · GoD violet→prismatic). Re-running `/setup-server` syncs colours idempotently. New: `Drip Lord` role and `📦-mod-log-dump` low-priority audit channel.
+- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front with section-banded colours (Beginner grey · Dan bronze · Fighter green · Ranger teal · Vanquisher blue · Garyu purple · Ruler amber · Fujin red · Tekken gold · GoD violet→prismatic). Re-running `/setup-server` syncs colours idempotently. Channels include `📦-mod-log-dump` (low-priority audit) and `📈-rank-ups` (promotion celebrations). Roles include `Drip Lord` (rotating fashion crown).
+- **Rank-up celebrations** — when a verified player promotes (sweeper or self-refresh), the bot posts a Pillow rank-up card to `#📈-rank-ups`: "PROMOTED" kicker, player name, from-rank → to-rank icons with a gold chevron, section colour stripe.
+- **Tournament champion card** — gold-trim Pillow banner posted alongside `FINAL STANDINGS` showing the winner's character, rank, and the runner-up.
+- **Achievement badges** — player cards show chips for current `Drip Lord` 👑, lifetime `Champion` 🏆, fit-check `Veteran` 📸 (10+ posts), and `Verified` ✅. Up to 6 chips per card.
+- **Weekly recap** — every 7 days (Mondays in practice), `cogs/recap.py` posts a Pillow digest in `#📣-announcements`: Drip Lord, top fit, new members, tournaments completed, fit checks posted. `/recap-now` for admin force-trigger. Idempotent via `posted_messages` keyed on ISO week.
+- **Bot health endpoint** — optional aiohttp listener (`bot_health.py`) on `BOT_HEALTH_PORT`. `/healthz` returns 200 when ready + gateway latency under 5s; `/metrics` exposes basic counters. Closes the "host alive but bot crashloop" blind spot for Uptime Kuma.
+- **Per-rank embed colours** — profile embeds tint by the player's rank tier so the role-list colour story carries through.
 - **Branded banners** on every user-facing channel. Body text baked into the PNG, not the embed description.
 - **Bot profile banner** sized for Discord's safe zones (avatar bottom-left, kebab top-right excluded).
 
@@ -57,15 +63,18 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 - `rank_emoji.py` — `markdown_for(guild_id, rank_name)` helper for inline custom emoji.
 - `channel_util.py` — `find_text_channel` robust to emoji-prefixed names.
 - `view_util.py` — `ErrorHandledView` base; catches button exceptions and surfaces them as ephemeral messages instead of silent fails.
-- `tournament_render.py` — every Pillow render: roster card-grid, bracket, banners (with body-text band + `## HEADER` syntax), profile banner, README art, **single-player card** (`render_player_card`, used by My Profile), **fit-check card** (`render_fitcheck_card`, brand frame around user image), **Drip Lord celebration card** (`render_drip_lord_card`, gold-trim winner banner).
+- `tournament_render.py` — every Pillow render: roster card-grid, bracket, banners, profile banner, README art, **single-player card** (with optional badge chips), **fit-check card**, **Drip Lord celebration card**, **rank-up card** (`render_rank_up_card`), **tournament champion card** (`render_tournament_champion_card`), **weekly recap composite** (`render_weekly_recap_card`).
+- `rank_meta.py` — single source of truth for rank colours, sections, ordinals, promotion detection. Imported by setup (role colours), tournament_render (card tints), onboarding (embed tints, rank-up celebrations), recap.
+- `bot_health.py` — optional HTTP liveness listener bound to localhost. Activates only when `BOT_HEALTH_PORT` is set in env.
 - `audit.py` — `post_event` / `post_mod_event` / `post_dump_event` → `#🛡️-mod-log` / `#🔍-verification-log` / `#📦-mod-log-dump` (low-priority feed).
 - `cogs/`
-  - `onboarding.py` — PlayerHubView + verify/refresh/unlink flows. 5-button persistent panel.
+  - `onboarding.py` — PlayerHubView + verify/refresh/unlink flows. 5-button persistent panel. Rank-up celebrations fire from the rank-change call sites.
   - `setup.py` — SERVER_PLAN, ROLE_PLAN, BANNER_PLAN + all admin commands + purge/reset machinery.
-  - `tournament.py` — Swiss state machine, all views, match-report flow + round auto-advance.
+  - `tournament.py` — Swiss state machine, all views, match-report flow + round auto-advance. Champion card posts on completion.
   - `matchmaking.py` — LFG panels.
   - `fitcheck.py` — fit-check post/vote/delete flow, FitcheckVoteView (persistent 👍/👎), `_DripLordRotator` weekly background task, `/fitcheck-rotate-now` and `/fitcheck-set-drip-lord` admin triggers.
-  - `admin.py` — cross-feature staff diagnostics. `/admin-inspect-user` dumps every relevant DB row (verification, pending claim, unlink cooldown, fit-check stats, Drip Lord status, bot-relevant roles) into one ephemeral embed.
+  - `admin.py` — cross-feature staff diagnostics. `/admin-inspect-user` dumps every relevant DB row.
+  - `recap.py` — `_RecapPoster` weekly background task + `/recap-now` admin trigger.
   - `mod.py` — `/shutup`.
 
 ## Admin escape hatches
