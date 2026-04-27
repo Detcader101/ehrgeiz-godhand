@@ -24,6 +24,11 @@ import channel_util
 
 VERIFICATION_LOG_CHANNEL = "verification-log"
 MOD_LOG_CHANNEL = "mod-log"
+# Low-priority audit feed: routine bot events that don't need mod
+# attention but should still leave a trail. Fit-check posts/deletes,
+# Drip Lord rotations, future low-stakes feature events all go here so
+# #mod-log stays readable as a "things that need a human" channel.
+MOD_LOG_DUMP_CHANNEL = "mod-log-dump"
 
 log = logging.getLogger(__name__)
 
@@ -63,3 +68,10 @@ async def post_event(
 async def post_mod_event(guild: discord.Guild | None, **kwargs) -> None:
     """Convenience wrapper: post to #mod-log instead of #verification-log."""
     await post_event(guild, channel_name=MOD_LOG_CHANNEL, **kwargs)
+
+
+async def post_dump_event(guild: discord.Guild | None, **kwargs) -> None:
+    """Convenience wrapper: post to #mod-log-dump (low-priority feed).
+    Falls back silently if the dump channel hasn't been provisioned yet
+    so an older guild without it doesn't error on routine events."""
+    await post_event(guild, channel_name=MOD_LOG_DUMP_CHANNEL, **kwargs)

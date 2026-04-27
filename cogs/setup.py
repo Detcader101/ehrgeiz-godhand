@@ -123,6 +123,9 @@ SERVER_PLAN: list[CategorySpec] = [
                     "💬 Main hangout chat."),
         ChannelSpec("🎬-clips-and-highlights", "text",
                     "🎬 Drop your clips. Use threads for per-character discussion."),
+        ChannelSpec("📸-fit-check", "text",
+                    "📸 Show off your character customisation. "
+                    "Use /fitcheck-post — verified members vote 👍/👎."),
         ChannelSpec("🌀-off-topic", "text",
                     "🌀 Non-Tekken stuff."),
     ], verified_only=True),
@@ -154,7 +157,12 @@ SERVER_PLAN: list[CategorySpec] = [
     ], verified_only=True),
     CategorySpec("🛠️ Staff", [
         ChannelSpec("🛡️-mod-log", "text",
-                    "📋 Every mod action the bot performs is logged here."),
+                    "📋 Every mod action the bot performs is logged here. "
+                    "Read this if you want to know what needs a human."),
+        ChannelSpec("📦-mod-log-dump", "text",
+                    "📦 Low-priority audit feed: fit-check posts and "
+                    "deletes, Drip Lord rotations, other routine bot "
+                    "events. Paper trail, no human action expected."),
         ChannelSpec("🔍-verification-log", "text",
                     "🔍 Audit trail for player verification: links, unlinks, "
                     "rank changes, admin overrides, and high-rank pending "
@@ -277,6 +285,24 @@ BANNER_PLAN: list[BannerSpec] = [
             "\n"
             "## Keep the feed readable\n"
             "Thread the discussion under each clip."
+        ),
+    ),
+    BannerSpec(
+        channel_name="fit-check", kind="banner_fitcheck",
+        kicker="Showcase", title="Fit Check",
+        subtitle="Show off your customisation",
+        body=(
+            "## How to post\n"
+            "Run `/fitcheck-post`, attach a screenshot, pick the character.\n"
+            "\n"
+            "## Voting\n"
+            "👍 / 👎 buttons under each post. Verified members only.\n"
+            "Click the same button twice to retract your vote.\n"
+            "\n"
+            "## Leaderboard\n"
+            "`/fitcheck-leaderboard` ranks the past week's top fits.\n"
+            "Best of the week gets bragging rights — winners announced "
+            "in #announcements when there's a clear lead."
         ),
     ),
     BannerSpec(
@@ -451,6 +477,13 @@ ROLE_PLAN: list[RoleSpec] = [
     RoleSpec("The Silencerz", discord.Color.from_rgb(180, 0, 200),
              discord.Permissions.none(),
              hoist=False, mentionable=False),
+    # Weekly fashion-leaderboard winner. Rotated by the fit-check cog's
+    # background task — strip from previous holders, grant to this
+    # week's #1 net-score post. Gold colour marks the honour at a
+    # glance; no perms attached, this is purely flair.
+    RoleSpec("Drip Lord", discord.Color.from_rgb(212, 175, 55),
+             discord.Permissions.none(),
+             hoist=False, mentionable=True),
 ]
 
 

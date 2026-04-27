@@ -167,6 +167,60 @@ CREATE TABLE IF NOT EXISTS guild_rank_emojis (
     uploaded_at TEXT    NOT NULL,
     PRIMARY KEY (guild_id, rank_name)
 );
+
+-- Fit Check entries — one row per posted character outfit / customisation.
+--   character: free-text Tekken 8 character name. Validated against the
+--     wavu.T8_CHARACTERS roster at post time so we never pick up garbage,
+--     but stored as plain text so a future roster addition doesn't strand
+--     historical posts.
+--   image_url: Discord CDN URL of the uploaded attachment. Discord retains
+--     attachments for the lifetime of the message; if a moderator deletes
+--     the post the URL goes 404 but the row stays for the leaderboard
+--     audit trail.
+--   message_id is what FitcheckVoteView uses to look up the entry on a
+--     button click — like every other persistent view in this bot.
+CREATE TABLE IF NOT EXISTS fitcheck_entries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    poster_id   INTEGER NOT NULL,
+    character   TEXT    NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    image_url   TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fitcheck_entries_message
+    ON fitcheck_entries(message_id);
+CREATE INDEX IF NOT EXISTS idx_fitcheck_entries_guild_created
+    ON fitcheck_entries(guild_id, created_at);
+
+-- One vote per user per entry. The composite primary key gives us a
+-- single round-trip to flip a vote: INSERT OR REPLACE rewrites a user's
+-- existing row, so toggling 👍 ↔ 👎 is atomic, and a second click of the
+-- same button is detected by the helper layer (which then deletes).
+CREATE TABLE IF NOT EXISTS fitcheck_votes (
+    entry_id    INTEGER NOT NULL,
+    user_id     INTEGER NOT NULL,
+    vote_type   TEXT    NOT NULL CHECK(vote_type IN ('up', 'down')),
+    voted_at    TEXT    NOT NULL,
+    PRIMARY KEY (entry_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fitcheck_votes_entry
+    ON fitcheck_votes(entry_id);
+
+-- Generic per-guild key/value store for small bits of bot state that
+-- don't justify a dedicated table — last-rotation timestamps, feature
+-- flags, one-shot dismissals. Keep keys namespaced (e.g. 'fitcheck:
+-- last_drip_lord_rotation') so unrelated callers don't collide.
+CREATE TABLE IF NOT EXISTS bot_state (
+    guild_id   INTEGER NOT NULL,
+    key        TEXT    NOT NULL,
+    value      TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL,
+    PRIMARY KEY (guild_id, key)
+);
 """
 
 
@@ -1021,5 +1075,177 @@ async def list_matches_for_round(tournament_id: int, round_number: int):
             ORDER BY match_number
             """,
             (tournament_id, round_number),
+        ) as cur:
+            return await cur.fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# Fit Check                                                                    #
+# --------------------------------------------------------------------------- #
+
+async def create_fitcheck_entry(
+    *,
+    guild_id: int,
+    poster_id: int,
+    character: str,
+    channel_id: int,
+    message_id: int,
+    image_url: str,
+    now_iso: str,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO fitcheck_entries
+                (guild_id, poster_id, character, channel_id, message_id,
+                 image_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, poster_id, character, channel_id, message_id,
+             image_url, now_iso),
+        )
+        await db.commit()
+        return cur.lastrowid or 0
+
+
+async def get_fitcheck_by_message(message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM fitcheck_entries WHERE message_id = ?",
+            (message_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def delete_fitcheck_entry(entry_id: int) -> None:
+    """Drop an entry and all its votes. Used by /fitcheck-delete (mod) and
+    by the post-author when they want to retract their own post.
+    foreign_keys isn't enabled (per CLAUDE.md), so we wipe children
+    explicitly."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM fitcheck_votes WHERE entry_id = ?", (entry_id,),
+        )
+        await db.execute(
+            "DELETE FROM fitcheck_entries WHERE id = ?", (entry_id,),
+        )
+        await db.commit()
+
+
+async def set_fitcheck_vote(
+    entry_id: int, user_id: int, vote_type: str, now_iso: str,
+) -> str:
+    """Record/toggle a vote. Returns the resulting state for the caller:
+        'up'      — vote is now an upvote
+        'down'    — vote is now a downvote
+        'cleared' — user clicked the same button they'd already cast,
+                    so the vote was withdrawn
+
+    The toggle-off behaviour matches Reddit's convention: clicking your
+    own vote a second time un-votes; clicking the other vote replaces.
+    """
+    if vote_type not in ("up", "down"):
+        raise ValueError(f"vote_type must be 'up' or 'down', got {vote_type!r}")
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT vote_type FROM fitcheck_votes "
+            "WHERE entry_id = ? AND user_id = ?",
+            (entry_id, user_id),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing and existing["vote_type"] == vote_type:
+            await db.execute(
+                "DELETE FROM fitcheck_votes "
+                "WHERE entry_id = ? AND user_id = ?",
+                (entry_id, user_id),
+            )
+            await db.commit()
+            return "cleared"
+
+        await db.execute(
+            """
+            INSERT INTO fitcheck_votes (entry_id, user_id, vote_type, voted_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(entry_id, user_id) DO UPDATE SET
+                vote_type = excluded.vote_type,
+                voted_at  = excluded.voted_at
+            """,
+            (entry_id, user_id, vote_type, now_iso),
+        )
+        await db.commit()
+        return vote_type
+
+
+async def get_fitcheck_vote_counts(entry_id: int) -> tuple[int, int]:
+    """Returns (up_count, down_count) for the given entry."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT
+                SUM(CASE WHEN vote_type = 'up'   THEN 1 ELSE 0 END) AS ups,
+                SUM(CASE WHEN vote_type = 'down' THEN 1 ELSE 0 END) AS downs
+            FROM fitcheck_votes WHERE entry_id = ?
+            """,
+            (entry_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if row is None:
+        return (0, 0)
+    return (int(row[0] or 0), int(row[1] or 0))
+
+
+async def get_bot_state(guild_id: int, key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM bot_state WHERE guild_id = ? AND key = ?",
+            (guild_id, key),
+        ) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def set_bot_state(
+    guild_id: int, key: str, value: str, now_iso: str,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO bot_state (guild_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(guild_id, key) DO UPDATE SET
+                value      = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (guild_id, key, value, now_iso),
+        )
+        await db.commit()
+
+
+async def top_fitchecks_in_window(
+    guild_id: int, since_iso: str, limit: int = 5,
+):
+    """Return the top fit-check entries created on/after `since_iso`,
+    ranked by net score (ups - downs) descending, ties broken by total
+    engagement (ups + downs) then most recent. Used by /fitcheck-leaderboard."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                e.id, e.guild_id, e.poster_id, e.character, e.channel_id,
+                e.message_id, e.image_url, e.created_at,
+                COALESCE(SUM(CASE WHEN v.vote_type='up'   THEN 1 ELSE 0 END), 0) AS ups,
+                COALESCE(SUM(CASE WHEN v.vote_type='down' THEN 1 ELSE 0 END), 0) AS downs
+            FROM fitcheck_entries e
+            LEFT JOIN fitcheck_votes v ON v.entry_id = e.id
+            WHERE e.guild_id = ? AND e.created_at >= ?
+            GROUP BY e.id
+            ORDER BY (ups - downs) DESC, (ups + downs) DESC, e.created_at DESC
+            LIMIT ?
+            """,
+            (guild_id, since_iso, limit),
         ) as cur:
             return await cur.fetchall()

@@ -878,9 +878,29 @@ async def _flow_profile(interaction: discord.Interaction) -> None:
     embed = _profile_embed(profile)
     if extra is not None:
         embed.add_field(name="Verification status", value=extra, inline=False)
-    await interaction.response.send_message(
-        embed=embed, ephemeral=True, delete_after=25,
-    )
+    # Render the broadcast-style player card alongside the embed. Pillow
+    # work runs off-loop inside render_player_card, so we await before
+    # sending — defer first so the user sees thinking state if the icon
+    # cache is cold and we have to fetch.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        card_buf = await tournament_render.render_player_card(
+            display_name=profile.display_name,
+            rank_tier=profile.rank_tier,
+            main_char=profile.main_char,
+            tekken_id=profile.tekken_id,
+        )
+        card_file = discord.File(card_buf, filename="player-card.png")
+        embed.set_image(url="attachment://player-card.png")
+        await interaction.followup.send(
+            embed=embed, file=card_file, ephemeral=True,
+        )
+    except Exception:
+        # If render fails (network, Pillow surprise, etc.) fall back to
+        # the text embed — the profile data is the load-bearing part.
+        log.exception("[profile] player-card render failed for user=%s",
+                      interaction.user.id)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------------- #
