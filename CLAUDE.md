@@ -38,6 +38,9 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 - **Weekly recap** — every 7 days (Mondays in practice), `cogs/recap.py` posts a Pillow digest in `#📣-announcements`: Drip Lord, top fit, new members, tournaments completed, fit checks posted. `/recap-now` for admin force-trigger. Idempotent via `posted_messages` keyed on ISO week.
 - **Bot health endpoint** — optional aiohttp listener (`bot_health.py`) on `BOT_HEALTH_PORT`. `/healthz` returns 200 when ready + gateway latency under 5s; `/metrics` exposes basic counters. Closes the "host alive but bot crashloop" blind spot for Uptime Kuma.
 - **Per-rank embed colours** — profile embeds tint by the player's rank tier so the role-list colour story carries through.
+- **Fit-check leaderboard** — `/fitcheck-leaderboard` renders a 2-column Pillow card grid (mirrors the tournament-roster style) with medal-coloured accent stripes, net score, and a top-anchored bust crop pulled from each entry's actual posted screenshot.
+- **What's That Move?** — `/whats-that-move` Pokemon-style frame-data quiz. Random move from `frame_data.T8_KEY_MOVES`, four multiple-choice frame answers, click-to-reveal Pillow card with safety-bracket colour grading. First correct click wins; community-guessable.
+- **Admin test panel** — `/admin-test-panel` ephemeral panel with 10 buttons in 3 rows: card previews (no side effects), force-triggers (drip lord rotate / recap / re-setup), diagnostics (inspect-self / health JSON probe).
 - **Branded banners** on every user-facing channel. Body text baked into the PNG, not the embed description.
 - **Bot profile banner** sized for Discord's safe zones (avatar bottom-left, kebab top-right excluded).
 
@@ -75,7 +78,9 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
   - `fitcheck.py` — fit-check post/vote/delete flow, FitcheckVoteView (persistent 👍/👎), `_DripLordRotator` weekly background task, `/fitcheck-rotate-now` and `/fitcheck-set-drip-lord` admin triggers.
   - `admin.py` — cross-feature staff diagnostics. `/admin-inspect-user` dumps every relevant DB row.
   - `recap.py` — `_RecapPoster` weekly background task + `/recap-now` admin trigger.
+  - `whats_that_move.py` — frame-data quiz. Reads `frame_data.T8_KEY_MOVES`.
   - `mod.py` — `/shutup`.
+- `frame_data.py` — hardcoded T8 move frame-on-block dataset for the quiz. Extend by appending `Move(...)` entries; character names must match `wavu.T8_CHARACTERS` for icon resolution.
 
 ## Admin escape hatches
 
