@@ -221,6 +221,25 @@ CREATE TABLE IF NOT EXISTS bot_state (
     updated_at TEXT    NOT NULL,
     PRIMARY KEY (guild_id, key)
 );
+
+-- Idempotency log for "post once" operations. Any background task that
+-- emits a Discord message and might be retried after a crash should
+-- look here first — a present row means "we already did this work, do
+-- not re-fire." Identity is caller-supplied (e.g. ISO date for a
+-- weekly drop, "<tournament_id>:r2" for a tournament round-start) so
+-- the same primitive serves any feature that wants idempotent posts.
+CREATE TABLE IF NOT EXISTS posted_messages (
+    kind        TEXT    NOT NULL,
+    identity    TEXT    NOT NULL,
+    guild_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    posted_at   TEXT    NOT NULL,
+    PRIMARY KEY (kind, identity, guild_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_posted_messages_message
+    ON posted_messages(message_id);
 """
 
 
@@ -1220,6 +1239,50 @@ async def set_bot_state(
                 updated_at = excluded.updated_at
             """,
             (guild_id, key, value, now_iso),
+        )
+        await db.commit()
+
+
+async def find_posted_message(
+    kind: str, identity: str, guild_id: int,
+):
+    """Return the posted_messages row for (kind, identity, guild_id), or
+    None if nothing was recorded for that key. Crash-safe replay primitive
+    — callers consult this before posting and `record_posted_message`
+    after a successful send, so a process death between post-and-record
+    leaves the record blank but the next replay can detect via this
+    helper that a post might already exist."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM posted_messages WHERE kind = ? AND identity = ? "
+            "AND guild_id = ?",
+            (kind, identity, guild_id),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def record_posted_message(
+    *,
+    kind: str,
+    identity: str,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    now_iso: str,
+) -> None:
+    """Stamp a (kind, identity, guild) tuple as posted. ON CONFLICT DO
+    NOTHING keeps the original timestamp if a duplicate write happens
+    (e.g. retry after a transient HTTP error during the post)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO posted_messages
+                (kind, identity, guild_id, channel_id, message_id, posted_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(kind, identity, guild_id) DO NOTHING
+            """,
+            (kind, identity, guild_id, channel_id, message_id, now_iso),
         )
         await db.commit()
 

@@ -31,7 +31,7 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 - **Matchmaking** — LFG panels per region, EU primary for UK/EU audience.
 - **Fit Check** (Slice 3, ace-of-spades) — `#📸-fit-check` channel for character-customisation screenshots. `/fitcheck-post` composites the user image into a Pillow-rendered Ehrgeiz card (header band, character medallion, rank flair). Verified members vote 👍/👎 (Reddit-style toggle, self-votes blocked). `/fitcheck-leaderboard` ranks last week's net-score winners. Weekly background task crowns a **Drip Lord** — rotating role + gold celebration card posted in `#📣-announcements`. `/fitcheck-rotate-now` is the admin force-trigger. Posts and deletes log to `#📦-mod-log-dump`.
 - **Moderation** — `/shutup` (mods bypass rate limit; *The Silencerz* marker role gets one per hour).
-- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front. New: `Drip Lord` role and `📦-mod-log-dump` low-priority audit channel.
+- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front with section-banded colours (Beginner grey · Dan bronze · Fighter green · Ranger teal · Vanquisher blue · Garyu purple · Ruler amber · Fujin red · Tekken gold · GoD violet→prismatic). Re-running `/setup-server` syncs colours idempotently. New: `Drip Lord` role and `📦-mod-log-dump` low-priority audit channel.
 - **Branded banners** on every user-facing channel. Body text baked into the PNG, not the embed description.
 - **Bot profile banner** sized for Discord's safe zones (avatar bottom-left, kebab top-right excluded).
 
@@ -85,6 +85,20 @@ Every button-driven flow has an admin slash-command equivalent so staff can reso
 | Fit Check post (button-less by design) | `/fitcheck-post` is the only path; `/fitcheck-delete` removes posts |
 
 For triage: **`/admin-inspect-user member`** dumps every relevant DB row + role state in one ephemeral embed.
+
+## Crash-safety / idempotent posting
+
+Background tasks that send Discord messages must survive a process restart without double-posting. Two primitives in `db.py`:
+
+- `bot_state` — per-guild key/value store. Stamp the rotation timestamp **before** side effects so a crash mid-flow can't re-fire the rotation on next loop.
+- `posted_messages` — idempotency log keyed by `(kind, identity, guild_id)`. Callers consult `find_posted_message` before posting and call `record_posted_message` after. The Drip Lord rotator uses this with `identity = YYYY-MM-DD` so two rotations on the same calendar day are forbidden.
+
+Same pattern applies to:
+- Channel banner provisioning (already idempotent via `db.panels`)
+- Player Hub panel (already idempotent via `db.panels`)
+- Drip Lord weekly announcement (now via `posted_messages`)
+
+When adding a new background-emitted post, route through `posted_messages` with a deterministic identity key. Log on duplicate-skip; the dedup is the load-bearing safety, not the log line.
 
 ## Design conventions
 

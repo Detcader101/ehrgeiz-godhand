@@ -512,6 +512,41 @@ def _profile_embed(p: wavu.PlayerProfile) -> discord.Embed:
     return embed
 
 
+async def _profile_card_payload(
+    p: wavu.PlayerProfile,
+) -> tuple[discord.Embed, discord.File] | tuple[discord.Embed, None]:
+    """Render the broadcast-style player card and pair it with a slim
+    embed that hosts the title + tekken ID + rating-mu line. The image
+    carries name / rank / character; the embed carries the metadata
+    bits that don't fit cleanly inside the card.
+
+    Returns (embed_with_attachment_image, file) on success or
+    (text_only_embed, None) if rendering blew up — callers can splat
+    the tuple into followup.send and the fallback is harmless.
+    """
+    embed = discord.Embed(title=p.display_name, color=discord.Color.blurple())
+    embed.add_field(name="🪪 Tekken ID", value=f"`{p.tekken_id}`", inline=False)
+    if p.rating_mu is not None:
+        embed.add_field(
+            name="📊 Rating (μ)", value=f"{p.rating_mu:.0f}", inline=True,
+        )
+    embed.set_footer(text="Sources: wank.wavu.wiki + ewgf.gg")
+    try:
+        card_buf = await tournament_render.render_player_card(
+            display_name=p.display_name,
+            rank_tier=p.rank_tier,
+            main_char=p.main_char,
+            tekken_id=p.tekken_id,
+        )
+    except Exception:
+        log.exception("[profile-card] render failed for %s", p.tekken_id)
+        # Degrade to the text-heavy embed so the user still sees their data.
+        return _profile_embed(p), None
+    file = discord.File(card_buf, filename="player-card.png")
+    embed.set_image(url="attachment://player-card.png")
+    return embed, file
+
+
 # --------------------------------------------------------------------------- #
 # Rank self-report (two-stage dropdown when replay lookup fails)               #
 # --------------------------------------------------------------------------- #
@@ -670,11 +705,28 @@ class ConfirmProfileView(ErrorHandledView):
             )
             return
 
+        # Acknowledge on the original ephemeral message (clears the confirm
+        # view), then send a follow-up with the broadcast-style player card
+        # so the success state actually feels celebratory rather than just
+        # a one-liner. edit_message + followup is the supported pattern for
+        # adding fresh attachments alongside an interaction response.
         await interaction.response.edit_message(
-            content=f"Verified. Welcome, {self.profile.display_name}.",
+            content=f"✅ Verified. Welcome, {self.profile.display_name}.",
             embed=None, view=None,
         )
-        _schedule_delete(interaction, delay=8)
+        embed, file = await _profile_card_payload(self.profile)
+        try:
+            if file is not None:
+                await interaction.followup.send(
+                    embed=embed, file=file, ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    embed=embed, ephemeral=True,
+                )
+        except discord.HTTPException:
+            # Card follow-up is decoration; the verify itself already landed.
+            pass
 
         await audit.post_event(
             guild,
@@ -805,17 +857,22 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
                 ephemeral=True,
             )
         else:
-            await interaction.followup.send(
-                content="Updated.", embed=_profile_embed(profile),
-                ephemeral=True,
-            )
+            embed, file = await _profile_card_payload(profile)
+            kwargs: dict = {"content": "Updated.", "embed": embed, "ephemeral": True}
+            if file is not None:
+                kwargs["file"] = file
+            await interaction.followup.send(**kwargs)
     elif stored_is_valid:
         # rank_tier == stored, so needs_pending is False; safe.
         await _save_and_apply(stored)
-        await interaction.followup.send(
-            content="Updated. *(Couldn't auto-detect rank — kept your existing one.)*",
-            embed=_profile_embed(profile), ephemeral=True,
-        )
+        embed, file = await _profile_card_payload(profile)
+        kwargs = {
+            "content": "Updated. *(Couldn't auto-detect rank — kept your existing one.)*",
+            "embed": embed, "ephemeral": True,
+        }
+        if file is not None:
+            kwargs["file"] = file
+        await interaction.followup.send(**kwargs)
     else:
         view = RankGroupSelectView(bot, interaction.user.id, profile)
         await interaction.followup.send(
@@ -875,31 +932,13 @@ async def _flow_profile(interaction: discord.Interaction) -> None:
                 "Profile shows the claimed rank as self-reported until an "
                 "organizer confirms — no rank role granted."
             )
-    embed = _profile_embed(profile)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    embed, file = await _profile_card_payload(profile)
     if extra is not None:
         embed.add_field(name="Verification status", value=extra, inline=False)
-    # Render the broadcast-style player card alongside the embed. Pillow
-    # work runs off-loop inside render_player_card, so we await before
-    # sending — defer first so the user sees thinking state if the icon
-    # cache is cold and we have to fetch.
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        card_buf = await tournament_render.render_player_card(
-            display_name=profile.display_name,
-            rank_tier=profile.rank_tier,
-            main_char=profile.main_char,
-            tekken_id=profile.tekken_id,
-        )
-        card_file = discord.File(card_buf, filename="player-card.png")
-        embed.set_image(url="attachment://player-card.png")
-        await interaction.followup.send(
-            embed=embed, file=card_file, ephemeral=True,
-        )
-    except Exception:
-        # If render fails (network, Pillow surprise, etc.) fall back to
-        # the text embed — the profile data is the load-bearing part.
-        log.exception("[profile] player-card render failed for user=%s",
-                      interaction.user.id)
+    if file is not None:
+        await interaction.followup.send(embed=embed, file=file, ephemeral=True)
+    else:
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1960,10 +1999,14 @@ class Onboarding(commands.Cog):
                 ephemeral=True,
             )
             return
-        await interaction.followup.send(
-            content=f"Linked {member.mention}.", embed=_profile_embed(profile),
-            ephemeral=True,
-        )
+        embed, file = await _profile_card_payload(profile)
+        kwargs: dict = {
+            "content": f"Linked {member.mention}.",
+            "embed": embed, "ephemeral": True,
+        }
+        if file is not None:
+            kwargs["file"] = file
+        await interaction.followup.send(**kwargs)
 
         await audit.post_event(
             interaction.guild,

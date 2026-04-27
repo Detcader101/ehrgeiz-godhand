@@ -452,6 +452,77 @@ BANNER_PLAN: list[BannerSpec] = [
 ]
 
 
+# Rank-tier role colours — each Tekken section gets its own hue, with
+# the per-tier shade brightening within the section to telegraph "higher
+# rank = brighter". Pulled from the in-game rank-tier colour bands; if
+# Bandai changes the palette in a future patch, edit here and re-run
+# /setup-server (the colour sync is idempotent).
+#
+# Sections (by index in wavu.TEKKEN_RANKS):
+#   0      Beginner             — neutral grey
+#   1-2    Dan tier              — bronze
+#   3-6    Fighter section       — green
+#   7-10   Ranger section        — teal
+#   11-14  Vanquisher section    — blue
+#   15-17  Garyu section         — purple
+#   18-20  Ruler section         — amber
+#   21-24  Fujin section         — red
+#   25-28  Tekken King section   — gold
+#   29-33  God of Destruction    — violet → prismatic gold for ∞
+RANK_COLORS: dict[str, tuple[int, int, int]] = {
+    "Beginner":              (140, 140, 145),
+
+    "1st Dan":               (130, 100,  70),
+    "2nd Dan":               (170, 130,  80),
+
+    "Fighter":               ( 60, 130,  80),
+    "Strategist":            ( 75, 155, 100),
+    "Combatant":             ( 95, 180, 120),
+    "Brawler":               (120, 210, 140),
+
+    "Ranger":                ( 60, 140, 150),
+    "Cavalry":               ( 75, 165, 180),
+    "Warrior":               ( 95, 190, 205),
+    "Assailant":             (120, 215, 230),
+
+    "Dominator":             ( 60,  90, 175),
+    "Vanquisher":            ( 80, 120, 200),
+    "Destroyer":             (100, 145, 220),
+    "Eliminator":            (130, 170, 240),
+
+    "Garyu":                 (110,  60, 175),
+    "Shinryu":               (140,  90, 205),
+    "Tenryu":                (175, 125, 230),
+
+    "Mighty Ruler":          (200, 110,  50),
+    "Flame Ruler":           (225, 145,  70),
+    "Battle Ruler":          (245, 180,  95),
+
+    "Fujin":                 (175,  50,  60),
+    "Raijin":                (200,  80,  90),
+    "Kishin":                (220, 110, 120),
+    "Bushin":                (240, 145, 155),
+
+    "Tekken King":           (200, 165,  50),
+    "Tekken Emperor":        (225, 185,  70),
+    "Tekken God":            (240, 205,  95),
+    "Tekken God Supreme":    (255, 225, 130),
+
+    "God of Destruction":    (180,  80, 200),
+    "God of Destruction I":  (170, 100, 220),
+    "God of Destruction II": (160, 130, 240),
+    "God of Destruction III":(150, 170, 250),
+    "God of Destruction ∞":  (255, 215,   0),  # ∞ — pure gold, the ceiling
+}
+
+
+def _rank_color(rank_name: str) -> discord.Color:
+    rgb = RANK_COLORS.get(rank_name)
+    if rgb is None:
+        return discord.Color.default()
+    return discord.Color.from_rgb(*rgb)
+
+
 # Every role here ships with hoist=False — only the bot's own role
 # (auto-created by Discord when the bot was invited) should separate in
 # the member list. Keeps the sidebar tidy regardless of staff headcount.
@@ -899,12 +970,30 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
     # worked but meant fresh tiers arrived at position 1 at the bottom
     # until the next onboarding shuffled them up. Create every rank up
     # front so they exist in the right hierarchy band from day one.
+    #
+    # Each rank gets its section colour from RANK_COLORS so the role
+    # list reads like the in-game rank-tier ribbon. Re-runs sync the
+    # colour to whatever's in RANK_COLORS today so a palette tweak
+    # propagates with a single /setup-server.
     for rank_name in wavu.ALL_RANK_NAMES:
-        if rank_name in role_by_name:
+        target_colour = _rank_color(rank_name)
+        existing = role_by_name.get(rank_name)
+        if existing is not None:
+            if existing.colour != target_colour:
+                try:
+                    await existing.edit(
+                        colour=target_colour,
+                        reason="Ehrgeiz Godhand /setup-server (rank colour sync)",
+                    )
+                except discord.HTTPException as e:
+                    report.errors.append(
+                        f"Rank colour sync '{rank_name}': {e}",
+                    )
             continue
         try:
             role = await guild.create_role(
                 name=rank_name,
+                colour=target_colour,
                 hoist=False,
                 mentionable=False,
                 reason="Ehrgeiz Godhand /setup-server (rank role)",
