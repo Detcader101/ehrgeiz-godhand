@@ -26,11 +26,12 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 
 ## Features shipped
 
-- **Onboarding** — Polaris Battle ID verification, rank chain: wavu.wiki `/api/replays` → ewgf.gg scrape → self-report fallback. 7-day relink cooldown on ID change. Tiered pending verification for Tekken King+ claims.
+- **Onboarding** — Polaris Battle ID verification, rank chain: wavu.wiki `/api/replays` → ewgf.gg scrape → self-report fallback. 7-day relink cooldown on ID change. Tiered pending verification for Tekken King+ claims. **My Profile** (button in `#🎴-player-hub`) now renders a Pillow player card alongside the embed.
 - **Tournaments** — `/tournament-create`, signup panel with Join/Leave, Dutch Swiss round-1 pairing, Report-a-Win flow with loser confirm, dispute routing to organizer, auto-advance between rounds, final standings with Buchholz tiebreakers, `/tournament-set-result` admin override.
 - **Matchmaking** — LFG panels per region, EU primary for UK/EU audience.
+- **Fit Check** (Slice 3, ace-of-spades) — `#📸-fit-check` channel for character-customisation screenshots. `/fitcheck-post` composites the user image into a Pillow-rendered Ehrgeiz card (header band, character medallion, rank flair). Verified members vote 👍/👎 (Reddit-style toggle, self-votes blocked). `/fitcheck-leaderboard` ranks last week's net-score winners. Weekly background task crowns a **Drip Lord** — rotating role + gold celebration card posted in `#📣-announcements`. `/fitcheck-rotate-now` is the admin force-trigger. Posts and deletes log to `#📦-mod-log-dump`.
 - **Moderation** — `/shutup` (mods bypass rate limit; *The Silencerz* marker role gets one per hour).
-- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front.
+- **Server setup** — `/setup-server`, `/reset-server`, `/purge-server` with preview + confirm. Pre-creates every rank role up front. New: `Drip Lord` role and `📦-mod-log-dump` low-priority audit channel.
 - **Branded banners** on every user-facing channel. Body text baked into the PNG, not the embed description.
 - **Bot profile banner** sized for Discord's safe zones (avatar bottom-left, kebab top-right excluded).
 
@@ -56,13 +57,14 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
 - `rank_emoji.py` — `markdown_for(guild_id, rank_name)` helper for inline custom emoji.
 - `channel_util.py` — `find_text_channel` robust to emoji-prefixed names.
 - `view_util.py` — `ErrorHandledView` base; catches button exceptions and surfaces them as ephemeral messages instead of silent fails.
-- `tournament_render.py` — every Pillow render: roster card-grid, bracket, banners (with body-text band + `## HEADER` syntax), profile banner, README art.
-- `audit.py` — `post_event` / `post_mod_event` → `#🛡️-mod-log` / `#🔍-verification-log`.
+- `tournament_render.py` — every Pillow render: roster card-grid, bracket, banners (with body-text band + `## HEADER` syntax), profile banner, README art, **single-player card** (`render_player_card`, used by My Profile), **fit-check card** (`render_fitcheck_card`, brand frame around user image), **Drip Lord celebration card** (`render_drip_lord_card`, gold-trim winner banner).
+- `audit.py` — `post_event` / `post_mod_event` / `post_dump_event` → `#🛡️-mod-log` / `#🔍-verification-log` / `#📦-mod-log-dump` (low-priority feed).
 - `cogs/`
   - `onboarding.py` — PlayerHubView + verify/refresh/unlink flows. 5-button persistent panel.
   - `setup.py` — SERVER_PLAN, ROLE_PLAN, BANNER_PLAN + all admin commands + purge/reset machinery.
   - `tournament.py` — Swiss state machine, all views, match-report flow + round auto-advance.
   - `matchmaking.py` — LFG panels.
+  - `fitcheck.py` — fit-check post/vote/delete flow, FitcheckVoteView (persistent 👍/👎), `_DripLordRotator` weekly background task, `/fitcheck-rotate-now` admin trigger.
   - `mod.py` — `/shutup`.
 
 ## Design conventions

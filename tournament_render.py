@@ -420,6 +420,598 @@ def _to_png_buf(img: Image.Image) -> io.BytesIO:
 
 
 # --------------------------------------------------------------------------- #
+# Single-player card (Player Hub /profile, fit-check, etc.)                    #
+# --------------------------------------------------------------------------- #
+
+PLAYER_CARD_W = 600
+PLAYER_CARD_H = 260
+
+
+async def render_player_card(
+    *,
+    display_name: str,
+    rank_tier: str | None,
+    main_char: str | None,
+    tekken_id: str | None = None,
+    badge: str | None = None,
+) -> io.BytesIO:
+    """Standalone broadcast-style card for one player.
+
+    Reuses the roster-card visual language (red accent strip, character
+    portrait + chip on the left, rank plaque + stacked text on the right)
+    but at a larger single-card size so it reads on its own in a profile
+    embed or pinned post. `badge` is an optional small caption shown in
+    place of the tekken_id (e.g. "Fit Check · KAZUYA") for reusing the
+    same renderer in feature-specific contexts.
+    """
+    RANK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    CHAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    rank_url = media.rank_icon_url(rank_tier)
+    char_url = media.character_icon_url(main_char)
+
+    session: aiohttp.ClientSession | None = None
+    rank_icon: Image.Image | None = None
+    char_icon: Image.Image | None = None
+    try:
+        needs_net = (
+            (rank_url and not _cache_path_for(rank_url, RANK_CACHE_DIR).exists())
+            or (char_url and not _cache_path_for(char_url, CHAR_CACHE_DIR).exists())
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        rank_icon = await _fetch_icon(rank_url, RANK_CACHE_DIR, session)
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_player_card_png,
+        display_name, rank_tier, main_char, tekken_id, badge,
+        rank_icon, char_icon,
+    )
+
+
+def _compose_player_card_png(
+    display_name: str,
+    rank_tier: str | None,
+    main_char: str | None,
+    tekken_id: str | None,
+    badge: str | None,
+    rank_icon: Image.Image | None,
+    char_icon: Image.Image | None,
+) -> io.BytesIO:
+    W = PLAYER_CARD_W
+    H = PLAYER_CARD_H
+    PORTRAIT_W = 220
+    CHIP_H = 44
+    ACCENT_W = 6
+    PAD = 18
+
+    img = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    # Background gradient — same depth trick as the roster header.
+    _paint_header_gradient(img, 0, H)
+
+    # Left red accent strip — visual anchor borrowed from the roster card.
+    draw.rectangle([(0, 0), (ACCENT_W, H)], fill=ACCENT)
+
+    # --- Portrait region with cover-crop + character chip ------------------ #
+    portrait_rect = (ACCENT_W, 0, ACCENT_W + PORTRAIT_W, H)
+    draw.rectangle(portrait_rect, fill=(24, 20, 22))
+    portrait_image_rect = (
+        portrait_rect[0], portrait_rect[1],
+        portrait_rect[2], portrait_rect[3] - CHIP_H,
+    )
+    _fill_cell_with_icon_cover(
+        img, char_icon, portrait_image_rect, pad=2, vertical_anchor=0.18,
+    )
+    if main_char:
+        chip_top = H - CHIP_H
+        draw.rectangle(
+            [(portrait_rect[0], chip_top), (portrait_rect[2], H)],
+            fill=ACCENT,
+        )
+        label = main_char.upper()
+        chip_font = _fit_text_to_box(
+            draw, label,
+            max_w=PORTRAIT_W - 16, max_h=CHIP_H - 12,
+            max_size=36, min_size=14,
+        )
+        bbox = draw.textbbox((0, 0), label, font=chip_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (portrait_rect[0] + (PORTRAIT_W - tw) // 2,
+             chip_top + (CHIP_H - th) // 2 - bbox[1]),
+            label, fill=TEXT, font=chip_font,
+        )
+
+    # --- Right column — rank plaque + stacked text ------------------------- #
+    right_x0 = ACCENT_W + PORTRAIT_W
+    right_w = W - right_x0
+    rank_box_h = 110
+    rank_rect = (right_x0, PAD, right_x0 + rank_box_h, PAD + rank_box_h)
+    _fill_cell_with_icon(img, rank_icon, rank_rect, pad=4)
+
+    # Rank tier name beside the plaque (display font, accent-tinted).
+    # Unranked players get a quiet em-dash in TEXT_DIM rather than a loud
+    # red "UNRANKED" — the visual hierarchy still flags rank as the main
+    # right-column signal without shouting at people who haven't pulled
+    # one yet.
+    has_rank = bool(rank_tier)
+    rank_label = rank_tier.upper() if has_rank else "—"
+    rank_label_color = ACCENT if has_rank else TEXT_DIM
+    rank_label_x = rank_rect[2] + 14
+    rank_label_w = W - rank_label_x - PAD
+    rank_font = _fit_text_to_box(
+        draw, rank_label,
+        max_w=rank_label_w, max_h=rank_box_h - 30,
+        max_size=44, min_size=18,
+    )
+    bbox = draw.textbbox((0, 0), rank_label, font=rank_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (rank_label_x, rank_rect[1] + (rank_box_h - th) // 2 - bbox[1]),
+        rank_label, fill=rank_label_color, font=rank_font,
+    )
+
+    # Display name — body font, mixed-case preserved.
+    name_y = rank_rect[3] + 16
+    name_box_w = right_w - 2 * PAD
+    name_box_h = 56
+    name_font = _fit_text_to_box(
+        draw, display_name,
+        max_w=name_box_w, max_h=name_box_h,
+        max_size=44, min_size=14,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), display_name, font=name_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (right_x0 + PAD, name_y - bbox[1]),
+        display_name, fill=TEXT, font=name_font,
+    )
+
+    # Optional caption line — `badge` (e.g. "Fit Check · KAZUYA") wins over
+    # `tekken_id`. Both render identically; the field is just routed
+    # through the same slot so callers can override the default ID line.
+    caption = badge if badge else (f"ID  ·  {tekken_id}" if tekken_id else None)
+    if caption:
+        caption_y = name_y + name_box_h + 4
+        caption_font = _fit_text_to_box(
+            draw, caption,
+            max_w=name_box_w, max_h=28,
+            max_size=22, min_size=12,
+            font_loader=_load_font,
+        )
+        bbox = draw.textbbox((0, 0), caption, font=caption_font)
+        draw.text(
+            (right_x0 + PAD, caption_y - bbox[1]),
+            caption, fill=TEXT_DIM, font=caption_font,
+        )
+
+    # Bottom accent strip — mirrors the top, ties the card together.
+    draw.line([(0, H - 2), (W, H - 2)], fill=ACCENT, width=2)
+
+    return _to_png_buf(img)
+
+
+# --------------------------------------------------------------------------- #
+# Fit Check card                                                               #
+# --------------------------------------------------------------------------- #
+
+FITCHECK_HEADER_H = 100
+FITCHECK_FOOTER_H = 64
+FITCHECK_PAD = 14
+# Cap source-image size so a 4K phone screenshot doesn't blow up the
+# canvas to the point Discord re-encodes our card heavily; minimum keeps
+# tiny crops from looking comically narrow inside the frame.
+FITCHECK_MAX_DIM = 760
+FITCHECK_MIN_DIM = 540
+
+
+async def render_fitcheck_card(
+    *,
+    source_bytes: bytes,
+    character: str,
+    poster_name: str,
+    rank_tier: str | None = None,
+) -> io.BytesIO:
+    """Compose a branded card around a user-submitted fit-check screenshot.
+
+    Layout (top to bottom):
+      [HEADER]  EHRGEIZ · FIT CHECK kicker, character title, char-icon
+                medallion top-right.
+      [IMAGE ]  Source screenshot, scaled to fit FITCHECK_MAX_DIM longest
+                side. No letterbox: the canvas adapts to the source aspect
+                ratio so a phone-portrait fit and a 4:3 cabinet capture
+                both render unstretched.
+      [FOOTER]  "BY {poster}" left, "VOTE BELOW" right; thin accent line
+                separating from the image area.
+    """
+    src = await asyncio.to_thread(_open_image_bytes, source_bytes)
+    sw, sh = src.size
+    longest = max(sw, sh)
+    if longest > FITCHECK_MAX_DIM:
+        scale = FITCHECK_MAX_DIM / longest
+    elif longest < FITCHECK_MIN_DIM:
+        scale = FITCHECK_MIN_DIM / longest
+    else:
+        scale = 1.0
+    new_w = max(1, int(sw * scale))
+    new_h = max(1, int(sh * scale))
+
+    char_url = media.character_icon_url(character)
+    rank_url = media.rank_icon_url(rank_tier)
+    session: aiohttp.ClientSession | None = None
+    try:
+        needs_net = (
+            (char_url and not _cache_path_for(char_url, CHAR_CACHE_DIR).exists())
+            or (rank_url and not _cache_path_for(rank_url, RANK_CACHE_DIR).exists())
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+        rank_icon = await _fetch_icon(rank_url, RANK_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_fitcheck_card_png,
+        src, new_w, new_h,
+        character, poster_name, rank_tier,
+        char_icon, rank_icon,
+    )
+
+
+def _open_image_bytes(data: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _compose_fitcheck_card_png(
+    src: Image.Image,
+    new_w: int,
+    new_h: int,
+    character: str,
+    poster_name: str,
+    rank_tier: str | None,
+    char_icon: Image.Image | None,
+    rank_icon: Image.Image | None,
+) -> io.BytesIO:
+    PAD = FITCHECK_PAD
+    HEADER_H = FITCHECK_HEADER_H
+    FOOTER_H = FITCHECK_FOOTER_H
+
+    src_resized = src.resize((new_w, new_h), Image.LANCZOS)
+
+    W = new_w + 2 * PAD
+    H = HEADER_H + new_h + 2 * PAD + FOOTER_H
+
+    canvas = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # --- Header ---------------------------------------------------------- #
+    _paint_header_gradient(canvas, 0, HEADER_H)
+
+    # Reserve room top-right for the character medallion.
+    medal_size = HEADER_H - 24
+    medal_x = W - PAD - medal_size
+    medal_y = (HEADER_H - medal_size) // 2
+
+    text_max_w = medal_x - PAD - 14  # 14px breathing room before the chip
+
+    kicker = "EHRGEIZ  ·  FIT CHECK"
+    kicker_font = _load_display_font(22)
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text(
+        (PAD + 4, 12 - bbox[1]),
+        kicker, fill=ACCENT, font=kicker_font,
+    )
+
+    # Title — character name, big and condensed.
+    title = character.upper()
+    title_font = _fit_text_to_box(
+        draw, title,
+        max_w=text_max_w, max_h=HEADER_H - 48,
+        max_size=56, min_size=22,
+    )
+    bbox = draw.textbbox((0, 0), title, font=title_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (PAD + 4, HEADER_H - th - 14 - bbox[1]),
+        title, fill=TEXT, font=title_font,
+    )
+
+    # Character medallion — solid red chip backdrop, icon centered.
+    chip_pad = 6
+    draw.rectangle(
+        [(medal_x - chip_pad, medal_y - chip_pad),
+         (medal_x + medal_size + chip_pad, medal_y + medal_size + chip_pad)],
+        fill=ACCENT,
+    )
+    if char_icon is not None:
+        _paste_icon(canvas, char_icon, medal_x, medal_y, medal_size, medal_size)
+    else:
+        # Initial fallback if the icon never downloaded — preserves the
+        # chip silhouette so the layout doesn't visibly break.
+        initial = (character[:1] or "?").upper()
+        init_font = _load_display_font(int(medal_size * 0.7))
+        bbox = draw.textbbox((0, 0), initial, font=init_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (medal_x + (medal_size - tw) // 2,
+             medal_y + (medal_size - th) // 2 - bbox[1]),
+            initial, fill=TEXT, font=init_font,
+        )
+
+    # Accent rule under the header.
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=ACCENT, width=3)
+
+    # --- Image area ------------------------------------------------------ #
+    image_y = HEADER_H + PAD
+    canvas.paste(src_resized, (PAD, image_y))
+    # Hairline frame so the image edge doesn't bleed into the canvas dark.
+    draw.rectangle(
+        [(PAD - 1, image_y - 1),
+         (PAD + new_w, image_y + new_h)],
+        outline=(60, 55, 58), width=1,
+    )
+
+    # --- Footer ---------------------------------------------------------- #
+    footer_y = image_y + new_h + PAD
+    draw.line([(0, footer_y), (W, footer_y)], fill=ACCENT, width=2)
+
+    # Left: "BY <poster>" — body font preserves mixed-case names.
+    left_label = f"BY  {poster_name.upper()}"
+    left_font = _fit_text_to_box(
+        draw, left_label,
+        max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 24,
+        max_size=24, min_size=14,
+    )
+    bbox = draw.textbbox((0, 0), left_label, font=left_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (PAD + 4, footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+        left_label, fill=TEXT, font=left_font,
+    )
+
+    # Right: rank flair if we have it (small plaque + tier text), else
+    # a "RATE THIS FIT" call-to-action so the footer isn't empty.
+    if rank_tier and rank_icon is not None:
+        rk_size = FOOTER_H - 18
+        rk_y = footer_y + (FOOTER_H - rk_size) // 2
+        rk_x = W - PAD - rk_size
+        _paste_icon(canvas, rank_icon, rk_x, rk_y, rk_size, rk_size)
+        # Rank label to the left of the plaque.
+        rk_label = rank_tier.upper()
+        rk_font = _fit_text_to_box(
+            draw, rk_label,
+            max_w=W // 2 - 2 * PAD - rk_size - 12,
+            max_h=FOOTER_H - 24,
+            max_size=22, min_size=12,
+        )
+        bbox = draw.textbbox((0, 0), rk_label, font=rk_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (rk_x - 12 - tw,
+             footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+            rk_label, fill=ACCENT, font=rk_font,
+        )
+    else:
+        cta = "RATE THIS FIT"
+        cta_font = _fit_text_to_box(
+            draw, cta,
+            max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 24,
+            max_size=24, min_size=14,
+        )
+        bbox = draw.textbbox((0, 0), cta, font=cta_font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        draw.text(
+            (W - PAD - 4 - tw,
+             footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+            cta, fill=ACCENT, font=cta_font,
+        )
+
+    return _to_png_buf(canvas)
+
+
+# --------------------------------------------------------------------------- #
+# Drip Lord celebration card                                                   #
+# --------------------------------------------------------------------------- #
+
+
+async def render_drip_lord_card(
+    *,
+    winner_name: str,
+    character: str,
+    rank_tier: str | None,
+    fit_image_bytes: bytes | None,
+    net_score: int,
+) -> io.BytesIO:
+    """Celebration banner posted when a weekly Drip Lord is crowned.
+
+    Composes the winning fit (if available) inside a gold-trimmed crown
+    frame with kicker / title / score callout. If the original fit image
+    is missing (post deleted before the cron fires) the centre falls
+    back to a brand panel with the character medallion enlarged.
+    """
+    char_url = media.character_icon_url(character)
+    rank_url = media.rank_icon_url(rank_tier)
+
+    if fit_image_bytes:
+        src = await asyncio.to_thread(_open_image_bytes, fit_image_bytes)
+        sw, sh = src.size
+        longest = max(sw, sh)
+        scale = min(680 / longest, 1.0) if longest > 0 else 1.0
+        new_w = max(1, int(sw * scale))
+        new_h = max(1, int(sh * scale))
+    else:
+        src = None
+        new_w, new_h = 680, 380
+
+    session: aiohttp.ClientSession | None = None
+    try:
+        needs_net = (
+            (char_url and not _cache_path_for(char_url, CHAR_CACHE_DIR).exists())
+            or (rank_url and not _cache_path_for(rank_url, RANK_CACHE_DIR).exists())
+        )
+        if needs_net:
+            session = aiohttp.ClientSession()
+        char_icon = await _fetch_icon(char_url, CHAR_CACHE_DIR, session)
+        rank_icon = await _fetch_icon(rank_url, RANK_CACHE_DIR, session)
+    finally:
+        if session is not None:
+            await session.close()
+
+    return await asyncio.to_thread(
+        _compose_drip_lord_png,
+        src, new_w, new_h,
+        winner_name, character, rank_tier, net_score,
+        char_icon, rank_icon,
+    )
+
+
+def _compose_drip_lord_png(
+    src: Image.Image | None,
+    new_w: int,
+    new_h: int,
+    winner_name: str,
+    character: str,
+    rank_tier: str | None,
+    net_score: int,
+    char_icon: Image.Image | None,
+    rank_icon: Image.Image | None,
+) -> io.BytesIO:
+    GOLD = (212, 175, 55)
+    GOLD_DIM = (110, 90, 30)
+    PAD = 16
+    HEADER_H = 130
+    FOOTER_H = 90
+
+    W = new_w + 2 * PAD
+    H = HEADER_H + new_h + 2 * PAD + FOOTER_H
+
+    canvas = Image.new("RGBA", (W, H), BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+
+    # Header — gold-tinted gradient (subtle), large title with crown
+    # framing the centre.
+    for i in range(HEADER_H):
+        t = i / max(1, HEADER_H - 1)
+        r = int(40 + (20 - 40) * t)
+        g = int(34 + (18 - 34) * t)
+        b = int(24 + (20 - 24) * t)
+        canvas.paste((r, g, b, 255), (0, i, W, i + 1))
+
+    kicker_font = _load_display_font(22)
+    kicker = "DRIP LORD  ·  FIT OF THE WEEK"
+    bbox = draw.textbbox((0, 0), kicker, font=kicker_font)
+    draw.text(
+        ((W - (bbox[2] - bbox[0])) // 2, 14 - bbox[1]),
+        kicker, fill=GOLD, font=kicker_font,
+    )
+
+    # Winner title — display font, mixed-case-aware via body font for
+    # names with lowercase letters (Bebas would uppercase them anyway,
+    # but body font keeps the original spelling readable).
+    title_font = _fit_text_to_box(
+        draw, winner_name,
+        max_w=W - 2 * PAD - 24, max_h=HEADER_H - 60,
+        max_size=58, min_size=22,
+        font_loader=_load_font,
+    )
+    bbox = draw.textbbox((0, 0), winner_name, font=title_font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(
+        ((W - tw) // 2, HEADER_H - th - 16 - bbox[1]),
+        winner_name, fill=TEXT, font=title_font,
+    )
+
+    # Gold rule under header.
+    draw.line([(0, HEADER_H), (W, HEADER_H)], fill=GOLD, width=3)
+    draw.line([(0, HEADER_H + 4), (W, HEADER_H + 4)], fill=GOLD_DIM, width=1)
+
+    # --- Centre: winning fit, or brand fallback -------------------------- #
+    image_y = HEADER_H + PAD
+    if src is not None:
+        src_resized = src.resize((new_w, new_h), Image.LANCZOS)
+        canvas.paste(src_resized, (PAD, image_y))
+    else:
+        # Fallback panel — solid gradient + giant character medallion so
+        # the announcement still reads if the post got deleted before
+        # the cron landed.
+        draw.rectangle(
+            [(PAD, image_y), (PAD + new_w, image_y + new_h)],
+            fill=ROW_BG_ALT,
+        )
+        if char_icon is not None:
+            ic_size = min(new_w, new_h) - 60
+            _paste_icon(
+                canvas, char_icon,
+                PAD + (new_w - ic_size) // 2,
+                image_y + (new_h - ic_size) // 2,
+                ic_size, ic_size,
+            )
+    draw.rectangle(
+        [(PAD - 1, image_y - 1),
+         (PAD + new_w, image_y + new_h)],
+        outline=GOLD, width=2,
+    )
+
+    # --- Footer: character chip + score callout -------------------------- #
+    footer_y = image_y + new_h + PAD
+    draw.line([(0, footer_y), (W, footer_y)], fill=GOLD, width=2)
+
+    # Character pill — small icon + name.
+    if char_icon is not None:
+        ic_size = FOOTER_H - 28
+        ic_y = footer_y + (FOOTER_H - ic_size) // 2
+        _paste_icon(canvas, char_icon, PAD + 8, ic_y, ic_size, ic_size)
+        char_label_x = PAD + 8 + ic_size + 12
+    else:
+        char_label_x = PAD + 8
+
+    char_label = character.upper()
+    char_font = _fit_text_to_box(
+        draw, char_label,
+        max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 30,
+        max_size=30, min_size=14,
+    )
+    bbox = draw.textbbox((0, 0), char_label, font=char_font)
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (char_label_x, footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+        char_label, fill=TEXT, font=char_font,
+    )
+
+    # Net-score callout (right side).
+    score_label = f"+{net_score}  NET"
+    score_font = _fit_text_to_box(
+        draw, score_label,
+        max_w=W // 2 - 2 * PAD, max_h=FOOTER_H - 30,
+        max_size=42, min_size=18,
+    )
+    bbox = draw.textbbox((0, 0), score_label, font=score_font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    draw.text(
+        (W - PAD - 8 - tw,
+         footer_y + (FOOTER_H - th) // 2 - bbox[1]),
+        score_label, fill=GOLD, font=score_font,
+    )
+
+    return _to_png_buf(canvas)
+
+
+# --------------------------------------------------------------------------- #
 # Channel banner render                                                        #
 # --------------------------------------------------------------------------- #
 

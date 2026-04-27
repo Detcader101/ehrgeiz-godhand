@@ -32,6 +32,7 @@ INITIAL_COGS = [
     "cogs.mod",
     "cogs.tournament",
     "cogs.matchmaking",
+    "cogs.fitcheck",
 ]
 
 
