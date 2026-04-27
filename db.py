@@ -1224,6 +1224,61 @@ async def set_bot_state(
         await db.commit()
 
 
+async def get_user_fitcheck_stats(
+    guild_id: int, user_id: int,
+) -> dict:
+    """Aggregate fit-check stats for one user in one guild. Used by the
+    diagnostic /admin-inspect-user command. Returns:
+      {
+        'posts': int,                # number of entries posted
+        'total_ups': int,            # ups summed across all their posts
+        'total_downs': int,          # downs summed across all their posts
+        'best_net': int | None,      # highest net score among their posts
+      }
+    Zero-counts for a user with no posts.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT
+                COUNT(DISTINCT e.id) AS posts,
+                COALESCE(SUM(CASE WHEN v.vote_type='up'   THEN 1 ELSE 0 END), 0) AS total_ups,
+                COALESCE(SUM(CASE WHEN v.vote_type='down' THEN 1 ELSE 0 END), 0) AS total_downs
+            FROM fitcheck_entries e
+            LEFT JOIN fitcheck_votes v ON v.entry_id = e.id
+            WHERE e.guild_id = ? AND e.poster_id = ?
+            """,
+            (guild_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        # Best net per-entry: subquery — done separately so the GROUP BY
+        # above stays an aggregate over all entries.
+        async with db.execute(
+            """
+            SELECT MAX(net) FROM (
+                SELECT
+                    SUM(CASE WHEN v.vote_type='up' THEN 1
+                             WHEN v.vote_type='down' THEN -1
+                             ELSE 0 END) AS net
+                FROM fitcheck_entries e
+                LEFT JOIN fitcheck_votes v ON v.entry_id = e.id
+                WHERE e.guild_id = ? AND e.poster_id = ?
+                GROUP BY e.id
+            )
+            """,
+            (guild_id, user_id),
+        ) as cur:
+            best_row = await cur.fetchone()
+
+    posts = int(row[0] or 0) if row else 0
+    return {
+        "posts": posts,
+        "total_ups": int(row[1] or 0) if row else 0,
+        "total_downs": int(row[2] or 0) if row else 0,
+        "best_net": (int(best_row[0]) if (best_row and best_row[0] is not None) else None),
+    }
+
+
 async def top_fitchecks_in_window(
     guild_id: int, since_iso: str, limit: int = 5,
 ):

@@ -1052,6 +1052,168 @@ class Tournament(commands.Cog):
             interaction, current, states=("IN_PROGRESS",),
         )
 
+    # ---- Admin participant overrides (escape hatch for Join/Leave) ------- #
+
+    @app_commands.command(
+        name="tournament-add-player",
+        description="[Organizer] Force-add a player to a tournament's signups.",
+    )
+    @app_commands.describe(
+        name="Tournament name (must be in SIGNUPS_OPEN)",
+        member="The Discord member to add",
+    )
+    async def tournament_add_player(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 60],
+        member: discord.Member,
+    ):
+        guild = interaction.guild
+        actor = interaction.user
+        if guild is None or not isinstance(actor, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        if not _is_organizer(actor):
+            await interaction.response.send_message(
+                f"Need the **{ORGANIZER_ROLE_NAME}** role (or Administrator).",
+                ephemeral=True, delete_after=12)
+            return
+
+        t = await db.get_active_tournament_by_name(guild.id, name)
+        if t is None or t["state"] != "SIGNUPS_OPEN":
+            await interaction.response.send_message(
+                f"No tournament in **SIGNUPS_OPEN** state called **{name}**.",
+                ephemeral=True, delete_after=12)
+            return
+
+        if t["max_players"]:
+            current = await db.count_participants(t["id"])
+            if current >= t["max_players"]:
+                await interaction.response.send_message(
+                    f"**{name}** is already at the {t['max_players']}-player cap.",
+                    ephemeral=True, delete_after=12)
+                return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        # Snapshot identity from the players row when available — same
+        # convention as the Join button — so the bracket stays stable
+        # if the player later unlinks.
+        player = await db.get_player_by_discord(member.id)
+        rank_tier = player["rank_tier"] if player else None
+        display_name = player["display_name"] if player else member.display_name
+
+        inserted = await db.add_participant(
+            tournament_id=t["id"],
+            user_id=member.id,
+            display_name=display_name,
+            rank_tier=rank_tier,
+            now_iso=_now_iso(),
+        )
+        if not inserted:
+            await interaction.followup.send(
+                f"{member.mention} is already signed up for **{name}**.",
+                ephemeral=True,
+            )
+            return
+
+        await _refresh_signup_message(self.bot, t["id"])
+
+        await interaction.followup.send(
+            f"✅ Added {member.mention} to **{name}**.",
+            ephemeral=True,
+        )
+        await audit.post_event(
+            guild,
+            title="Tournament · player ADDED (admin)",
+            color=discord.Color.purple(),
+            fields=[
+                ("Tournament", t["name"], True),
+                ("Player", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{actor.mention} (`{actor.id}`)", True),
+                ("Display snapshot", display_name, True),
+                ("Rank snapshot", rank_tier or "—", True),
+            ],
+        )
+
+    @tournament_add_player.autocomplete("name")
+    async def _tournament_add_player_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await _autocomplete_tournaments(
+            interaction, current, states=("SIGNUPS_OPEN",),
+        )
+
+    @app_commands.command(
+        name="tournament-remove-player",
+        description="[Organizer] Force-remove a player from a tournament's signups.",
+    )
+    @app_commands.describe(
+        name="Tournament name (must be in SIGNUPS_OPEN)",
+        member="The Discord member to remove",
+    )
+    async def tournament_remove_player(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 60],
+        member: discord.Member,
+    ):
+        guild = interaction.guild
+        actor = interaction.user
+        if guild is None or not isinstance(actor, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        if not _is_organizer(actor):
+            await interaction.response.send_message(
+                f"Need the **{ORGANIZER_ROLE_NAME}** role (or Administrator).",
+                ephemeral=True, delete_after=12)
+            return
+
+        t = await db.get_active_tournament_by_name(guild.id, name)
+        if t is None or t["state"] != "SIGNUPS_OPEN":
+            await interaction.response.send_message(
+                f"No tournament in **SIGNUPS_OPEN** state called **{name}**. "
+                "Once a tournament is IN_PROGRESS the participant list is "
+                "frozen — handle drops with `/tournament-set-result` instead.",
+                ephemeral=True, delete_after=15)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        removed = await db.remove_participant(t["id"], member.id)
+        if not removed:
+            await interaction.followup.send(
+                f"{member.mention} wasn't on the **{name}** signup list.",
+                ephemeral=True,
+            )
+            return
+
+        await _refresh_signup_message(self.bot, t["id"])
+
+        await interaction.followup.send(
+            f"✅ Removed {member.mention} from **{name}**.",
+            ephemeral=True,
+        )
+        await audit.post_event(
+            guild,
+            title="Tournament · player REMOVED (admin)",
+            color=discord.Color.dark_red(),
+            fields=[
+                ("Tournament", t["name"], True),
+                ("Player", f"{member.mention} (`{member.id}`)", True),
+                ("Acted by", f"{actor.mention} (`{actor.id}`)", True),
+            ],
+        )
+
+    @tournament_remove_player.autocomplete("name")
+    async def _tournament_remove_player_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await _autocomplete_tournaments(
+            interaction, current, states=("SIGNUPS_OPEN",),
+        )
+
     # ---- Test mode ------------------------------------------------------- #
 
     @app_commands.command(

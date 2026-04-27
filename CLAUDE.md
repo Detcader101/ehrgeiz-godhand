@@ -64,8 +64,27 @@ cmd.exe /c start pwsh -NoExit -Command "cd C:\Users\jayja\tekken-bot; .\.venv\Sc
   - `setup.py` — SERVER_PLAN, ROLE_PLAN, BANNER_PLAN + all admin commands + purge/reset machinery.
   - `tournament.py` — Swiss state machine, all views, match-report flow + round auto-advance.
   - `matchmaking.py` — LFG panels.
-  - `fitcheck.py` — fit-check post/vote/delete flow, FitcheckVoteView (persistent 👍/👎), `_DripLordRotator` weekly background task, `/fitcheck-rotate-now` admin trigger.
+  - `fitcheck.py` — fit-check post/vote/delete flow, FitcheckVoteView (persistent 👍/👎), `_DripLordRotator` weekly background task, `/fitcheck-rotate-now` and `/fitcheck-set-drip-lord` admin triggers.
+  - `admin.py` — cross-feature staff diagnostics. `/admin-inspect-user` dumps every relevant DB row (verification, pending claim, unlink cooldown, fit-check stats, Drip Lord status, bot-relevant roles) into one ephemeral embed.
   - `mod.py` — `/shutup`.
+
+## Admin escape hatches
+
+Every button-driven flow has an admin slash-command equivalent so staff can resolve user-facing issues without depending on a clickable message:
+
+| Button flow | Admin override |
+|---|---|
+| Player Hub → Verify | `/admin-link member tekken_id rank?` |
+| Player Hub → Unlink Me | `/admin-unlink member` |
+| (cooldown blocks Verify) | `/admin-clear-cooldown member` |
+| #verification-log → Confirm/Reject | `/admin-pending-resolve member action:confirm\|reject` |
+| Tournament signup → Join | `/tournament-add-player name member` |
+| Tournament signup → Leave | `/tournament-remove-player name member` |
+| Match report → Confirm/Dispute | `/tournament-set-result name round_number match_number winner` |
+| Drip Lord auto-rotation | `/fitcheck-rotate-now` (force run) or `/fitcheck-set-drip-lord member` (manual crown) |
+| Fit Check post (button-less by design) | `/fitcheck-post` is the only path; `/fitcheck-delete` removes posts |
+
+For triage: **`/admin-inspect-user member`** dumps every relevant DB row + role state in one ephemeral embed.
 
 ## Design conventions
 
