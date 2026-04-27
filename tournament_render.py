@@ -505,7 +505,11 @@ def _compose_player_card_png(
     draw.rectangle([(0, 0), (ACCENT_W, H)], fill=ACCENT)
 
     # --- Portrait region with cover-crop + character chip ------------------ #
-    portrait_rect = (ACCENT_W, 0, ACCENT_W + PORTRAIT_W, H)
+    # Pin the portrait to the *main* card region — when a trailing badge
+    # band is appended below, the portrait must NOT extend into it, or
+    # the character chip and the leftmost badge would overlap.
+    main_h = PLAYER_CARD_H
+    portrait_rect = (ACCENT_W, 0, ACCENT_W + PORTRAIT_W, main_h)
     draw.rectangle(portrait_rect, fill=(24, 20, 22))
     portrait_image_rect = (
         portrait_rect[0], portrait_rect[1],
@@ -515,9 +519,9 @@ def _compose_player_card_png(
         img, char_icon, portrait_image_rect, pad=2, vertical_anchor=0.18,
     )
     if main_char:
-        chip_top = H - CHIP_H
+        chip_top = main_h - CHIP_H
         draw.rectangle(
-            [(portrait_rect[0], chip_top), (portrait_rect[2], H)],
+            [(portrait_rect[0], chip_top), (portrait_rect[2], main_h)],
             fill=ACCENT,
         )
         label = main_char.upper()
@@ -606,42 +610,78 @@ def _compose_player_card_png(
     draw.line([(0, main_bottom - 2), (W, main_bottom - 2)], fill=ACCENT, width=2)
 
     if badges:
-        # Badge chips on the trailing band. Pillow doesn't have rounded
-        # rectangles in older versions, so we use plain solid fills with
-        # 1px breathing on each side. Up to 6 badges fit comfortably at
-        # PLAYER_CARD_W=600; the layout truncates beyond that to avoid
-        # squashed text.
+        # Badge chips on the trailing band, right-aligned so they sit
+        # bottom-right of the card and never overlap the character chip
+        # on the bottom-left of the portrait. Chip order in the input
+        # list is "highest prestige first", so we reverse before laying
+        # out so the highest-prestige chip is closest to the right edge
+        # (most visible after Discord scales the card down).
         band_top = PLAYER_CARD_H
         chip_h = 30
         chip_y = band_top + (badge_band_h - chip_h) // 2
         chip_pad_x = 14
         chip_gap = 8
-        chip_x = ACCENT_W + 12
+        right_edge = W - 12
+        # Don't place chips over the portrait area — leaves room for the
+        # character chip's bottom rounded silhouette to breathe.
+        left_limit = ACCENT_W + PORTRAIT_W + 12
         chip_font_max = 22
-        chip_font_min = 14
+        chip_font_min = 16
+
+        # Pre-measure chips so we can pack from the right edge inward,
+        # dropping leftmost (lowest-priority) chips when space runs out.
+        # `badges` is highest-priority-first; sized chips list keeps that
+        # order, then we lay out right-to-left from the *end* so the
+        # priority order on screen reads left-to-right after right
+        # alignment.
+        sized: list[tuple[str, tuple[int, int, int], int]] = []
         for label, rgb in badges[:6]:
             label_str = label.upper()
             chip_font = _fit_text_to_box(
                 draw, label_str,
-                max_w=200, max_h=chip_h - 8,
+                max_w=240, max_h=chip_h - 8,
                 max_size=chip_font_max, min_size=chip_font_min,
             )
             bbox = draw.textbbox((0, 0), label_str, font=chip_font)
             tw = bbox[2] - bbox[0]
             chip_w = tw + 2 * chip_pad_x
-            if chip_x + chip_w > W - 8:
-                break  # ran out of space; trailing badges are dropped
+            sized.append((label_str, rgb, chip_w))
+
+        # Walk right-to-left: place the LAST chip (lowest priority) at
+        # the right edge, then keep going left until we hit the limit.
+        # Chips that don't fit get dropped from the left side, preserving
+        # the highest-priority badges nearest the right edge.
+        x = right_edge
+        placements: list[tuple[int, str, tuple[int, int, int]]] = []
+        for label_str, rgb, chip_w in reversed(sized):
+            chip_left = x - chip_w
+            if chip_left < left_limit:
+                break  # no more room
+            placements.append((chip_left, label_str, rgb))
+            x = chip_left - chip_gap
+
+        # Render in normal order (left-to-right of placements list, which
+        # is right-to-left of the original badge order — meaning the
+        # first item in `placements` is the rightmost chip).
+        for chip_left, label_str, rgb in placements:
+            chip_font = _fit_text_to_box(
+                draw, label_str,
+                max_w=240, max_h=chip_h - 8,
+                max_size=chip_font_max, min_size=chip_font_min,
+            )
+            bbox = draw.textbbox((0, 0), label_str, font=chip_font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            chip_w = tw + 2 * chip_pad_x
             draw.rectangle(
-                [(chip_x, chip_y), (chip_x + chip_w, chip_y + chip_h)],
+                [(chip_left, chip_y), (chip_left + chip_w, chip_y + chip_h)],
                 fill=rgb,
             )
-            th = bbox[3] - bbox[1]
             draw.text(
-                (chip_x + chip_pad_x,
+                (chip_left + chip_pad_x,
                  chip_y + (chip_h - th) // 2 - bbox[1]),
                 label_str, fill=TEXT, font=chip_font,
             )
-            chip_x += chip_w + chip_gap
 
     return _to_png_buf(img)
 
