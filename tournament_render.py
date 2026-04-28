@@ -423,8 +423,13 @@ def _to_png_buf(img: Image.Image) -> io.BytesIO:
 # Single-player card (Player Hub /profile, fit-check, etc.)                    #
 # --------------------------------------------------------------------------- #
 
-PLAYER_CARD_W = 600
-PLAYER_CARD_H = 260
+PLAYER_CARD_W = 720
+PLAYER_CARD_H = 300
+# Supersampling factor — render at 2x then downsample with LANCZOS for
+# crisp anti-aliased text. The OUTPUT stays at PLAYER_CARD_W × _H so
+# Discord's inline preview works at native scale; the win is per-pixel
+# AA from the downsample.
+PLAYER_CARD_SCALE = 2
 
 
 async def render_player_card(
@@ -435,6 +440,7 @@ async def render_player_card(
     tekken_id: str | None = None,
     badge: str | None = None,
     badges: list[tuple[str, tuple[int, int, int]]] | None = None,
+    is_verified: bool = False,
 ) -> io.BytesIO:
     """Standalone broadcast-style card for one player.
 
@@ -470,6 +476,7 @@ async def render_player_card(
     return await asyncio.to_thread(
         _compose_player_card_png,
         display_name, rank_tier, main_char, tekken_id, badge, badges or [],
+        is_verified,
         rank_icon, char_icon,
     )
 
@@ -481,19 +488,26 @@ def _compose_player_card_png(
     tekken_id: str | None,
     badge: str | None,
     badges: list[tuple[str, tuple[int, int, int]]],
+    is_verified: bool,
     rank_icon: Image.Image | None,
     char_icon: Image.Image | None,
 ) -> io.BytesIO:
+    # Supersample: every dimension and font size is multiplied by SCALE
+    # at render time, then we downsample to the published PLAYER_CARD_W
+    # × _H at the end. The result is the same physical card size but
+    # with sub-pixel-accurate AA on text edges and chip strokes.
+    S = PLAYER_CARD_SCALE
+
     # Add a footer band when badges are present so they don't crowd the
-    # name/caption above. Each badge is a small chip ~32px tall; we
-    # collapse to a single 44px band for any number of badges.
-    badge_band_h = 44 if badges else 0
-    W = PLAYER_CARD_W
-    H = PLAYER_CARD_H + badge_band_h
-    PORTRAIT_W = 220
-    CHIP_H = 44
-    ACCENT_W = 6
-    PAD = 18
+    # name/caption above. Each badge is a chip ~36px tall; the band is
+    # 52px to give breathing room.
+    badge_band_h = 52 * S if badges else 0
+    W = PLAYER_CARD_W * S
+    H = PLAYER_CARD_H * S + badge_band_h
+    PORTRAIT_W = 264 * S
+    CHIP_H = 52 * S
+    ACCENT_W = 8 * S
+    PAD = 22 * S
 
     img = Image.new("RGBA", (W, H), BG_COLOR)
     draw = ImageDraw.Draw(img)
@@ -508,7 +522,7 @@ def _compose_player_card_png(
     # Pin the portrait to the *main* card region — when a trailing badge
     # band is appended below, the portrait must NOT extend into it, or
     # the character chip and the leftmost badge would overlap.
-    main_h = PLAYER_CARD_H
+    main_h = PLAYER_CARD_H * S
     portrait_rect = (ACCENT_W, 0, ACCENT_W + PORTRAIT_W, main_h)
     draw.rectangle(portrait_rect, fill=(24, 20, 22))
     portrait_image_rect = (
@@ -516,7 +530,7 @@ def _compose_player_card_png(
         portrait_rect[2], portrait_rect[3] - CHIP_H,
     )
     _fill_cell_with_icon_cover(
-        img, char_icon, portrait_image_rect, pad=2, vertical_anchor=0.18,
+        img, char_icon, portrait_image_rect, pad=2 * S, vertical_anchor=0.18,
     )
     if main_char:
         chip_top = main_h - CHIP_H
@@ -527,8 +541,8 @@ def _compose_player_card_png(
         label = main_char.upper()
         chip_font = _fit_text_to_box(
             draw, label,
-            max_w=PORTRAIT_W - 16, max_h=CHIP_H - 12,
-            max_size=36, min_size=22,
+            max_w=PORTRAIT_W - 16 * S, max_h=CHIP_H - 14 * S,
+            max_size=44 * S, min_size=28 * S,
         )
         bbox = draw.textbbox((0, 0), label, font=chip_font)
         tw = bbox[2] - bbox[0]
@@ -542,9 +556,9 @@ def _compose_player_card_png(
     # --- Right column — rank plaque + stacked text ------------------------- #
     right_x0 = ACCENT_W + PORTRAIT_W
     right_w = W - right_x0
-    rank_box_h = 110
+    rank_box_h = 132 * S
     rank_rect = (right_x0, PAD, right_x0 + rank_box_h, PAD + rank_box_h)
-    _fill_cell_with_icon(img, rank_icon, rank_rect, pad=4)
+    _fill_cell_with_icon(img, rank_icon, rank_rect, pad=4 * S)
 
     # Rank tier name beside the plaque (display font, accent-tinted).
     # Unranked players get a quiet em-dash in TEXT_DIM rather than a loud
@@ -554,12 +568,12 @@ def _compose_player_card_png(
     has_rank = bool(rank_tier)
     rank_label = rank_tier.upper() if has_rank else "—"
     rank_label_color = ACCENT if has_rank else TEXT_DIM
-    rank_label_x = rank_rect[2] + 14
+    rank_label_x = rank_rect[2] + 16 * S
     rank_label_w = W - rank_label_x - PAD
     rank_font = _fit_text_to_box(
         draw, rank_label,
-        max_w=rank_label_w, max_h=rank_box_h - 30,
-        max_size=44, min_size=24,
+        max_w=rank_label_w, max_h=rank_box_h - 36 * S,
+        max_size=54 * S, min_size=30 * S,
     )
     bbox = draw.textbbox((0, 0), rank_label, font=rank_font)
     th = bbox[3] - bbox[1]
@@ -569,13 +583,13 @@ def _compose_player_card_png(
     )
 
     # Display name — body font, mixed-case preserved.
-    name_y = rank_rect[3] + 16
+    name_y = rank_rect[3] + 18 * S
     name_box_w = right_w - 2 * PAD
-    name_box_h = 56
+    name_box_h = 70 * S
     name_font = _fit_text_to_box(
         draw, display_name,
         max_w=name_box_w, max_h=name_box_h,
-        max_size=44, min_size=22,
+        max_size=56 * S, min_size=28 * S,
         font_loader=_load_font,
     )
     bbox = draw.textbbox((0, 0), display_name, font=name_font)
@@ -589,57 +603,80 @@ def _compose_player_card_png(
     # `tekken_id`. Both render identically; the field is just routed
     # through the same slot so callers can override the default ID line.
     caption = badge if badge else (f"ID  ·  {tekken_id}" if tekken_id else None)
+    caption_bottom_y = None
     if caption:
-        caption_y = name_y + name_box_h + 4
+        caption_y = name_y + name_box_h + 6 * S
         caption_font = _fit_text_to_box(
             draw, caption,
-            max_w=name_box_w, max_h=28,
-            max_size=22, min_size=18,
+            max_w=name_box_w, max_h=34 * S,
+            max_size=28 * S, min_size=22 * S,
             font_loader=_load_font,
         )
         bbox = draw.textbbox((0, 0), caption, font=caption_font)
+        ch = bbox[3] - bbox[1]
         draw.text(
             (right_x0 + PAD, caption_y - bbox[1]),
             caption, fill=TEXT_DIM, font=caption_font,
+        )
+        caption_bottom_y = caption_y + ch
+
+    # Lowkey verified mark — universal among server members, so it sits as
+    # a small dim "✓ verified" text in the right column rather than a
+    # loud chip in the badge band. Right-aligned, body font, TEXT_DIM,
+    # placed in the empty slot under the caption above the bottom accent.
+    if is_verified:
+        verified_label = "✓ VERIFIED"
+        verified_font_size = 22 * S
+        try:
+            verified_font = _load_display_font(verified_font_size)
+        except Exception:
+            verified_font = _load_font(verified_font_size)
+        bbox = draw.textbbox((0, 0), verified_label, font=verified_font)
+        vw = bbox[2] - bbox[0]
+        vh = bbox[3] - bbox[1]
+        verified_x = W - PAD - vw
+        # Anchor to PLAYER_CARD_H * S minus a small margin so it never
+        # collides with the bottom accent or the badge band.
+        verified_y = main_h - 14 * S - vh - bbox[1]
+        # If a caption is present and would clip into this slot, shift up.
+        if caption_bottom_y is not None and verified_y < caption_bottom_y + 6 * S:
+            verified_y = caption_bottom_y + 6 * S - bbox[1]
+        draw.text(
+            (verified_x, verified_y),
+            verified_label, fill=(110, 150, 120), font=verified_font,
         )
 
     # Bottom accent strip — mirrors the top, ties the card together.
     # When a badge band is present it sits below this line; otherwise the
     # line is the very last 2px of the card.
-    main_bottom = PLAYER_CARD_H if badges else H
-    draw.line([(0, main_bottom - 2), (W, main_bottom - 2)], fill=ACCENT, width=2)
+    main_bottom = PLAYER_CARD_H * S if badges else H
+    draw.line([(0, main_bottom - 2 * S), (W, main_bottom - 2 * S)],
+              fill=ACCENT, width=2 * S)
 
     if badges:
         # Badge chips on the trailing band, right-aligned so they sit
         # bottom-right of the card and never overlap the character chip
-        # on the bottom-left of the portrait. Chip order in the input
-        # list is "highest prestige first", so we reverse before laying
-        # out so the highest-prestige chip is closest to the right edge
-        # (most visible after Discord scales the card down).
-        band_top = PLAYER_CARD_H
-        chip_h = 30
+        # on the bottom-left of the portrait. Chip order is "highest
+        # prestige first"; we lay out right-to-left from the right edge
+        # so the priority chip lands closest to the right (most visible
+        # after Discord scales the card down).
+        band_top = PLAYER_CARD_H * S
+        chip_h = 36 * S
         chip_y = band_top + (badge_band_h - chip_h) // 2
-        chip_pad_x = 14
-        chip_gap = 8
-        right_edge = W - 12
-        # Don't place chips over the portrait area — leaves room for the
-        # character chip's bottom rounded silhouette to breathe.
-        left_limit = ACCENT_W + PORTRAIT_W + 12
-        chip_font_max = 22
-        chip_font_min = 16
+        chip_pad_x = 16 * S
+        chip_gap = 10 * S
+        right_edge = W - 14 * S
+        # Don't place chips over the portrait area.
+        left_limit = ACCENT_W + PORTRAIT_W + 14 * S
+        chip_font_max = 28 * S
+        chip_font_min = 20 * S
 
-        # Pre-measure chips so we can pack from the right edge inward,
-        # dropping leftmost (lowest-priority) chips when space runs out.
-        # `badges` is highest-priority-first; sized chips list keeps that
-        # order, then we lay out right-to-left from the *end* so the
-        # priority order on screen reads left-to-right after right
-        # alignment.
         sized: list[tuple[str, tuple[int, int, int], int]] = []
         for label, rgb in badges[:6]:
             label_str = label.upper()
             chip_font = _fit_text_to_box(
                 draw, label_str,
-                max_w=240, max_h=chip_h - 8,
+                max_w=300 * S, max_h=chip_h - 10 * S,
                 max_size=chip_font_max, min_size=chip_font_min,
             )
             bbox = draw.textbbox((0, 0), label_str, font=chip_font)
@@ -647,10 +684,6 @@ def _compose_player_card_png(
             chip_w = tw + 2 * chip_pad_x
             sized.append((label_str, rgb, chip_w))
 
-        # Walk right-to-left: place the LAST chip (lowest priority) at
-        # the right edge, then keep going left until we hit the limit.
-        # Chips that don't fit get dropped from the left side, preserving
-        # the highest-priority badges nearest the right edge.
         x = right_edge
         placements: list[tuple[int, str, tuple[int, int, int]]] = []
         for label_str, rgb, chip_w in reversed(sized):
@@ -660,13 +693,10 @@ def _compose_player_card_png(
             placements.append((chip_left, label_str, rgb))
             x = chip_left - chip_gap
 
-        # Render in normal order (left-to-right of placements list, which
-        # is right-to-left of the original badge order — meaning the
-        # first item in `placements` is the rightmost chip).
         for chip_left, label_str, rgb in placements:
             chip_font = _fit_text_to_box(
                 draw, label_str,
-                max_w=240, max_h=chip_h - 8,
+                max_w=300 * S, max_h=chip_h - 10 * S,
                 max_size=chip_font_max, min_size=chip_font_min,
             )
             bbox = draw.textbbox((0, 0), label_str, font=chip_font)
@@ -683,7 +713,15 @@ def _compose_player_card_png(
                 label_str, fill=TEXT, font=chip_font,
             )
 
-    return _to_png_buf(img)
+    # Downsample to the published output size — this is what gives
+    # the card crisp anti-aliased text. LANCZOS is the right filter
+    # for downscale: it's slow vs BICUBIC but the per-glyph quality
+    # difference is visible, and we're in an asyncio.to_thread.
+    final_h = PLAYER_CARD_H + (badge_band_h // S)
+    final = img.resize(
+        (PLAYER_CARD_W, final_h), Image.LANCZOS,
+    )
+    return _to_png_buf(final)
 
 
 # --------------------------------------------------------------------------- #
