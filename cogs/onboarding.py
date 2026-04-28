@@ -588,10 +588,12 @@ async def _compute_badges_for_member(
     member: discord.Member | None,
 ) -> list[tuple[str, tuple[int, int, int]]]:
     """Return the badge chips a player has earned. Cheap-only checks —
-    Discord role membership for current-Drip-Lord and Verified, single
-    DB queries for tournament champion and fit-check veteran. Order is
-    deliberate: highest-prestige first so the leftmost chip is the one
-    we'd want visible if Discord scales the card down."""
+    Discord role membership for current-Drip-Lord, single DB queries
+    for tournament champion and fit-check veteran. Verified is the
+    *floor* of server membership (everyone has it after onboarding),
+    so it lives as a quiet checkmark on the card itself rather than
+    as a chip — would otherwise drown out the rare-flex badges in
+    every single profile."""
     if member is None:
         return []
     chips: list[tuple[str, tuple[int, int, int]]] = []
@@ -613,10 +615,13 @@ async def _compute_badges_for_member(
         if stats["posts"] >= 10:
             chips.append(("📸 Veteran", (200, 30, 40)))
 
-    if VERIFIED_ROLE_NAME in role_names:
-        chips.append(("✅ Verified", (50, 160, 90)))
-
     return chips
+
+
+def _is_verified_member(member: discord.Member | None) -> bool:
+    if member is None:
+        return False
+    return any(r.name == VERIFIED_ROLE_NAME for r in member.roles)
 
 
 async def _profile_card_payload(
@@ -657,6 +662,7 @@ async def _profile_card_payload(
             main_char=p.main_char,
             tekken_id=p.tekken_id,
             badges=badges,
+            is_verified=_is_verified_member(member),
         )
     except Exception:
         log.exception("[profile-card] render failed for %s", p.tekken_id)
