@@ -82,15 +82,15 @@ SERVER_PLAN: list[CategorySpec] = [
     # not an information gate — clicking it enables matchmaking + rank
     # roles, it doesn't grant read access.
     #
-    # #👋-welcome is the only verified-only channel here — its banner copy
-    # is "you made it past the gate" and only makes sense post-verify.
-    # #🎴-player-hub sits last so it's adjacent to the gated categories
-    # below; the visual flow for unverified users is read-the-rules →
-    # click-Verify → sidebar unlocks the rest.
+    # #👋-welcome is public so Discord's system-messages channel can
+    # point here (member-join notifications fire before verification).
+    # Banner copy greets unverified arrivals and points them at
+    # #🎴-player-hub. The hub sits last in this category so it's adjacent
+    # to the gated categories below; the visual flow for unverified users
+    # is read-welcome → read-rules → click-Verify → sidebar unlocks.
     CategorySpec("📋 Info", [
         ChannelSpec("👋-welcome", "text",
-                    "👋 Welcome (verified-only — post-verify landing).",
-                    verified_only=True),
+                    "👋 Welcome — start here. Bot posts join messages."),
         ChannelSpec("📜-rules", "text",
                     "📜 Server rules. Breaking them gets you warned, "
                     "timed out, or banned."),
@@ -210,25 +210,26 @@ class BannerSpec:
 
 BANNER_PLAN: list[BannerSpec] = [
     # ---- Info ---- #
-    # #👋-welcome is now verified-only — only readers that already passed
-    # the gate see this banner, so the copy talks to a new-but-verified
-    # member rather than a pre-verify onboarding prompt.
+    # #👋-welcome is public and serves as Discord's system-messages
+    # channel (member-join notifications land here). Banner copy talks
+    # to a brand-new arrival who hasn't verified yet — points them at
+    # rules first, then the player hub.
     BannerSpec(
         channel_name="welcome", kind="banner_welcome",
-        kicker="You're in", title="Welcome to Ehrgeiz",
+        kicker="New here", title="Welcome to Ehrgeiz",
         subtitle="A UK/EU home for Tekken 8",
         body=(
-            "## You made it past the gate\n"
-            "Your Tekken ID is linked and your rank role is live.\n"
+            "## You just landed\n"
+            "Glad to have you. Take a minute before you dive in.\n"
             "\n"
-            "## Where to go next\n"
-            "• #matchmaking-eu — find games in your region\n"
-            "• #general — hang out with the crowd\n"
-            "• #tournaments — join the next bracket\n"
+            "## Two quick steps\n"
+            "1. Read #rules — short, painless.\n"
+            "2. Head to #player-hub and click Verify. Link your\n"
+            "   Polaris ID and you'll get your rank role plus access\n"
+            "   to matchmaking, tournaments, and the rest of the server.\n"
             "\n"
-            "## Keeping your rank fresh\n"
-            "Your rank auto-refreshes in the background. To force an\n"
-            "update, hit Refresh Rank in #player-hub."
+            "## Need a hand\n"
+            "Ping a Mod or Organizer in #player-hub if anything's stuck."
         ),
     ),
     BannerSpec(
@@ -1071,6 +1072,20 @@ async def _build_server(guild: discord.Guild) -> SetupReport:
                         report.errors.append(
                             f"Channel '{ch_spec.name}' verified-gate: {e}"
                         )
+
+    # Point Discord's system-messages channel at #👋-welcome so
+    # member-join / boost notifications land in the public landing
+    # channel rather than wherever Discord defaulted (often #general,
+    # which is verified-only here). Idempotent: skip if already set.
+    welcome_channel = channel_util.find_text_channel(guild, "welcome")
+    if welcome_channel is not None and guild.system_channel != welcome_channel:
+        try:
+            await guild.edit(
+                system_channel=welcome_channel,
+                reason="Ehrgeiz Godhand /setup-server (system messages → #welcome)",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            report.errors.append(f"system_channel → #welcome: {e}")
 
     return report
 

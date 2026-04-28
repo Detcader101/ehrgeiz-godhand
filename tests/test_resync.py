@@ -197,17 +197,17 @@ async def test_refresh_api_status_rank_changed_below_threshold(
     row = await db.get_player_by_discord(mock_member.id)
 
     stub_external.wavu_lookup.return_value = _profile()
-    stub_external.ewgf_rank.return_value = "Bushin"  # up from Tenryu, still below King
+    stub_external.ewgf_rank.return_value = "Battle Ruler"  # up from Tenryu, still below Fujin
 
     result = await refresh_player_from_api(
         mock_guild, mock_member, row, audit_source="test",
     )
     assert result["status"] == "rank-changed"
     assert result["from"] == "Tenryu"
-    assert result["to"] == "Bushin"
+    assert result["to"] == "Battle Ruler"
     stub_external.audit_post.assert_called_once()
     stub_external.start_pending.assert_not_called()
-    assert "Bushin" in _role_names(mock_member)
+    assert "Battle Ruler" in _role_names(mock_member)
     assert "Tenryu" not in _role_names(mock_member)
 
 
@@ -388,13 +388,13 @@ async def test_resync_api_mode_records_rank_change(
                        last_synced_delta=timedelta(days=1))
 
     stub_external.wavu_lookup.return_value = _profile()
-    stub_external.ewgf_rank.return_value = "Bushin"
+    stub_external.ewgf_rank.return_value = "Battle Ruler"
 
     results = await resync_all_players(
         mock_guild, api_refresh=True, force=True, audit_source="test",
     )
     assert results["rank_changed"] == 1
-    assert "Bushin" in _role_names(member)
+    assert "Battle Ruler" in _role_names(member)
     stub_external.audit_post.assert_called_once()
 
 

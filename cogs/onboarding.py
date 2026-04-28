@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
@@ -34,7 +35,15 @@ RELINK_COOLDOWN = timedelta(days=7)
 # Spec §5.3 — claims at this rank or higher require organizer confirmation
 # before the rank role is granted. The string must match a name in
 # wavu.TEKKEN_RANKS (case-sensitive).
-PENDING_THRESHOLD_RANK = "Tekken King"
+#
+# Lowered from "Tekken King" to "Fujin" after observing impersonation
+# in the wild: a Discord user linked someone else's real Polaris ID
+# resolving to Fujin and got the role with no review. Honor-based
+# verification can't tell who owns an ID, so the only defence is
+# making higher-tier claims pass through a human. Fujin is the lowest
+# tier where the role visibly matters (server section colour, bragging
+# rights), so it's the right floor.
+PENDING_THRESHOLD_RANK = "Fujin"
 PENDING_EXPIRY = timedelta(hours=72)
 PENDING_SWEEP_INTERVAL = timedelta(hours=1)
 
@@ -367,7 +376,7 @@ async def _start_pending_verification(
         now_iso=_now_iso(),
     )
 
-    channel = discord.utils.get(guild.text_channels, name=audit.VERIFICATION_LOG_CHANNEL)
+    channel = channel_util.find_text_channel(guild, audit.VERIFICATION_LOG_CHANNEL)
     if channel is None:
         log.warning(
             "Pending verification for %s in guild %s has no audit channel "
@@ -903,9 +912,11 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     row = await db.get_player_by_discord(interaction.user.id)
     if row is None:
         log.info("[refresh/user] user=%s result=not-linked", interaction.user.id)
-        await interaction.response.send_message(
-            "You're not linked yet. Click **Verify** first.",
-            ephemeral=True, delete_after=10,
+        await _send_ident_response(
+            interaction,
+            kicker="Refresh Rank", title="Not linked",
+            description="You're not linked yet. Click **Verify** first.",
+            delete_after=10,
         )
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -980,12 +991,16 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
     if rank_name is not None:
         went_pending = await _save_and_apply(rank_name)
         if went_pending:
-            await interaction.followup.send(
-                content=(
+            await _send_ident_response(
+                interaction,
+                kicker="Refresh Rank", title="Pending review",
+                description=(
                     f"Your **{rank_name}** claim was sent to organizers for "
                     "confirmation — they'll grant the rank role within ~72h."
                 ),
-                ephemeral=True,
+                color=discord.Color.gold(),
+                accent=tournament_render.ACCENT_GOLD,
+                use_followup=True,
             )
         else:
             embed, file = await _profile_card_payload(profile, member=member)
@@ -1016,9 +1031,11 @@ async def _flow_refresh(interaction: discord.Interaction, bot: commands.Bot) -> 
 async def _flow_set_rank(interaction: discord.Interaction, bot: commands.Bot) -> None:
     row = await db.get_player_by_discord(interaction.user.id)
     if row is None:
-        await interaction.response.send_message(
-            "You're not linked yet. Click **Verify** first.",
-            ephemeral=True, delete_after=10,
+        await _send_ident_response(
+            interaction,
+            kicker="Set Rank", title="Not linked",
+            description="You're not linked yet. Click **Verify** first.",
+            delete_after=10,
         )
         return
     profile = wavu.PlayerProfile(
@@ -1028,9 +1045,11 @@ async def _flow_set_rank(interaction: discord.Interaction, bot: commands.Bot) ->
         rating_mu=row["rating_mu"],
         rank_tier=None,
     )
-    view = RankGroupSelectView(bot, interaction.user.id, profile)
-    await interaction.response.send_message(
-        "Pick your current rank:", view=view, ephemeral=True,
+    await _send_ident_response(
+        interaction,
+        kicker="Set Rank", title="Pick your tier",
+        description="Pick your current rank from the dropdowns below.",
+        view=RankGroupSelectView(bot, interaction.user.id, profile),
     )
 
 
@@ -1652,9 +1671,13 @@ class _ConfirmUnlinkView(ErrorHandledView):
                     await member.remove_roles(*to_remove, reason="Self-unlink")
                 except discord.Forbidden:
                     pass
+        embed, file = await _ident_banner_payload(
+            kicker="Unlink", title="Unlinked",
+            description="Click **Verify** anytime to link again.",
+            accent=tournament_render.ACCENT_NEUTRAL,
+        )
         await interaction.response.edit_message(
-            content="Unlinked. Click **Verify** anytime to link again.",
-            embed=None, view=None,
+            content=None, embed=embed, attachments=[file], view=None,
         )
         _schedule_delete(interaction, delay=10)
 
@@ -1680,20 +1703,27 @@ class _ConfirmUnlinkView(ErrorHandledView):
 async def _flow_unlink(interaction: discord.Interaction) -> None:
     row = await db.get_player_by_discord(interaction.user.id)
     if row is None:
-        await interaction.response.send_message(
-            "You're not linked.", ephemeral=True, delete_after=8,
+        await _send_ident_response(
+            interaction,
+            kicker="Unlink", title="Nothing to unlink",
+            description="You're not linked.",
+            delete_after=8,
         )
         return
-    await interaction.response.send_message(
-        f"Unlink **{row['display_name']}** (`{row['tekken_id']}`)? "
-        "This removes your rank role. You can re-verify anytime — note the "
-        "7-day cooldown if you re-link to a *different* Tekken ID.",
+    await _send_ident_response(
+        interaction,
+        kicker="Unlink", title="Confirm unlink",
+        description=(
+            f"Unlink **{row['display_name']}** (`{row['tekken_id']}`)?\n\n"
+            "This removes your rank role. You can re-verify anytime — note "
+            "the 7-day cooldown if you re-link to a *different* Tekken ID."
+        ),
+        accent=tournament_render.ACCENT_DESTRUCTIVE,
         view=_ConfirmUnlinkView(
             interaction.user.id,
             tekken_id=row["tekken_id"],
             display_name=row["display_name"],
         ),
-        ephemeral=True,
     )
 
 
@@ -1827,6 +1857,78 @@ async def _delete_player_hub_pin_notification(
                 return
     except (discord.Forbidden, discord.HTTPException):
         pass
+
+
+# Tiny in-process cache for ident banners — keyed by (kicker, title, accent).
+# Each Hub button click would otherwise re-rasterise the same skinny brand
+# strip; rendering once per (action, accent) saves ~10ms per click and
+# keeps RAM under 200KB even with every variant warmed.
+_IDENT_BANNER_CACHE: dict[tuple[str, str, tuple[int, int, int] | None], bytes] = {}
+
+
+async def _ident_banner_payload(
+    kicker: str,
+    title: str,
+    description: str,
+    *,
+    color: discord.Color | None = None,
+    accent: tuple[int, int, int] | None = None,
+) -> tuple[discord.Embed, discord.File]:
+    """Brand-stamped ephemeral payload for Player Hub button responses.
+
+    Returns (embed, file). Callers attach both to `interaction.response`
+    or `followup` so the response carries the same visual family as the
+    pinned Hub banner instead of a plain text message."""
+    key = (kicker, title, accent)
+    cached = _IDENT_BANNER_CACHE.get(key)
+    if cached is None:
+        buf = await tournament_render.render_ident_banner(
+            kicker=kicker, title=title, accent=accent,
+        )
+        cached = buf.getvalue()
+        _IDENT_BANNER_CACHE[key] = cached
+    slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_") or "ident"
+    filename = f"hub_ident_{slug}.png"
+    embed = discord.Embed(
+        description=description,
+        color=color or discord.Color.red(),
+    )
+    embed.set_image(url=f"attachment://{filename}")
+    return embed, discord.File(io.BytesIO(cached), filename=filename)
+
+
+async def _send_ident_response(
+    interaction: discord.Interaction,
+    *,
+    kicker: str,
+    title: str,
+    description: str,
+    color: discord.Color | None = None,
+    accent: tuple[int, int, int] | None = None,
+    use_followup: bool = False,
+    delete_after: float | None = None,
+    view: discord.ui.View | None = None,
+) -> None:
+    """Render an ident banner + send it as the Hub button's ephemeral
+    reply. Collapses the (build payload → call send) idiom that
+    otherwise repeats at every Hub callsite. `use_followup=True` for
+    flows that have already deferred."""
+    embed, file = await _ident_banner_payload(
+        kicker=kicker, title=title, description=description,
+        color=color, accent=accent,
+    )
+    if use_followup:
+        kwargs: dict = {"embed": embed, "file": file, "ephemeral": True}
+        if view is not None:
+            kwargs["view"] = view
+        await interaction.followup.send(**kwargs)
+        return
+    kwargs = {"embed": embed, "file": file, "ephemeral": True}
+    if delete_after is not None:
+        kwargs["delete_after"] = delete_after
+    if view is not None:
+        kwargs["view"] = view
+    await interaction.response.send_message(**kwargs)
 
 
 async def _player_hub_banner_file() -> discord.File:
