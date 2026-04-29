@@ -44,7 +44,7 @@ def test_normalize_id_makes_equivalent_ids_match():
 
 def test_requires_pending_low_ranks_dont_trigger():
     assert _requires_pending("Beginner") is False
-    assert _requires_pending("Bushin") is False  # just below Tekken King
+    assert _requires_pending("Battle Ruler") is False  # just below Fujin (current threshold)
 
 
 def test_requires_pending_threshold_rank_triggers():

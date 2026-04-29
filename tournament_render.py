@@ -2301,6 +2301,84 @@ def _compose_whats_that_move_png(
 BANNER_W = 960
 BANNER_H = 240
 
+IDENT_BANNER_W = 720
+IDENT_BANNER_H = 120
+
+# Named accents for ident banners. Callers pick a tone via these
+# constants instead of repeating raw RGB tuples at every Hub callsite.
+ACCENT_GOLD = (212, 175, 55)
+ACCENT_NEUTRAL = (120, 120, 130)
+ACCENT_DESTRUCTIVE = (180, 50, 60)
+
+
+async def render_ident_banner(
+    *, kicker: str, title: str, accent: tuple[int, int, int] | None = None,
+) -> io.BytesIO:
+    """Skinny brand strip used on ephemeral Player Hub responses.
+
+    Shares visual DNA with `render_banner` (logo left, accent bars, gradient
+    wash) but at ~half the height — meant to sit at the top of an embed
+    as a brand identifier rather than carrying body copy. `accent` lets
+    callers tint the strip per action (red for destructive, gold for
+    rank changes, etc.); defaults to the brand red ACCENT.
+    """
+    accent_color = accent or ACCENT
+    img = Image.new("RGBA", (IDENT_BANNER_W, IDENT_BANNER_H), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    _paint_banner_gradient(img, y_start=0, y_end=IDENT_BANNER_H)
+
+    draw.rectangle([(0, 0), (IDENT_BANNER_W, 3)], fill=accent_color)
+    draw.rectangle(
+        [(0, IDENT_BANNER_H - 3), (IDENT_BANNER_W, IDENT_BANNER_H)],
+        fill=accent_color,
+    )
+
+    logo_x = 24
+    logo_w = 92
+    if LOGO_PATH.exists():
+        try:
+            logo = Image.open(LOGO_PATH).convert("RGBA")
+            src_w, src_h = logo.size
+            scale = min(logo_w / src_w, (IDENT_BANNER_H - 24) / src_h)
+            new_w = max(1, int(src_w * scale))
+            new_h = max(1, int(src_h * scale))
+            resized = logo.resize((new_w, new_h), Image.LANCZOS)
+            img.alpha_composite(
+                resized,
+                (logo_x + (logo_w - new_w) // 2,
+                 (IDENT_BANNER_H - new_h) // 2),
+            )
+        except (OSError, IOError) as e:
+            log.warning("ident banner logo load failed: %s", e)
+
+    text_x = logo_x + logo_w + 20
+    text_max_w = IDENT_BANNER_W - text_x - 20
+
+    kicker_h = 18
+    title_h = 48
+    gap = 6
+    block_h = kicker_h + gap + title_h
+    block_y = (IDENT_BANNER_H - block_h) // 2
+
+    y = block_y
+    kf = _fit_text_to_box(
+        draw, kicker.upper(),
+        max_w=text_max_w, max_h=kicker_h,
+        max_size=16, min_size=11,
+    )
+    draw.text((text_x, y), kicker.upper(), fill=accent_color, font=kf)
+    y += kicker_h + gap
+
+    title_font = _fit_text_to_box(
+        draw, title.upper(),
+        max_w=text_max_w, max_h=title_h,
+        max_size=44, min_size=18,
+    )
+    draw.text((text_x, y), title.upper(), fill=TEXT, font=title_font)
+
+    return _to_png_buf(img)
+
 
 async def render_banner(
     *,

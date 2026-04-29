@@ -129,23 +129,21 @@ def test_info_category_itself_is_public():
     assert info.staff_only is False
 
 
-def test_welcome_is_the_only_gated_info_channel():
-    """Verify is a *focus* gate, not an information gate: rules and
-    announcements stay readable by @everyone so newcomers can decide
-    whether to link a Polaris ID. #welcome is the one exception — its
-    banner copy is post-verify ('you made it past the gate') and would
-    confuse unverified arrivals. If this test fails, somebody's about
-    to ship a regression that hides the rules from newcomers (or
-    publishes the post-verify welcome to them)."""
+def test_welcome_is_public_and_rank_ups_is_gated():
+    """Verify is a *focus* gate, not an information gate. #welcome must
+    be public so Discord's system-messages channel can point at it
+    (member-join notifications fire pre-verification). #📈-rank-ups
+    stays verified-only because the celebration cards are noise to
+    unverified lurkers and read as in-group chatter for linked
+    members. Rules / announcements / player-hub must remain public so
+    a brand-new arrival can navigate the onboarding flow."""
     info = _find_info_category()
-    gated = [c for c in info.channels if c.verified_only]
-    gated_names = [c.name for c in gated]
-    assert gated_names == ["👋-welcome"], (
-        f"Only #👋-welcome should be verified_only in Info; got {gated_names}"
+    gated_names = [c.name for c in info.channels if c.verified_only]
+    assert gated_names == ["📈-rank-ups"], (
+        f"Only #📈-rank-ups should be verified_only in Info; got {gated_names}"
     )
-    # And rules/announcements/player-hub must stay public.
     ungated_names = {c.name for c in info.channels if not c.verified_only}
-    for required in ("📜-rules", "📣-announcements", "🎴-player-hub"):
+    for required in ("👋-welcome", "📜-rules", "📣-announcements", "🎴-player-hub"):
         assert required in ungated_names, (
             f"#{required} must NOT be verified_only — newcomers need it"
         )
