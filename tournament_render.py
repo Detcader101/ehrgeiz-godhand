@@ -230,6 +230,32 @@ def _fit_text_to_box(
     return loader(min_size)
 
 
+def _fit_text_with_ellipsis(
+    draw: ImageDraw.ImageDraw, text: str,
+    *, max_w: int, max_h: int,
+    max_size: int, min_size: int, step: int = 2,
+    font_loader=None,
+) -> tuple[str, "ImageFont.ImageFont"]:
+    """Like `_fit_text_to_box` but truncates with an ellipsis when even
+    `min_size` overflows. Returns (rendered_text, font). Use for
+    user-controlled strings (display names, tournament titles) that
+    might be arbitrarily long — keeps the floor font size readable
+    instead of shrinking until the text disappears."""
+    font = _fit_text_to_box(
+        draw, text, max_w=max_w, max_h=max_h,
+        max_size=max_size, min_size=min_size, step=step,
+        font_loader=font_loader,
+    )
+    bbox = draw.textbbox((0, 0), text, font=font)
+    if bbox[2] - bbox[0] <= max_w:
+        return text, font
+    ellipsis = "…"
+    truncated = text
+    while truncated and draw.textbbox((0, 0), truncated + ellipsis, font=font)[2] > max_w:
+        truncated = truncated[:-1]
+    return (truncated + ellipsis) if truncated else ellipsis, font
+
+
 async def render_roster(participants: list[dict]) -> io.BytesIO:
     """Render the signup roster as a grid of player cards.
 
@@ -573,7 +599,7 @@ def _compose_player_card_png(
     rank_font = _fit_text_to_box(
         draw, rank_label,
         max_w=rank_label_w, max_h=rank_box_h - 36 * S,
-        max_size=54 * S, min_size=30 * S,
+        max_size=60 * S, min_size=42 * S,
     )
     bbox = draw.textbbox((0, 0), rank_label, font=rank_font)
     th = bbox[3] - bbox[1]
@@ -582,21 +608,24 @@ def _compose_player_card_png(
         rank_label, fill=rank_label_color, font=rank_font,
     )
 
-    # Display name — body font, mixed-case preserved.
+    # Display name — body font, mixed-case preserved. Sized to dominate
+    # the right column: this is the headline of the card. Floor raised
+    # from 28 to 44 so even long handles stay readable rather than
+    # shrinking into the ID caption below.
     name_y = rank_rect[3] + 18 * S
     name_box_w = right_w - 2 * PAD
-    name_box_h = 70 * S
-    name_font = _fit_text_to_box(
+    name_box_h = 84 * S
+    name_text, name_font = _fit_text_with_ellipsis(
         draw, display_name,
         max_w=name_box_w, max_h=name_box_h,
-        max_size=56 * S, min_size=28 * S,
+        max_size=72 * S, min_size=44 * S,
         font_loader=_load_font,
     )
-    bbox = draw.textbbox((0, 0), display_name, font=name_font)
+    bbox = draw.textbbox((0, 0), name_text, font=name_font)
     th = bbox[3] - bbox[1]
     draw.text(
         (right_x0 + PAD, name_y - bbox[1]),
-        display_name, fill=TEXT, font=name_font,
+        name_text, fill=TEXT, font=name_font,
     )
 
     # Optional caption line — `badge` (e.g. "Fit Check · KAZUYA") wins over
@@ -608,8 +637,8 @@ def _compose_player_card_png(
         caption_y = name_y + name_box_h + 6 * S
         caption_font = _fit_text_to_box(
             draw, caption,
-            max_w=name_box_w, max_h=34 * S,
-            max_size=28 * S, min_size=22 * S,
+            max_w=name_box_w, max_h=40 * S,
+            max_size=34 * S, min_size=28 * S,
             font_loader=_load_font,
         )
         bbox = draw.textbbox((0, 0), caption, font=caption_font)
@@ -2355,8 +2384,8 @@ async def render_ident_banner(
     text_x = logo_x + logo_w + 20
     text_max_w = IDENT_BANNER_W - text_x - 20
 
-    kicker_h = 18
-    title_h = 48
+    kicker_h = 22
+    title_h = 56
     gap = 6
     block_h = kicker_h + gap + title_h
     block_y = (IDENT_BANNER_H - block_h) // 2
@@ -2365,7 +2394,7 @@ async def render_ident_banner(
     kf = _fit_text_to_box(
         draw, kicker.upper(),
         max_w=text_max_w, max_h=kicker_h,
-        max_size=16, min_size=11,
+        max_size=20, min_size=16,
     )
     draw.text((text_x, y), kicker.upper(), fill=accent_color, font=kf)
     y += kicker_h + gap
@@ -2373,7 +2402,7 @@ async def render_ident_banner(
     title_font = _fit_text_to_box(
         draw, title.upper(),
         max_w=text_max_w, max_h=title_h,
-        max_size=44, min_size=18,
+        max_size=52, min_size=32,
     )
     draw.text((text_x, y), title.upper(), fill=TEXT, font=title_font)
 
