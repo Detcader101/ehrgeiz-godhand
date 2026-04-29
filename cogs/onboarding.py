@@ -1207,7 +1207,46 @@ class PendingVerificationView(ErrorHandledView):
         # leaves the player with no rank role; Confirm's role grant is best-effort.
         await db.delete_pending_verification(row["discord_id"])
 
-        # Update the audit message in place to lock in the resolution.
+        # DM the player about the outcome so they know an organizer
+        # actually acted (otherwise Confirm just silently gives them a
+        # role and Reject is invisible).
+        guild_name = guild.name if guild is not None else "the server"
+        if action == "confirm" and granted:
+            dm_sent = await audit.notify_user_dm(
+                target_member,
+                title="✅ Rank confirmed",
+                description=(
+                    f"An organizer confirmed your **{row['rank_tier']}** "
+                    f"claim in **{guild_name}**. Your rank role is now live."
+                ),
+                color=discord.Color.green(),
+            )
+        elif action == "confirm":
+            dm_sent = await audit.notify_user_dm(
+                target_member,
+                title="✅ Rank confirmed (role pending)",
+                description=(
+                    f"An organizer confirmed your **{row['rank_tier']}** "
+                    f"claim in **{guild_name}**, but the bot couldn't assign "
+                    "the role automatically (role hierarchy issue). An admin "
+                    "will sort it shortly."
+                ),
+                color=discord.Color.orange(),
+            )
+        else:
+            dm_sent = await audit.notify_user_dm(
+                target_member,
+                title="❌ Claim not approved",
+                description=(
+                    f"Your **{row['rank_tier']}** claim wasn't approved in "
+                    f"**{guild_name}**. You're still Verified — try **Refresh "
+                    "Rank** in #🎴-player-hub once you have recent replays "
+                    "at the claimed rank, or message an organizer if you "
+                    "think this was wrong."
+                ),
+                color=discord.Color.red(),
+            )
+
         embed = msg.embeds[0] if msg.embeds else None
         if embed is not None:
             if action == "confirm":
@@ -1223,6 +1262,11 @@ class PendingVerificationView(ErrorHandledView):
             embed.add_field(
                 name="Resolved by",
                 value=f"{interaction.user.mention} <t:{ts}:R>",
+                inline=False,
+            )
+            embed.add_field(
+                name="📬 Player notified",
+                value="DM delivered" if dm_sent else "DM blocked (closed DMs / mutual-server gone)",
                 inline=False,
             )
             if action == "confirm" and not granted:
@@ -2241,9 +2285,23 @@ class Onboarding(commands.Cog):
                 ephemeral=True,
             )
             return
+        dm_sent = await audit.notify_user_dm(
+            member,
+            title="🔗 Account linked by admin",
+            description=(
+                f"An admin linked your Discord to Polaris ID "
+                f"`{profile.tekken_id}` (**{profile.display_name}**, rank "
+                f"**{profile.rank_tier or '—'}**) in **{interaction.guild.name}**.\n\n"
+                "If this wasn't you, ping a mod immediately so they can "
+                "revert it with `/admin-unlink`."
+            ),
+            color=discord.Color.purple(),
+        )
+
         embed, file = await _profile_card_payload(profile, member=member)
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         kwargs: dict = {
-            "content": f"Linked {member.mention}.",
+            "content": f"Linked {member.mention}.{dm_suffix}",
             "embed": embed, "ephemeral": True,
         }
         if file is not None:
@@ -2280,8 +2338,21 @@ class Onboarding(commands.Cog):
             )
             return
         await db.clear_unlink(member.id)
+        dm_sent = await audit.notify_user_dm(
+            member,
+            title="⏱️ Relink cooldown cleared",
+            description=(
+                f"An admin cleared your 7-day relink cooldown in "
+                f"**{interaction.guild.name}**. You can now verify a "
+                "different Tekken ID — head to #🎴-player-hub and click "
+                "**Verify**."
+            ),
+            color=discord.Color.blurple(),
+        )
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         await interaction.response.send_message(
-            f"Cleared cooldown for {member.mention}. They can now link any Tekken ID.",
+            f"Cleared cooldown for {member.mention}. They can now link any Tekken ID."
+            + dm_suffix,
             ephemeral=True, delete_after=12,
         )
         await audit.post_event(
@@ -2317,8 +2388,21 @@ class Onboarding(commands.Cog):
                 await member.remove_roles(*to_remove, reason="Admin unlink")
             except discord.Forbidden:
                 pass
+        dm_sent = await audit.notify_user_dm(
+            member,
+            title="🔓 Account unlinked by admin",
+            description=(
+                f"An admin removed your Tekken link in "
+                f"**{interaction.guild.name}** (was `{row['tekken_id']}` · "
+                f"**{row['display_name']}**). Your rank role has been "
+                "removed.\n\nTo get back in, head to #🎴-player-hub and "
+                "click **Verify** to re-link."
+            ),
+            color=discord.Color.dark_grey(),
+        )
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         await interaction.response.send_message(
-            f"Unlinked {member.mention} (was `{row['tekken_id']}`).",
+            f"Unlinked {member.mention} (was `{row['tekken_id']}`)." + dm_suffix,
             ephemeral=True, delete_after=12,
         )
 
@@ -2421,15 +2505,55 @@ class Onboarding(commands.Cog):
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                     pass
 
+        guild_name = guild.name
+        if action.value == "confirm" and granted:
+            dm_sent = await audit.notify_user_dm(
+                member,
+                title="✅ Rank confirmed",
+                description=(
+                    f"An organizer confirmed your **{pending['rank_tier']}** "
+                    f"claim in **{guild_name}**. Your rank role is now live."
+                ),
+                color=discord.Color.green(),
+            )
+        elif action.value == "confirm":
+            dm_sent = await audit.notify_user_dm(
+                member,
+                title="✅ Rank confirmed (role pending)",
+                description=(
+                    f"An organizer confirmed your **{pending['rank_tier']}** "
+                    f"claim in **{guild_name}**, but the bot couldn't assign "
+                    "the role automatically (role hierarchy issue). An admin "
+                    "will sort it shortly."
+                ),
+                color=discord.Color.orange(),
+            )
+        else:
+            dm_sent = await audit.notify_user_dm(
+                member,
+                title="❌ Claim not approved",
+                description=(
+                    f"Your **{pending['rank_tier']}** claim wasn't approved "
+                    f"in **{guild_name}**. You're still Verified — try "
+                    "**Refresh Rank** in #🎴-player-hub once you have recent "
+                    "replays at the claimed rank, or message an organizer "
+                    "if you think this was wrong."
+                ),
+                color=discord.Color.red(),
+            )
+
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         if action.value == "confirm":
             summary = (
                 f"✅ Confirmed **{pending['rank_tier']}** for {member.mention}"
                 + ("." if granted else " — DB updated, role grant failed (hierarchy?).")
+                + dm_suffix
             )
         else:
             summary = (
                 f"❌ Rejected the **{pending['rank_tier']}** claim for "
                 f"{member.mention}. They keep Verified, no rank role."
+                + dm_suffix
             )
         await interaction.followup.send(summary, ephemeral=True)
 

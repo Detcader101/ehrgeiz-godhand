@@ -1036,9 +1036,42 @@ class Tournament(commands.Cog):
             ],
         )
 
+        # DM both players so they know their match was overridden.
+        loser_id = (
+            match["player_b_id"] if winner.id == match["player_a_id"]
+            else match["player_a_id"]
+        )
+        match_label = f"**{t['name']}** · R{round_number} · Match {match_number}"
+        winner_dm = await audit.notify_user_dm(
+            winner,
+            title="🔧 Match result overridden",
+            description=(
+                f"An organizer set you as the winner of {match_label} in "
+                f"**{guild.name}**. Your bracket standing has been updated."
+            ),
+            color=discord.Color.green(),
+        )
+        loser_member = guild.get_member(loser_id) if loser_id else None
+        loser_dm = False
+        if loser_member is not None:
+            loser_dm = await audit.notify_user_dm(
+                loser_member,
+                title="🔧 Match result overridden",
+                description=(
+                    f"An organizer overrode the result of {match_label} in "
+                    f"**{guild.name}** — {winner.mention} is now the winner. "
+                    "If you think this is wrong, message the organizer."
+                ),
+                color=discord.Color.dark_red(),
+            )
+
+        dm_summary = []
+        dm_summary.append("winner ✓" if winner_dm else "winner ✗")
+        if loser_member is not None:
+            dm_summary.append("loser ✓" if loser_dm else "loser ✗")
         await interaction.followup.send(
             f"🔧 Overrode **{name} · R{round_number} · Match {match_number}** "
-            f"— winner set to {winner.mention}.",
+            f"— winner set to {winner.mention}. (DMs: {', '.join(dm_summary)})",
             ephemeral=True,
         )
         # Override might have been the last outstanding match of the round.
@@ -1120,8 +1153,19 @@ class Tournament(commands.Cog):
 
         await _refresh_signup_message(self.bot, t["id"])
 
+        dm_sent = await audit.notify_user_dm(
+            member,
+            title="🎟️ Added to a tournament",
+            description=(
+                f"An organizer signed you up for **{t['name']}** in "
+                f"**{guild.name}**. Watch #🏆-tournaments for the bracket "
+                "drop."
+            ),
+            color=discord.Color.green(),
+        )
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         await interaction.followup.send(
-            f"✅ Added {member.mention} to **{name}**.",
+            f"✅ Added {member.mention} to **{name}**." + dm_suffix,
             ephemeral=True,
         )
         await audit.post_event(
@@ -1191,8 +1235,19 @@ class Tournament(commands.Cog):
 
         await _refresh_signup_message(self.bot, t["id"])
 
+        dm_sent = await audit.notify_user_dm(
+            member,
+            title="🎟️ Removed from a tournament",
+            description=(
+                f"An organizer removed you from **{t['name']}** signups in "
+                f"**{guild.name}**. If you think this is wrong, message "
+                "the organizer."
+            ),
+            color=discord.Color.dark_red(),
+        )
+        dm_suffix = " (player DM'd)" if dm_sent else " (DM blocked)"
         await interaction.followup.send(
-            f"✅ Removed {member.mention} from **{name}**.",
+            f"✅ Removed {member.mention} from **{name}**." + dm_suffix,
             ephemeral=True,
         )
         await audit.post_event(
