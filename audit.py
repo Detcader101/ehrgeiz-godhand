@@ -75,3 +75,38 @@ async def post_dump_event(guild: discord.Guild | None, **kwargs) -> None:
     Falls back silently if the dump channel hasn't been provisioned yet
     so an older guild without it doesn't error on routine events."""
     await post_event(guild, channel_name=MOD_LOG_DUMP_CHANNEL, **kwargs)
+
+
+async def notify_user_dm(
+    member: discord.Member | None,
+    *,
+    title: str,
+    description: str,
+    color: discord.Color | None = None,
+    fields: list[tuple[str, str, bool]] | None = None,
+) -> bool:
+    """Best-effort DM to a user about an admin action that affects them
+    (rank confirmation, link/unlink, tournament override, etc).
+
+    Returns True if delivered, False if the user has DMs closed, has
+    blocked the bot, or shares no mutual server. Failures are logged at
+    info level — never raised — so the calling admin command always
+    succeeds even when the DM can't be opened. Use the return value to
+    surface "(DM'd)" / "(couldn't DM)" to the admin so they know
+    whether they need to ping the user another way.
+    """
+    if member is None:
+        return False
+    embed = discord.Embed(
+        title=title, description=description,
+        color=color or discord.Color.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    for name, value, inline in (fields or []):
+        embed.add_field(name=name, value=value, inline=inline)
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.info("DM notify failed for %s: %s", member.id, e)
+        return False
