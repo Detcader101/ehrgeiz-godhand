@@ -1262,6 +1262,56 @@ async def set_bot_state(
         await db.commit()
 
 
+# --------------------------------------------------------------------------- #
+# Warnings (spec §9 — /warn / /warnings)                                       #
+# --------------------------------------------------------------------------- #
+
+async def add_warning(
+    *,
+    discord_id: int,
+    issued_by: int,
+    reason: str,
+    now_iso: str,
+) -> int:
+    """Insert a warning. Returns the user's total warning count after insert
+    so the caller can decide whether to auto-escalate."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO warnings (discord_id, issued_by, reason, issued_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (discord_id, issued_by, reason, now_iso),
+        )
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE discord_id = ?", (discord_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        await db.commit()
+    return int(row[0] or 0) if row else 0
+
+
+async def list_warnings(discord_id: int):
+    """All warnings for a user, newest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM warnings WHERE discord_id = ? "
+            "ORDER BY issued_at DESC, id DESC",
+            (discord_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def count_warnings(discord_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE discord_id = ?", (discord_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 async def find_posted_message(
     kind: str, identity: str, guild_id: int,
 ):
