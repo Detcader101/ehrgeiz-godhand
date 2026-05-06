@@ -558,6 +558,116 @@ async def _provision_tournament_channels(
     return (category.id, announcements.id)
 
 
+async def _provision_match_voice_channels(
+    guild: discord.Guild, t, round_number: int,
+) -> None:
+    """Create one invite-only voice channel per non-bye match in this
+    round, locked to the two paired players + Organizer role + bot.
+    Best-effort: a single match's failure is logged and skipped, the
+    rest of the round still gets its VCs.
+
+    Skipped entirely if the tournament has no auto-provisioned category
+    (fallback case for tournaments started before slice 3 or where
+    category provisioning failed) — voice channels need to live inside
+    the tournament category to keep the channel list tidy."""
+    category_id = t["category_id"]
+    if not category_id:
+        return
+    category = guild.get_channel(category_id)
+    if not isinstance(category, discord.CategoryChannel):
+        return
+
+    organizer_role = discord.utils.get(guild.roles, name=ORGANIZER_ROLE_NAME)
+    matches = await db.list_matches_for_round(t["id"], round_number)
+    for m in matches:
+        if m["player_a_id"] is None or m["player_b_id"] is None:
+            continue  # bye
+        if m["voice_channel_id"]:
+            continue  # idempotent: don't double-provision on a retry
+        member_a = guild.get_member(m["player_a_id"])
+        member_b = guild.get_member(m["player_b_id"])
+        overwrites = _match_voice_overwrites(
+            guild, member_a, member_b, organizer_role,
+        )
+        try:
+            vc = await category.create_voice_channel(
+                name=f"Match {m['match_number']}",
+                overwrites=overwrites,
+                reason=(
+                    f"Tournament '{t['name']}' round {round_number} "
+                    f"match {m['match_number']}"
+                ),
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(
+                "couldn't create match VC for tournament %s match %s: %s",
+                t["id"], m["id"], e,
+            )
+            continue
+        await db.set_match_voice_channel(m["id"], vc.id)
+
+
+def _match_voice_overwrites(
+    guild: discord.Guild,
+    member_a: discord.Member | None,
+    member_b: discord.Member | None,
+    organizer_role: discord.Role | None,
+) -> dict:
+    """Build the permission overwrite dict for a Match N voice channel.
+    @everyone: deny view + connect; the two paired players, the Organizer
+    role, and the bot all get view + connect. A player who's left the
+    server (member is None) is silently skipped — the role-based
+    Organizer grant still gives staff the bridge into the room.
+    """
+    overwrites: dict = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False, connect=False,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, connect=True, manage_channels=True,
+        ),
+    }
+    if organizer_role is not None:
+        overwrites[organizer_role] = discord.PermissionOverwrite(
+            view_channel=True, connect=True,
+        )
+    for member in (member_a, member_b):
+        if member is not None:
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True, connect=True, speak=True,
+            )
+    return overwrites
+
+
+async def _cleanup_match_voice_channels(
+    client: discord.Client, t, round_number: int | None = None,
+) -> None:
+    """Delete the per-match VCs and clear their ids on the match rows.
+    If round_number is None, cleans every round (used at completion /
+    cancellation). Otherwise scoped to one round (used between rounds
+    so a stale Match-1 VC doesn't sit beside the new Match-1 of round 2)."""
+    if round_number is None:
+        matches = await db.list_matches_for_tournament(t["id"])
+    else:
+        matches = await db.list_matches_for_round(t["id"], round_number)
+    for m in matches:
+        vc_id = m["voice_channel_id"]
+        if not vc_id:
+            continue
+        ch = client.get_channel(vc_id)
+        if ch is not None:
+            try:
+                await ch.delete(
+                    reason=f"Tournament '{t['name']}' round complete",
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.debug(
+                    "couldn't delete match VC %s for tournament %s: %s",
+                    vc_id, t["id"], e,
+                )
+        await db.set_match_voice_channel(m["id"], None)
+
+
 async def _announce_state_change(
     client: discord.Client, t, kind: str,
     attachment: discord.File | None = None,
@@ -955,6 +1065,7 @@ class Tournament(commands.Cog):
             await _participants_for_pairing(t["id"])
         )
         await db.create_matches(t["id"], 1, pairings)
+        await _provision_match_voice_channels(guild, t_after, 1)
         bracket_file = await _build_round_bracket_file(t["name"], t["id"], 1)
 
         await _announce_state_change(
@@ -1015,6 +1126,9 @@ class Tournament(commands.Cog):
         await _refresh_signup_message(self.bot, t["id"])
         await _unpin_signup(self.bot, t_after)
         await _announce_state_change(self.bot, t_after, "cancelled")
+        # Tear down any match VCs that were live — there's no scenario
+        # where a cancelled tournament wants its voice rooms preserved.
+        await _cleanup_match_voice_channels(self.bot, t_after, round_number=None)
 
         await interaction.followup.send(
             f"❌ Cancelled **{name}**.", ephemeral=True)
@@ -2157,6 +2271,14 @@ async def _advance_to_next_round(
         tournament["id"], next_round, pairings, _now_iso(),
     )
 
+    # Wipe last round's VCs *before* spinning up next round's so a stale
+    # `Match 1` from the previous round doesn't sit beside the new one.
+    await _cleanup_match_voice_channels(client, tournament, completed_round)
+
+    guild = client.get_guild(tournament["guild_id"])
+    if guild is not None:
+        await _provision_match_voice_channels(guild, tournament, next_round)
+
     bracket_file = await _build_round_bracket_file(
         tournament["name"], tournament["id"], next_round,
     )
@@ -2197,6 +2319,10 @@ async def _complete_tournament(
     await db.update_tournament_state(
         tournament_id, "COMPLETED", _now_iso(),
     )
+    # Wipe every match VC across every round — the tournament is over,
+    # nobody needs the rooms. Category + #announcements are kept until
+    # the organizer cleanup prompt lands in the next slice.
+    await _cleanup_match_voice_channels(client, tournament, round_number=None)
 
     standings = await _compute_final_standings(tournament_id)
     if standings:
