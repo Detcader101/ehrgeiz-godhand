@@ -24,7 +24,7 @@ import discord
 import pytest
 
 import db
-from cogs.tournament import _tournament_post_channel
+from cogs.tournament import _match_voice_overwrites, _tournament_post_channel
 
 
 ISO = "2026-05-06T12:00:00+00:00"
@@ -58,6 +58,24 @@ async def test_set_tournament_resources_round_trips(tmp_db):
     row = await db.get_tournament(tid)
     assert row["category_id"] == 4242
     assert row["announcements_channel_id"] == 5353
+
+
+async def test_set_match_voice_channel_round_trips(tmp_db):
+    """Stamp-then-clear flow — provisioning sets the id; round advance
+    clears it back to None. Both halves must round-trip via get_match."""
+    tid = await _make_tournament()
+    await db.create_matches(tid, 1, [(101, 102, None)])
+    matches = await db.list_matches_for_round(tid, 1)
+    mid = matches[0]["id"]
+    assert matches[0]["voice_channel_id"] is None  # default
+
+    await db.set_match_voice_channel(mid, 7777)
+    row = await db.get_match(mid)
+    assert row["voice_channel_id"] == 7777
+
+    await db.set_match_voice_channel(mid, None)
+    row = await db.get_match(mid)
+    assert row["voice_channel_id"] is None
 
 
 async def test_set_tournament_resources_can_clear_back_to_null(tmp_db):
@@ -134,6 +152,75 @@ def test_post_channel_returns_none_when_nothing_resolvable():
     assert _tournament_post_channel(
         client, _row(signup=None, ann=None),
     ) is None
+
+
+# --- _match_voice_overwrites ---------------------------------------------- #
+#
+# Per spec: @everyone locked out, paired players + Organizer role + bot
+# get view+connect. The room is *invite-only* — if this helper ever
+# stops emitting `view_channel=False` for @everyone, the whole point of
+# the per-match VC collapses (every server member can drop in).
+
+def test_match_voice_overwrites_locks_out_everyone(mock_guild, make_member):
+    a = make_member(member_id=1, display_name="A")
+    b = make_member(member_id=2, display_name="B")
+    overwrites = _match_voice_overwrites(
+        mock_guild, a, b, organizer_role=None,
+    )
+    assert overwrites[mock_guild.default_role].view_channel is False
+    assert overwrites[mock_guild.default_role].connect is False
+
+
+def test_match_voice_overwrites_grants_paired_players(mock_guild, make_member):
+    a = make_member(member_id=1, display_name="A")
+    b = make_member(member_id=2, display_name="B")
+    overwrites = _match_voice_overwrites(
+        mock_guild, a, b, organizer_role=None,
+    )
+    for member in (a, b):
+        assert member in overwrites
+        assert overwrites[member].view_channel is True
+        assert overwrites[member].connect is True
+
+
+def test_match_voice_overwrites_grants_organizer_role(mock_guild, make_member, make_role):
+    """Organizer role gets the spectator/bridge access — that's the
+    escape hatch when a dispute or no-show needs staff in the room."""
+    a = make_member(member_id=1, display_name="A")
+    b = make_member(member_id=2, display_name="B")
+    organizer = make_role("Organizer")
+    overwrites = _match_voice_overwrites(mock_guild, a, b, organizer)
+    assert organizer in overwrites
+    assert overwrites[organizer].view_channel is True
+    assert overwrites[organizer].connect is True
+
+
+def test_match_voice_overwrites_skips_missing_member(mock_guild, make_member):
+    """A player who left the server mid-tournament resolves to None via
+    guild.get_member. Their overwrite is silently skipped — the room
+    still spins up for the remaining player + Organizer rather than
+    failing the whole round."""
+    b = make_member(member_id=2, display_name="B")
+    overwrites = _match_voice_overwrites(
+        mock_guild, member_a=None, member_b=b, organizer_role=None,
+    )
+    assert b in overwrites
+    # No KeyError, no crash — and crucially @everyone is still locked.
+    assert overwrites[mock_guild.default_role].view_channel is False
+
+
+def test_match_voice_overwrites_always_grants_bot(mock_guild, make_member):
+    """The bot needs view + manage_channels so it can delete the room
+    on round advance. If this drops, cleanup silently fails forever and
+    abandoned VCs accumulate."""
+    a = make_member(member_id=1, display_name="A")
+    b = make_member(member_id=2, display_name="B")
+    overwrites = _match_voice_overwrites(
+        mock_guild, a, b, organizer_role=None,
+    )
+    assert mock_guild.me in overwrites
+    assert overwrites[mock_guild.me].view_channel is True
+    assert overwrites[mock_guild.me].manage_channels is True
 
 
 def test_post_channel_ignores_non_text_channel():

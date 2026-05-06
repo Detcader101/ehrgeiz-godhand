@@ -277,6 +277,13 @@ async def init_db() -> None:
         await _safe_add_column(
             db, "tournaments", "announcements_channel_id", "INTEGER",
         )
+        # Per-match invite-only voice channel. NULL for byes and for
+        # matches created before slice 3, and goes back to NULL on
+        # cleanup so a deleted VC's snowflake doesn't linger as a
+        # dangling reference.
+        await _safe_add_column(
+            db, "tournament_matches", "voice_channel_id", "INTEGER",
+        )
         # First-verify timestamp so the weekly recap can count new joiners
         # without relying on last_synced (which moves on every refresh).
         # Existing rows inherit last_synced on first migration so they're
@@ -1130,6 +1137,17 @@ async def list_rank_emojis(guild_id: int):
             (guild_id,),
         ) as cur:
             return await cur.fetchall()
+
+
+async def set_match_voice_channel(match_id: int, voice_channel_id: int | None) -> None:
+    """Stamp (or clear) the per-match voice channel id. Cleared with
+    None when the round wraps and the VC is deleted."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournament_matches SET voice_channel_id = ? WHERE id = ?",
+            (voice_channel_id, match_id),
+        )
+        await db.commit()
 
 
 async def list_matches_for_round(tournament_id: int, round_number: int):
