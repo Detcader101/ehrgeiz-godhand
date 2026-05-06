@@ -266,6 +266,17 @@ async def init_db() -> None:
         await _safe_add_column(
             db, "tournaments", "winner_id", "INTEGER",
         )
+        # Slice 3: per-tournament auto-provisioned category + announcements
+        # channel. Both nullable — older tournaments started before this
+        # ran (and tournaments where provisioning failed) keep posting to
+        # signup_channel_id. Helpers prefer announcements_channel_id when
+        # set; that's how the fallback works.
+        await _safe_add_column(
+            db, "tournaments", "category_id", "INTEGER",
+        )
+        await _safe_add_column(
+            db, "tournaments", "announcements_channel_id", "INTEGER",
+        )
         # First-verify timestamp so the weekly recap can count new joiners
         # without relying on last_synced (which moves on every refresh).
         # Existing rows inherit last_synced on first migration so they're
@@ -608,6 +619,24 @@ async def create_tournament(
         )
         await db.commit()
         return cur.lastrowid or 0
+
+
+async def set_tournament_resources(
+    tournament_id: int,
+    category_id: int | None,
+    announcements_channel_id: int | None,
+) -> None:
+    """Stamp the auto-provisioned per-tournament category + announcements
+    channel onto a tournament row. Either id can be None — used both at
+    provisioning time (success → both set) and at cleanup (clear back to
+    NULL once the channels are deleted)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournaments SET category_id = ?, "
+            "announcements_channel_id = ? WHERE id = ?",
+            (category_id, announcements_channel_id, tournament_id),
+        )
+        await db.commit()
 
 
 async def set_tournament_signup_message(
@@ -1260,6 +1289,56 @@ async def set_bot_state(
             (guild_id, key, value, now_iso),
         )
         await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Warnings (spec §9 — /warn / /warnings)                                       #
+# --------------------------------------------------------------------------- #
+
+async def add_warning(
+    *,
+    discord_id: int,
+    issued_by: int,
+    reason: str,
+    now_iso: str,
+) -> int:
+    """Insert a warning. Returns the user's total warning count after insert
+    so the caller can decide whether to auto-escalate."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO warnings (discord_id, issued_by, reason, issued_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (discord_id, issued_by, reason, now_iso),
+        )
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE discord_id = ?", (discord_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        await db.commit()
+    return int(row[0] or 0) if row else 0
+
+
+async def list_warnings(discord_id: int):
+    """All warnings for a user, newest first."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM warnings WHERE discord_id = ? "
+            "ORDER BY issued_at DESC, id DESC",
+            (discord_id,),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def count_warnings(discord_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE discord_id = ?", (discord_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    return int(row[0] or 0) if row else 0
 
 
 async def find_posted_message(
