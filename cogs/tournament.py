@@ -486,6 +486,78 @@ async def _unpin_signup(client: discord.Client, t) -> None:
         log.debug("unpin failed for tournament %s: %s", t["id"], e)
 
 
+def _tournament_post_channel(
+    client: discord.Client, t,
+) -> discord.TextChannel | None:
+    """Pick the right channel for an in-progress announcement.
+
+    Tournaments started after slice 3 have a dedicated `announcements`
+    channel inside their auto-provisioned category — that's where round
+    brackets, FINAL STANDINGS, and champion cards belong, since the
+    public #tournaments channel is for *signups* not running events.
+    Tournaments older than slice 3 (or where provisioning failed) keep
+    posting to signup_channel_id; that's the fallback so a half-migrated
+    server doesn't black-hole its round announcements."""
+    ann_id = t["announcements_channel_id"]
+    if ann_id:
+        ch = client.get_channel(ann_id)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    if t["signup_channel_id"]:
+        ch = client.get_channel(t["signup_channel_id"])
+        if isinstance(ch, discord.TextChannel):
+            return ch
+    return None
+
+
+async def _provision_tournament_channels(
+    guild: discord.Guild, t,
+) -> tuple[int | None, int | None]:
+    """Create `Tournament — <name>` category + `announcements` text channel.
+    Returns (category_id, announcements_channel_id) — both None if the bot
+    lacks Manage Channels or Discord throws. Caller is expected to persist
+    via db.set_tournament_resources and tolerate the all-None failure mode
+    (the post helper falls back to signup_channel_id)."""
+    name = t["name"]
+    category_name = f"Tournament — {name}"
+    try:
+        category = await guild.create_category(
+            name=category_name,
+            reason=f"Auto-provisioned for tournament '{name}' (id={t['id']})",
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(
+            "couldn't create category for tournament %s: %s", t["id"], e,
+        )
+        return (None, None)
+    try:
+        announcements = await category.create_text_channel(
+            name="announcements",
+            reason=(
+                f"Auto-provisioned for tournament '{name}' (id={t['id']})"
+            ),
+            topic=(
+                f"Live round brackets, results, and standings for "
+                f"**{name}**. Bot-managed; do not delete manually."
+            ),
+        )
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(
+            "couldn't create announcements channel for tournament %s: %s",
+            t["id"], e,
+        )
+        # Roll back the category so we don't leave a half-provisioned
+        # husk behind — the next run would create another empty one.
+        try:
+            await category.delete(
+                reason="Rollback: announcements channel create failed"
+            )
+        except discord.HTTPException:
+            pass
+        return (None, None)
+    return (category.id, announcements.id)
+
+
 async def _announce_state_change(
     client: discord.Client, t, kind: str,
     attachment: discord.File | None = None,
@@ -496,10 +568,8 @@ async def _announce_state_change(
     separate from the persistent panel. kind is 'started' or 'cancelled'.
     Attachment + view are both optional; view is how the round-start
     announcement gets its Report-a-Win button."""
-    if t["signup_channel_id"] is None:
-        return
-    channel = client.get_channel(t["signup_channel_id"])
-    if not isinstance(channel, discord.TextChannel):
+    channel = _tournament_post_channel(client, t)
+    if channel is None:
         return
 
     participants = await db.list_participants(t["id"])
@@ -863,6 +933,20 @@ class Tournament(commands.Cog):
         await db.update_tournament_state(t["id"], "IN_PROGRESS", _now_iso())
         t_after = await db.get_tournament(t["id"])
         await _refresh_signup_message(self.bot, t["id"])
+
+        # Auto-provision per-tournament category + announcements channel
+        # *before* the round-1 announce so the announcement lands in the
+        # new dedicated channel. Failure is non-fatal — the helper logs,
+        # returns Nones, and the post falls back to #tournaments via
+        # _tournament_post_channel.
+        category_id, announcements_id = await _provision_tournament_channels(
+            guild, t_after,
+        )
+        if category_id is not None and announcements_id is not None:
+            await db.set_tournament_resources(
+                t["id"], category_id, announcements_id,
+            )
+            t_after = await db.get_tournament(t["id"])
 
         # Generate + persist round-1 pairings, render the bracket PNG, and
         # ship it attached to the hype announcement so entrants see the
@@ -2076,8 +2160,8 @@ async def _advance_to_next_round(
     bracket_file = await _build_round_bracket_file(
         tournament["name"], tournament["id"], next_round,
     )
-    channel = client.get_channel(tournament["signup_channel_id"])
-    if not isinstance(channel, discord.TextChannel):
+    channel = _tournament_post_channel(client, tournament)
+    if channel is None:
         return
 
     participants = await db.list_participants(tournament["id"])
@@ -2119,8 +2203,8 @@ async def _complete_tournament(
         # Cache the champion on the tournament row so future badge
         # queries don't have to recompute standings to ask "did X win".
         await db.set_tournament_winner(tournament_id, standings[0]["user_id"])
-    channel = client.get_channel(tournament["signup_channel_id"])
-    if not isinstance(channel, discord.TextChannel):
+    channel = _tournament_post_channel(client, tournament)
+    if channel is None:
         return
 
     podium_icons = ["🥇", "🥈", "🥉"]
