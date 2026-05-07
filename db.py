@@ -284,6 +284,13 @@ async def init_db() -> None:
         await _safe_add_column(
             db, "tournament_matches", "voice_channel_id", "INTEGER",
         )
+        # End-of-tournament cleanup prompt: persistent Yes/No view posted
+        # to the announcements channel after FINAL STANDINGS. Stamping the
+        # message id lets the view resolve its tournament after a bot
+        # restart without scanning every channel.
+        await _safe_add_column(
+            db, "tournaments", "cleanup_message_id", "INTEGER",
+        )
         # First-verify timestamp so the weekly recap can count new joiners
         # without relying on last_synced (which moves on every refresh).
         # Existing rows inherit last_synced on first migration so they're
@@ -663,6 +670,31 @@ async def get_tournament(tournament_id: int):
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM tournaments WHERE id = ?", (tournament_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def set_tournament_cleanup_message(
+    tournament_id: int, message_id: int | None,
+) -> None:
+    """Stamp (or clear) the message id of the post-FINAL-STANDINGS cleanup
+    prompt. Cleared back to NULL once the organizer answers so a stale
+    reference doesn't keep a persistent view bound to a deleted message."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tournaments SET cleanup_message_id = ? WHERE id = ?",
+            (message_id, tournament_id),
+        )
+        await db.commit()
+
+
+async def get_tournament_by_cleanup_message(message_id: int):
+    """Used by the cleanup View to resolve the tournament from a button click."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tournaments WHERE cleanup_message_id = ?",
+            (message_id,),
         ) as cur:
             return await cur.fetchone()
 

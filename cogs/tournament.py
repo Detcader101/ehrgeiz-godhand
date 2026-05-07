@@ -894,6 +894,8 @@ class Tournament(commands.Cog):
         self.bot.add_view(ReportWinView())
         self.bot.add_view(MatchReportPublicView())
         self.bot.add_view(DisputeResolveView())
+        # Slice 3 part 3: post-completion cleanup prompt.
+        self.bot.add_view(TournamentCleanupView())
 
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: Exception,
@@ -1132,6 +1134,75 @@ class Tournament(commands.Cog):
 
         await interaction.followup.send(
             f"❌ Cancelled **{name}**.", ephemeral=True)
+
+    @app_commands.command(
+        name="tournament-cleanup",
+        description=(
+            "Archive a completed tournament to #tournament-history and "
+            "delete its category."
+        ),
+    )
+    @app_commands.describe(name="Completed tournament name (exact)")
+    async def tournament_cleanup(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 60],
+    ):
+        """Admin escape hatch for the post-completion Yes/No prompt — same
+        behaviour as clicking Yes, available to organizers who dismissed
+        the buttons or never saw them (e.g. the prompt scrolled past)."""
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await interaction.response.send_message(
+                "Server-only.", ephemeral=True, delete_after=8)
+            return
+        if not _is_organizer(member):
+            await interaction.response.send_message(
+                f"Need the **{ORGANIZER_ROLE_NAME}** role.",
+                ephemeral=True, delete_after=12)
+            return
+
+        completed = await db.list_tournaments(guild.id, states=("COMPLETED",))
+        match = next(
+            (t for t in completed if t["name"].lower() == name.lower()), None,
+        )
+        if match is None:
+            await interaction.response.send_message(
+                f"No completed tournament named **{name}**.",
+                ephemeral=True, delete_after=12)
+            return
+        if not match["category_id"]:
+            await interaction.response.send_message(
+                f"**{name}** has no auto-provisioned category to clean up.",
+                ephemeral=True, delete_after=12)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        archived_to = await _archive_tournament_to_history(self.bot, match)
+        deleted = await _delete_tournament_category(self.bot, match)
+        await db.set_tournament_cleanup_message(match["id"], None)
+        if deleted:
+            await db.set_tournament_resources(match["id"], None, None)
+
+        bits = []
+        if archived_to is not None:
+            bits.append(f"archived to {archived_to.mention}")
+        else:
+            bits.append("couldn't find #tournament-history (skipped archive)")
+        bits.append("deleted category" if deleted else "category not deleted")
+        await interaction.followup.send(
+            f"🧹 **{name}** — " + "; ".join(bits) + ".",
+            ephemeral=True,
+        )
+
+    @tournament_cleanup.autocomplete("name")
+    async def _tournament_cleanup_autocomplete(
+        self, interaction: discord.Interaction, current: str,
+    ) -> list[app_commands.Choice[str]]:
+        return await _autocomplete_tournaments(
+            interaction, current, states=("COMPLETED",),
+        )
 
     @tournament_cancel.autocomplete("name")
     async def _tournament_cancel_autocomplete(
@@ -1730,6 +1801,280 @@ class DisputeResolveView(ErrorHandledView):
         self, interaction: discord.Interaction, _b: discord.ui.Button,
     ):
         await _flow_organizer_resolve(interaction, side="b")
+
+
+TOURNAMENT_HISTORY_CHANNEL = "tournament-history"
+
+
+class TournamentCleanupView(ErrorHandledView):
+    """Persistent Yes/No prompt posted after FINAL STANDINGS.
+
+    Yes → archive bracket + standings to #tournament-history, then delete
+    the auto-provisioned tournament category (which removes the
+    announcements channel and any leftover voice rooms in one shot).
+    No  → keep the channels for post-mortem chatter; the buttons clear.
+
+    Permission gate matches DisputeResolveView's: the tournament's
+    organizer (the row's organizer_id), anyone with the Organizer role,
+    or a guild administrator. Restricting to the row's organizer alone
+    would lock staff out when the original organizer leaves the server."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _resolve_tournament(self, interaction: discord.Interaction):
+        if interaction.message is None:
+            return None
+        return await db.get_tournament_by_cleanup_message(
+            interaction.message.id,
+        )
+
+    async def interaction_check(
+        self, interaction: discord.Interaction,
+    ) -> bool:
+        member = interaction.user
+        if not isinstance(member, discord.Member):
+            return False
+        if member.guild_permissions.administrator:
+            return True
+        if any(r.name == ORGANIZER_ROLE_NAME for r in member.roles):
+            return True
+        t = await self._resolve_tournament(interaction)
+        if t is not None and t["organizer_id"] == member.id:
+            return True
+        await interaction.response.send_message(
+            f"Only the tournament organizer or **{ORGANIZER_ROLE_NAME}** "
+            "/ **Admin** can decide on cleanup.",
+            ephemeral=True, delete_after=10,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Yes — archive & delete", emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        custom_id="tourney:cleanup_yes",
+    )
+    async def confirm(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_cleanup_confirm(interaction)
+
+    @discord.ui.button(
+        label="No — keep channels", emoji="🗂️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="tourney:cleanup_no",
+    )
+    async def decline(
+        self, interaction: discord.Interaction, _b: discord.ui.Button,
+    ):
+        await _flow_cleanup_decline(interaction)
+
+
+async def _flow_cleanup_confirm(interaction: discord.Interaction) -> None:
+    t = await db.get_tournament_by_cleanup_message(interaction.message.id)
+    if t is None:
+        await interaction.response.edit_message(
+            content="*(this prompt is no longer linked to a tournament)*",
+            view=None,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    archived_to = await _archive_tournament_to_history(interaction.client, t)
+    deleted = await _delete_tournament_category(interaction.client, t)
+
+    await db.set_tournament_cleanup_message(t["id"], None)
+    if deleted:
+        await db.set_tournament_resources(t["id"], None, None)
+
+    if archived_to is not None:
+        await interaction.followup.send(
+            f"Archived to {archived_to.mention} and "
+            f"{'deleted' if deleted else 'tried to delete'} the tournament "
+            "category.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "Couldn't find #tournament-history to archive into. "
+            "Channels left in place — re-run after creating the channel.",
+            ephemeral=True,
+        )
+
+    if not deleted:
+        # Category gone already → message is gone too, nothing to edit.
+        try:
+            await interaction.message.edit(
+                content=(interaction.message.content or "") +
+                "\n\n*(cleanup actioned — channels kept; category was "
+                "already gone or undeletable)*",
+                view=None,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+
+async def _flow_cleanup_decline(interaction: discord.Interaction) -> None:
+    t = await db.get_tournament_by_cleanup_message(interaction.message.id)
+    if t is not None:
+        await db.set_tournament_cleanup_message(t["id"], None)
+    await interaction.response.edit_message(
+        content=(
+            "🗂️ **Channels kept.** Use `/tournament-cleanup name:"
+            f"{t['name'] if t else '<name>'}` to revisit."
+        ),
+        view=None,
+    )
+
+
+async def _archive_tournament_to_history(
+    client: discord.Client, t,
+) -> discord.TextChannel | None:
+    """Post the final bracket + standings to #tournament-history. Returns
+    the destination channel on success (so callers can mention it back to
+    the organizer), or None if the channel doesn't exist in this guild.
+
+    Best-effort: bracket-render or send failures are logged but don't
+    abort the cleanup — losing the archive post is much less bad than
+    leaving a dead category sitting in the server forever."""
+    guild = client.get_guild(t["guild_id"])
+    if guild is None:
+        return None
+    history = channel_util.find_text_channel(guild, TOURNAMENT_HISTORY_CHANNEL)
+    if history is None:
+        return None
+
+    standings = await _compute_final_standings(t["id"])
+    final_round = await _final_round_number(t["id"])
+
+    podium_icons = ["🥇", "🥈", "🥉"]
+    lines: list[str] = []
+    for i, s in enumerate(standings):
+        icon = podium_icons[i] if i < 3 else f"#{i + 1}"
+        rank_bit = f" · {s['rank_tier']}" if s["rank_tier"] else ""
+        lines.append(
+            f"{icon} <@{s['user_id']}>{rank_bit}  "
+            f"— {s['wins']} W · Buchholz {s['buchholz']}"
+        )
+    body = "\n".join(lines) if lines else "*(no standings recorded)*"
+
+    headline = f"🗂️ **{t['name']} — archived**"
+    meta = (
+        f"{t['match_format']} · {len(standings)} entrants · "
+        f"{_compute_total_rounds(len(standings))} rounds"
+    )
+    payload = f"{headline}\n{meta}\n\n**FINAL STANDINGS**\n{body}"
+
+    files: list[discord.File] = []
+    if final_round:
+        try:
+            files.append(await _build_round_bracket_file(
+                t["name"], t["id"], final_round,
+            ))
+        except Exception:
+            log.exception(
+                "couldn't render archive bracket for tournament %s",
+                t["id"],
+            )
+
+    try:
+        await history.send(
+            payload, files=files,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except discord.HTTPException as e:
+        log.warning("archive post failed for tournament %s: %s", t["id"], e)
+        return None
+    return history
+
+
+async def _final_round_number(tournament_id: int) -> int | None:
+    matches = await db.list_matches_for_tournament(tournament_id)
+    if not matches:
+        return None
+    return max(m["round_number"] for m in matches)
+
+
+async def _delete_tournament_category(
+    client: discord.Client, t,
+) -> bool:
+    """Delete the tournament's auto-provisioned category and every channel
+    inside it. Returns True if the category was successfully deleted (or
+    was already gone). Best-effort on the children — a single locked
+    channel doesn't fail the whole cleanup, the category drop will
+    cascade-delete it once it's the last thing left."""
+    category_id = t["category_id"]
+    if not category_id:
+        return False
+    guild = client.get_guild(t["guild_id"])
+    if guild is None:
+        return False
+    category = guild.get_channel(category_id)
+    if not isinstance(category, discord.CategoryChannel):
+        # Already gone — the row's stale reference is what we're
+        # cleaning up. Caller will null out category_id.
+        return True
+    reason = f"Tournament '{t['name']}' archived & cleaned up"
+    for child in list(category.channels):
+        try:
+            await child.delete(reason=reason)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(
+                "couldn't delete child %s of tournament %s: %s",
+                child.id, t["id"], e,
+            )
+    try:
+        await category.delete(reason=reason)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        log.warning(
+            "couldn't delete category %s for tournament %s: %s",
+            category.id, t["id"], e,
+        )
+        return False
+    return True
+
+
+async def _post_cleanup_prompt(
+    client: discord.Client, t,
+) -> None:
+    """Post the Yes/No cleanup prompt in the announcements channel and
+    stamp the message id on the tournament row so the persistent view
+    can resolve it after a restart. Skipped silently when there's no
+    auto-provisioned category — there's nothing to clean up."""
+    if not t["category_id"]:
+        return
+    channel = _tournament_post_channel(client, t)
+    if channel is None:
+        return
+    organizer_mention = f"<@{t['organizer_id']}>"
+    guild = client.get_guild(t["guild_id"])
+    organizer_role = (
+        discord.utils.get(guild.roles, name=ORGANIZER_ROLE_NAME)
+        if guild else None
+    )
+    role_ping = organizer_role.mention if organizer_role else ""
+    body = (
+        f"🧹 {organizer_mention} {role_ping} — clean up the channels for "
+        f"**{t['name']}**?\n"
+        "**Yes** archives the bracket + standings to "
+        f"#{TOURNAMENT_HISTORY_CHANNEL} and deletes this category "
+        "(announcements + any match VCs go with it).\n"
+        "**No** keeps everything in place for post-tournament chatter."
+    )
+    allowed = discord.AllowedMentions(
+        users=[discord.Object(id=t["organizer_id"])],
+        roles=[organizer_role] if organizer_role else [],
+    )
+    try:
+        msg = await channel.send(
+            body, view=TournamentCleanupView(), allowed_mentions=allowed,
+        )
+    except discord.HTTPException as e:
+        log.warning(
+            "cleanup prompt failed for tournament %s: %s", t["id"], e,
+        )
+        return
+    await db.set_tournament_cleanup_message(t["id"], msg.id)
 
 
 class MatchPickerView(ErrorHandledView):
@@ -2350,8 +2695,9 @@ async def _complete_tournament(
 
     headline = f"🏆 **{tournament['name']} — COMPLETE!**"
     footer = (
-        "\n\nFinal bracket will archive into #🗂️-tournament-history "
-        "in the next update. Thanks for playing."
+        "\n\nOrganizer prompt below: archive the bracket to "
+        f"#{TOURNAMENT_HISTORY_CHANNEL} and delete this category, "
+        "or keep the channels for post-mortem chatter."
     )
 
     try:
@@ -2406,6 +2752,13 @@ async def _complete_tournament(
             )
 
     await _unpin_signup(client, tournament)
+
+    # Refresh the row so the prompt has the latest winner_id stamp +
+    # channel ids; _complete_tournament's `tournament` argument was a
+    # snapshot from before set_tournament_winner ran.
+    fresh = await db.get_tournament(tournament_id)
+    if fresh is not None:
+        await _post_cleanup_prompt(client, fresh)
 
     await audit.post_event(
         client.get_guild(tournament["guild_id"]),
